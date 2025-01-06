@@ -49,7 +49,7 @@ impl Threadpool {
 		let data = Arc::new(Data {
 			name: None,
 			stack_size: None,
-			max_threads: AtomicUsize::new(workers),
+			num_threads: AtomicUsize::new(workers),
 			thread_count: AtomicUsize::new(0),
 			queued_count: AtomicUsize::new(0),
 			active_count: AtomicUsize::new(0),
@@ -112,27 +112,12 @@ impl Threadpool {
 
 	/// Get the current number of active jobs in this pool
 	pub fn active_count(&self) -> usize {
-		self.data.queued_count.load(Ordering::Relaxed)
+		self.data.active_count.load(Ordering::Relaxed)
 	}
 
 	/// Get the specified number of threads for this pool
 	pub fn max_threads(&self) -> usize {
-		self.data.max_threads.load(Ordering::Relaxed)
-	}
-
-	/// Set the desired number of workers in this pool
-	pub fn set_workers(&mut self, workers: usize) {
-		// Workers needs to be at least 1
-		assert!(workers >= 1);
-		// Get the current number of threads
-		let current = self.data.max_threads.swap(workers, Ordering::Release);
-		// Check if we should spawn new threads
-		if let Some(additional) = workers.checked_sub(current) {
-			// Spawn the new workers
-			for _ in 0..additional {
-				Self::spawn(None, self.data.clone());
-			}
-		}
+		self.data.num_threads.load(Ordering::Relaxed)
 	}
 
 	/// Spawns a new worker thread in this pool
@@ -155,14 +140,6 @@ impl Threadpool {
 			data.thread_count.fetch_add(1, Ordering::SeqCst);
 			// Loop continuously, processing any jobs
 			loop {
-				// Get the max specified thread count
-				let max_threads = data.max_threads.load(Ordering::Relaxed);
-				// Get the total current thread count
-				let thread_count = data.thread_count.load(Ordering::Acquire);
-				// Check if there are too many threads
-				if thread_count > max_threads {
-					break;
-				}
 				// Pull a message from the job channel
 				let job = match data.receiver.recv_blocking() {
 					// We received a job to process

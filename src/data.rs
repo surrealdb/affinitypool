@@ -9,7 +9,7 @@ pub(crate) struct Data {
 	/// The stack size for each thread
 	pub(crate) stack_size: Option<usize>,
 	/// The specified number of threads
-	pub(crate) max_threads: AtomicUsize,
+	pub(crate) num_threads: AtomicUsize,
 	/// The current number of threads
 	pub(crate) thread_count: AtomicUsize,
 	/// The current number of queued jobs
