@@ -152,7 +152,7 @@ impl Builder {
 		let data = Arc::new(Data {
 			name: self.thread_name,
 			stack_size: None,
-			max_threads: AtomicUsize::new(workers),
+			num_threads: AtomicUsize::new(workers),
 			thread_count: AtomicUsize::new(0),
 			queued_count: AtomicUsize::new(0),
 			active_count: AtomicUsize::new(0),
