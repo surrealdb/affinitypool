@@ -116,7 +116,7 @@ impl Threadpool {
 	}
 
 	/// Get the specified number of threads for this pool
-	pub fn max_threads(&self) -> usize {
+	pub fn num_threads(&self) -> usize {
 		self.data.num_threads.load(Ordering::Relaxed)
 	}
 
