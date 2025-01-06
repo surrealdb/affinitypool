@@ -2,7 +2,7 @@
 name = "affinitypool"
 edition = "2021"
 version = "0.1.1"
-license = "Apache-2.0"
+license = "MIT/Apache-2.0"
 readme = "README.md"
 description = "A Rust library for running blocking jobs on a dedicated thread pool with CPU core affinity"
 repository = "https://github.com/surrealdb/affinitypool"
@@ -11,7 +11,6 @@ documentation = "https://docs.rs/affinitypool/"
 keywords = ["pool", "parallelism", "threading", "thread", "threadpool"]
 categories = ["asynchronous", "concurrency", "os"]
 resolver = "2"
-
 
 [features]
 default = []
