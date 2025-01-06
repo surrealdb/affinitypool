@@ -20,3 +20,9 @@ async-channel = "2.3.1"
 num_cpus = "1.16.0"
 thiserror = "1.0.63"
 tokio = { version = "1.42.0", features = ["sync"] }
+
+[target.'cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "freebsd"))'.dependencies]
+libc = "^0.2.30"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "^0.3.9", features = ["processthreadsapi", "winbase"] }

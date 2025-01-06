@@ -1,3 +1,4 @@
+mod affinity;
 mod atomic_waker;
 mod builder;
 mod data;
@@ -168,6 +169,10 @@ impl Threadpool {
 		let receiver = data.receiver.clone();
 		// Spawn a new worker thread
 		let _ = builder.spawn(move || {
+			// Assign this thread to a core
+			if let Some(coreid) = coreid {
+				affinity::set_for_current(coreid.into());
+			}
 			// Loop continuously, processing any jobs
 			loop {
 				// Pull a message from the job channel
