@@ -1,3 +1,4 @@
+mod affinity;
 mod atomic_waker;
 mod builder;
 mod data;
@@ -162,6 +163,10 @@ impl Threadpool {
 		}
 		// Spawn a new worker thread
 		let _ = builder.spawn(move || {
+			// Assign this thread to a core
+			if let Some(coreid) = coreid {
+				affinity::set_for_current(coreid.into());
+			}
 			// Create a new sentry watcher
 			let sentry = Sentry::new(coreid, &data);
 			// Increase the thread count counter

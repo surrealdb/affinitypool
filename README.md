@@ -6,4 +6,4 @@ For optimised workloads, the affinity of each thread can be specified, ensuring 
 
 #### Original
 
-This code is heavily inspired by [threadpool](https://crates.io/crates/threadpool), licensed under the Apache License 2.0 and MIT licenses.
+This code is heavily inspired by [threadpool](https://crates.io/crates/threadpool), with the CPU-based affinity code forked originally from [core-affinity](https://crates.io/crates/core_affinity). Both are licensed under the Apache License 2.0 and MIT licenses.
