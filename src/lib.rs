@@ -1,3 +1,4 @@
+mod affinity;
 mod builder;
 mod data;
 mod error;
