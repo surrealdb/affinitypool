@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 pub(crate) struct Sentry<'a> {
 	active: bool,
+	coreid: Option<usize>,
 	data: &'a Arc<Data>,
 }
 
 impl<'a> Sentry<'a> {
 	/// Create a new sentry tracker
-	pub fn new(data: &'a Arc<Data>) -> Sentry<'a> {
+	pub fn new(coreid: Option<usize>, data: &'a Arc<Data>) -> Sentry<'a> {
 		Sentry {
 			data,
+			coreid,
 			active: true,
 		}
 	}
@@ -32,7 +34,7 @@ impl Drop for Sentry<'_> {
 			// Reduce the active job count
 			self.data.active_count.fetch_sub(1, Ordering::SeqCst);
 			// Spawn another new thread
-			Threadpool::spawn(None, self.data.clone());
+			Threadpool::spawn(self.coreid, self.data.clone());
 		}
 	}
 }

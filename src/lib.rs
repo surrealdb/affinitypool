@@ -136,7 +136,7 @@ impl Threadpool {
 	}
 
 	/// Spawns a new worker thread in this pool
-	fn spawn(_coreid: Option<usize>, data: Arc<Data>) {
+	fn spawn(coreid: Option<usize>, data: Arc<Data>) {
 		// Create a new thread builder
 		let mut builder = std::thread::Builder::new();
 		// Assign a name to the thrads if specified
@@ -150,7 +150,7 @@ impl Threadpool {
 		// Spawn a new worker thread
 		let _ = builder.spawn(move || {
 			// Create a new sentry watcher
-			let sentry = Sentry::new(&data);
+			let sentry = Sentry::new(coreid, &data);
 			// Increase the thread count counter
 			data.thread_count.fetch_add(1, Ordering::SeqCst);
 			// Loop continuously, processing any jobs
