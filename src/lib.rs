@@ -18,12 +18,17 @@ use tokio::sync::oneshot;
 
 /// Queue a new command for execution on the global threadpool
 ///
+///
+/// This function is safe, as long as the caller ensures that the returned
+/// future is awaited and fully driven to completion. The caller must ensure
+/// that the lifetime ’scope is valid until the returned future is fully driven.
+///
 /// # Panics
 ///
 /// This function panics if a global threadpool has not been created.
-pub async fn execute<F, R>(func: F) -> R
+pub async fn execute<'scope, F, R>(func: F) -> R
 where
-	F: FnOnce() -> R + Send + 'static,
+	F: FnOnce() -> R + Send + 'scope,
 	R: Send + 'static,
 {
 	THREADPOOL.get().unwrap().execute(func).await
@@ -65,13 +70,25 @@ impl Threadpool {
 	}
 
 	/// Queue a new command for execution on this pool
-	pub async fn execute<F, R>(&self, func: F) -> R
+	///
+	/// This function is safe, as long as the caller ensures that the returned
+	/// future is awaited and fully driven to completion. The caller must ensure
+	/// that the lifetime ’scope is valid until the returned future is fully driven.
+	pub async fn execute<'scope, F, R>(&self, func: F) -> R
 	where
-		F: FnOnce() -> R + Send + 'static,
+		F: FnOnce() -> R + Send + 'scope,
 		R: Send + 'static,
 	{
 		// Create a new oneshot channel
 		let (tx, rx) = oneshot::channel();
+		// Remove the static requirement
+		let func = unsafe {
+			let boxed: Box<dyn FnOnce() -> R + Send + 'scope> = Box::new(func);
+			std::mem::transmute::<
+				Box<dyn FnOnce() -> R + Send + 'scope>,
+				Box<dyn FnOnce() -> R + Send + 'static>,
+			>(boxed)
+		};
 		// Enclose the function in a closure
 		let func = move || {
 			tx.send(catch_unwind(AssertUnwindSafe(func))).ok();
