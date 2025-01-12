@@ -154,8 +154,6 @@ impl Builder {
 			stack_size: None,
 			num_threads: AtomicUsize::new(workers),
 			thread_count: AtomicUsize::new(0),
-			queued_count: AtomicUsize::new(0),
-			active_count: AtomicUsize::new(0),
 			sender: send,
 			receiver: recv,
 		});

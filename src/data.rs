@@ -12,10 +12,6 @@ pub(crate) struct Data {
 	pub(crate) num_threads: AtomicUsize,
 	/// The current number of threads
 	pub(crate) thread_count: AtomicUsize,
-	/// The current number of queued jobs
-	pub(crate) queued_count: AtomicUsize,
-	/// The current number of active jobs
-	pub(crate) active_count: AtomicUsize,
 	/// The sender used for queueing jobs for processing
 	pub(crate) sender: Sender<Task>,
 	/// The receiver used for taking jobs to be processed

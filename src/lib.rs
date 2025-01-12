@@ -51,8 +51,6 @@ impl Threadpool {
 			stack_size: None,
 			num_threads: AtomicUsize::new(workers),
 			thread_count: AtomicUsize::new(0),
-			queued_count: AtomicUsize::new(0),
-			active_count: AtomicUsize::new(0),
 			sender: send,
 			receiver: recv,
 		});
@@ -78,8 +76,6 @@ impl Threadpool {
 		let func = move || {
 			tx.send(catch_unwind(AssertUnwindSafe(func))).ok();
 		};
-		// Increase the queued job counter
-		self.data.queued_count.fetch_add(1, Ordering::SeqCst);
 		// Send the function for processing
 		self.data.sender.send(Box::new(func)).await.unwrap();
 		// The channel has not been closed
@@ -103,16 +99,6 @@ impl Threadpool {
 	/// Get the total number of worker threads in this pool
 	pub fn thread_count(&self) -> usize {
 		self.data.thread_count.load(Ordering::Relaxed)
-	}
-
-	/// Get the current number of queued jobs in this pool
-	pub fn queued_count(&self) -> usize {
-		self.data.queued_count.load(Ordering::Relaxed)
-	}
-
-	/// Get the current number of active jobs in this pool
-	pub fn active_count(&self) -> usize {
-		self.data.active_count.load(Ordering::Relaxed)
 	}
 
 	/// Get the specified number of threads for this pool
@@ -147,14 +133,8 @@ impl Threadpool {
 					// This threadpool was dropped
 					Err(_) => break,
 				};
-				// Decrease the queued job counter
-				data.queued_count.fetch_sub(1, Ordering::Relaxed);
-				// Increase the active job counter
-				data.active_count.fetch_add(1, Ordering::Relaxed);
 				// Process the function callback
 				job.run();
-				// Decrease the active job counter
-				data.active_count.fetch_sub(1, Ordering::Relaxed);
 			}
 			// This thread has exited cleanly
 			sentry.cancel();

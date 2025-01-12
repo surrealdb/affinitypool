@@ -1,6 +1,5 @@
 use crate::Data;
 use crate::Threadpool;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub(crate) struct Sentry<'a> {
@@ -31,8 +30,6 @@ impl Drop for Sentry<'_> {
 		// properly cancelling the sentry,
 		// so we should start a new thread.
 		if self.active {
-			// Reduce the active job count
-			self.data.active_count.fetch_sub(1, Ordering::SeqCst);
 			// Spawn another new thread
 			Threadpool::spawn(self.coreid, self.data.clone());
 		}
