@@ -1,6 +1,7 @@
-use crate::task::Task;
 use async_channel::{Receiver, Sender};
 use std::sync::atomic::AtomicUsize;
+
+use crate::task::OwnedTask;
 
 #[derive(Debug)]
 pub(crate) struct Data {
@@ -13,7 +14,7 @@ pub(crate) struct Data {
 	/// The current number of threads
 	pub(crate) thread_count: AtomicUsize,
 	/// The sender used for queueing jobs for processing
-	pub(crate) sender: Sender<Task>,
+	pub(crate) sender: Sender<OwnedTask<'static>>,
 	/// The receiver used for taking jobs to be processed
-	pub(crate) receiver: Receiver<Task>,
+	pub(crate) receiver: Receiver<OwnedTask<'static>>,
 }

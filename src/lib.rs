@@ -1,7 +1,9 @@
+mod atomic_waker;
 mod builder;
 mod data;
 mod error;
 mod global;
+mod local;
 mod sentry;
 mod task;
 
@@ -11,9 +13,15 @@ pub use crate::error::Error;
 use crate::data::Data;
 use crate::global::THREADPOOL;
 use crate::sentry::Sentry;
+use atomic_waker::AtomicWaker;
+use local::SpawnFuture;
+use std::cell::UnsafeCell;
+use std::marker::{self};
+use std::mem::MaybeUninit;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use task::OwnedTask;
 use tokio::sync::oneshot;
 
 /// Queue a new command for execution on the global threadpool
@@ -26,12 +34,12 @@ use tokio::sync::oneshot;
 /// # Panics
 ///
 /// This function panics if a global threadpool has not been created.
-pub async fn execute<'scope, F, R>(func: F) -> R
+pub async fn execute<F, R>(func: F) -> R
 where
-	F: FnOnce() -> R + Send + 'scope,
+	F: FnOnce() -> R + Send + 'static,
 	R: Send + 'static,
 {
-	THREADPOOL.get().unwrap().execute(func).await
+	THREADPOOL.get().unwrap().spawn(func).await
 }
 
 #[derive(Debug)]
@@ -61,7 +69,7 @@ impl Threadpool {
 		});
 		// Spawn the desired number of workers
 		for _ in 0..workers {
-			Self::spawn(None, data.clone());
+			Self::spin_up(None, data.clone());
 		}
 		// Return the new threadpool
 		Threadpool {
@@ -70,35 +78,35 @@ impl Threadpool {
 	}
 
 	/// Queue a new command for execution on this pool
-	///
-	/// This function is safe, as long as the caller ensures that the returned
-	/// future is awaited and fully driven to completion. The caller must ensure
-	/// that the lifetime ’scope is valid until the returned future is fully driven.
-	pub async fn execute<'scope, F, R>(&self, func: F) -> R
+	pub async fn spawn<F, R>(&self, func: F) -> R
 	where
-		F: FnOnce() -> R + Send + 'scope,
+		F: FnOnce() -> R,
+		F: Send + 'static,
 		R: Send + 'static,
 	{
 		// Create a new oneshot channel
 		let (tx, rx) = oneshot::channel();
-		// Remove the static requirement
-		let func = unsafe {
-			let boxed: Box<dyn FnOnce() -> R + Send + 'scope> = Box::new(func);
-			std::mem::transmute::<
-				Box<dyn FnOnce() -> R + Send + 'scope>,
-				Box<dyn FnOnce() -> R + Send + 'static>,
-			>(boxed)
-		};
 		// Enclose the function in a closure
-		let func = move || {
+		let task = OwnedTask::new(move || {
 			tx.send(catch_unwind(AssertUnwindSafe(func))).ok();
-		};
+		});
 		// Send the function for processing
-		self.data.sender.send(Box::new(func)).await.unwrap();
+		self.data.sender.send(task).await.unwrap();
 		// The channel has not been closed
 		let res = rx.await.unwrap();
 		// Wait for the function response
 		res.unwrap_or_else(|err| resume_unwind(err))
+	}
+
+	/// Queue a new command for execution on this pool with access to the local variables.
+	///
+	/// The future of this function will block the current thread if it is not fully completed.
+	pub fn spawn_local<'pool, F, R>(&'pool self, func: F) -> SpawnFuture<'pool, F, R>
+	where
+		F: FnOnce() -> R + Send + 'pool,
+		R: Send + 'pool,
+	{
+		SpawnFuture::new(self, func)
 	}
 
 	/// Set this threadpool as the global threadpool
@@ -123,8 +131,8 @@ impl Threadpool {
 		self.data.num_threads.load(Ordering::Relaxed)
 	}
 
-	/// Spawns a new worker thread in this pool
-	fn spawn(coreid: Option<usize>, data: Arc<Data>) {
+	/// Spinns up a new worker thread in this pool
+	fn spin_up(coreid: Option<usize>, data: Arc<Data>) {
 		// Create a new thread builder
 		let mut builder = std::thread::Builder::new();
 		// Assign a name to the thrads if specified
