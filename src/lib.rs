@@ -20,22 +20,33 @@ use std::sync::Arc;
 use task::OwnedTask;
 use tokio::sync::oneshot;
 
-/// Queue a new command for execution on the global threadpool
-///
-///
-/// This function is safe, as long as the caller ensures that the returned
-/// future is awaited and fully driven to completion. The caller must ensure
-/// that the lifetime ’scope is valid until the returned future is fully driven.
+/// Queue a new command for execution on the global threadpool.
 ///
 /// # Panics
 ///
 /// This function panics if a global threadpool has not been created.
-pub async fn execute<F, R>(func: F) -> R
+pub async fn spawn<F, R>(func: F) -> R
 where
 	F: FnOnce() -> R + Send + 'static,
 	R: Send + 'static,
 {
 	THREADPOOL.get().unwrap().spawn(func).await
+}
+
+/// Queue a new command for execution on the global threadpool.
+/// The future of this function will block the current thread
+/// if it is not fully awaited and driven to completion.
+///
+/// # Panics
+///
+/// This function panics if a global threadpool has not been created.
+pub fn spawn_local<'pool, F, R>(func: F) -> SpawnFuture<'pool, F, R>
+where
+	F: FnOnce() -> R,
+	F: Send + 'pool,
+	R: Send + 'pool,
+{
+	THREADPOOL.get().unwrap().spawn_local(func)
 }
 
 #[derive(Debug)]
@@ -50,7 +61,7 @@ impl Default for Threadpool {
 }
 
 impl Threadpool {
-	/// Create a new thread pool
+	/// Create a new thread pool.
 	pub fn new(workers: usize) -> Self {
 		// Create a queuing channel for tasks
 		let (send, recv) = async_channel::unbounded();
@@ -73,7 +84,7 @@ impl Threadpool {
 		}
 	}
 
-	/// Queue a new command for execution on this pool
+	/// Queue a new command for execution on this pool.
 	pub async fn spawn<F, R>(&self, func: F) -> R
 	where
 		F: FnOnce() -> R,
@@ -99,13 +110,14 @@ impl Threadpool {
 	/// The future of this function will block the current thread if it is not fully completed.
 	pub fn spawn_local<'pool, F, R>(&'pool self, func: F) -> SpawnFuture<'pool, F, R>
 	where
-		F: FnOnce() -> R + Send + 'pool,
+		F: FnOnce() -> R,
+		F: Send + 'pool,
 		R: Send + 'pool,
 	{
 		SpawnFuture::new(self, func)
 	}
 
-	/// Set this threadpool as the global threadpool
+	/// Set this threadpool as the global threadpool.
 	pub fn build_global(self) -> Result<(), Error> {
 		// Check if the threadpool has been created
 		if THREADPOOL.get().is_some() {
@@ -117,17 +129,17 @@ impl Threadpool {
 		Ok(())
 	}
 
-	/// Get the total number of worker threads in this pool
+	/// Get the total number of worker threads in this pool.
 	pub fn thread_count(&self) -> usize {
 		self.data.thread_count.load(Ordering::Relaxed)
 	}
 
-	/// Get the specified number of threads for this pool
+	/// Get the specified number of threads for this pool.
 	pub fn num_threads(&self) -> usize {
 		self.data.num_threads.load(Ordering::Relaxed)
 	}
 
-	/// Spinns up a new worker thread in this pool
+	/// Spins up a new worker thread in this pool.
 	fn spin_up(coreid: Option<usize>, data: Arc<Data>) {
 		// Create a new thread builder
 		let mut builder = std::thread::Builder::new();
