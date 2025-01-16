@@ -22,31 +22,39 @@ use tokio::sync::oneshot;
 
 /// Queue a new command for execution on the global threadpool.
 ///
-/// # Panics
-///
-/// This function panics if a global threadpool has not been created.
+/// If no global threadpool has been created, then this function
+/// runs the provided closure immediately, without passing it to
+/// a blocking threadpool.
 pub async fn spawn<F, R>(func: F) -> R
 where
 	F: FnOnce() -> R + Send + 'static,
 	R: Send + 'static,
 {
-	THREADPOOL.get().unwrap().spawn(func).await
+	if let Some(threadpool) = THREADPOOL.get() {
+		threadpool.spawn(func).await
+	} else {
+		func()
+	}
 }
 
 /// Queue a new command for execution on the global threadpool.
 /// The future of this function will block the current thread
 /// if it is not fully awaited and driven to completion.
 ///
-/// # Panics
-///
-/// This function panics if a global threadpool has not been created.
-pub fn spawn_local<'pool, F, R>(func: F) -> SpawnFuture<'pool, F, R>
+/// If no global threadpool has been created, then this function
+/// runs the provided closure immediately, without passing it to
+/// a blocking threadpool.
+pub async fn spawn_local<'pool, F, R>(func: F) -> R
 where
 	F: FnOnce() -> R,
 	F: Send + 'pool,
 	R: Send + 'pool,
 {
-	THREADPOOL.get().unwrap().spawn_local(func)
+	if let Some(threadpool) = THREADPOOL.get() {
+		threadpool.spawn_local(func).await
+	} else {
+		func()
+	}
 }
 
 #[derive(Debug)]
