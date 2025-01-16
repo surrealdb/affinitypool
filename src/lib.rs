@@ -148,6 +148,7 @@ impl Threadpool {
 	}
 
 	/// Spins up a new worker thread in this pool.
+	#[cfg(not(target_family = "wasm"))]
 	fn spin_up(coreid: Option<usize>, data: Arc<Data>) {
 		// Create a new thread builder
 		let mut builder = std::thread::Builder::new();
@@ -180,5 +181,11 @@ impl Threadpool {
 			// This thread has exited cleanly
 			sentry.cancel();
 		});
+	}
+
+	/// Spins up a new worker thread in this pool.
+	#[cfg(target_family = "wasm")]
+	fn spin_up(coreid: Option<usize>, data: Arc<Data>) {
+		// Do nothing in WASM
 	}
 }
