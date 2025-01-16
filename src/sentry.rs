@@ -31,7 +31,7 @@ impl Drop for Sentry<'_> {
 		// so we should start a new thread.
 		if self.active {
 			// Spawn another new thread
-			Threadpool::spawn(self.coreid, self.data.clone());
+			Threadpool::spin_up(self.coreid, self.data.clone());
 		}
 	}
 }

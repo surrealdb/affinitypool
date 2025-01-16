@@ -161,12 +161,12 @@ impl Builder {
 		if self.thread_per_core {
 			// Spawn the desired number of workers
 			for id in 0..workers {
-				Threadpool::spawn(Some(id), data.clone());
+				Threadpool::spin_up(Some(id), data.clone());
 			}
 		} else {
 			// Spawn the desired number of workers
 			for _ in 0..workers {
-				Threadpool::spawn(None, data.clone());
+				Threadpool::spin_up(None, data.clone());
 			}
 		}
 		// Return the new threadpool
