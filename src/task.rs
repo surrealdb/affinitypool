@@ -60,7 +60,9 @@ impl<'a> OwnedTask<'a> {
 	/// Caller must ensure that the closure within the task remains valid for the duration of the
 	/// lifetime of the returned object.
 	pub unsafe fn erase_lifetime(self) -> OwnedTask<'static> {
-		OwnedTask(self.0, PhantomData)
+		let res = OwnedTask(self.0, PhantomData);
+		std::mem::forget(self);
+		res
 	}
 
 	pub fn run(self) {
