@@ -11,8 +11,11 @@ use std::{
 use crate::{atomic_waker::AtomicWaker, task::OwnedTask, Threadpool};
 
 struct SpawnFutureData<T> {
+	// cond var to wait on the result of the mutex changing when we find it empty during block.
 	condvar: Condvar,
+	// The actual value, if the future is properly driven to completion we never block on the mutex.
 	result: Mutex<Option<Result<T, Box<dyn Any + Send>>>>,
+	// Waker to notify the runtime of completion of the task.
 	waker: AtomicWaker,
 }
 
@@ -82,11 +85,13 @@ where
 
 							*lock = Some(res);
 
+							// drop the lock before waking the future.
 							mem::drop(lock);
 						}
 
+						// wake the future so that it can retrieve the result.
 						data_clone.waker.wake();
-
+						// notify possible blocked threads of completion.
 						data_clone.condvar.notify_one();
 					});
 					let future = unsafe { self.pool.data.sender.send(task.erase_lifetime()) };
@@ -147,10 +152,9 @@ impl<F, T> Drop for SpawnFuture<'_, F, T> {
 			State::Init(_) => {}
 			State::Sending(_, _) => {}
 			State::Running(ref data) => {
-				println!("Future dropped while running, blocking");
-
 				let guard = data.result.lock().unwrap();
 
+				// result was not yet ready, wait until it is finshed.
 				if guard.is_none() {
 					mem::drop(data.condvar.wait(guard).unwrap());
 				}
