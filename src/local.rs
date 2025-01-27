@@ -76,10 +76,14 @@ where
 					// move.
 					let task = OwnedTask::new(move || {
 						// keep the lock until we are done.
-						let mut lock = data_clone.result.lock().unwrap();
-						let res = panic::catch_unwind(AssertUnwindSafe(task));
+						{
+							let mut lock = data_clone.result.lock().unwrap();
+							let res = panic::catch_unwind(AssertUnwindSafe(task));
 
-						*lock = Some(res);
+							*lock = Some(res);
+
+							mem::drop(lock);
+						}
 
 						data_clone.waker.wake();
 
@@ -143,6 +147,8 @@ impl<F, T> Drop for SpawnFuture<'_, F, T> {
 			State::Init(_) => {}
 			State::Sending(_, _) => {}
 			State::Running(ref data) => {
+				println!("Future dropped while running, blocking");
+
 				let guard = data.result.lock().unwrap();
 
 				if guard.is_none() {
