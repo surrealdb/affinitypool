@@ -74,6 +74,12 @@ where
 						result: Mutex::new(None),
 						waker: AtomicWaker::new(),
 					});
+
+					// We need to register a waker immediatly so that if the task finishes before
+					// this thread can transition to State::Running ther is waker present to wake
+					// the future.
+					data.waker.register(cx.waker());
+
 					let data_clone = data.clone();
 					// send the task of to the thread no we are sure SpawnFuture will drop and not
 					// move.
@@ -99,7 +105,10 @@ where
 						self.as_mut().get_unchecked_mut().state = State::Sending(future, data);
 					}
 				}
-				State::Sending(ref mut future, _) => {
+				State::Sending(ref mut future, ref data) => {
+					// Make sure the right waker is in place such that we get notified the moment a
+					// the task is ready.
+					data.waker.register(cx.waker());
 					// pinning is structural for State::Sending and maintained by the
 					// implementation
 					unsafe { ready!(Pin::new_unchecked(future).poll(cx)) }.unwrap();
