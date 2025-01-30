@@ -155,9 +155,9 @@ impl<F, T> Drop for SpawnFuture<'_, F, T> {
 				let guard = data.result.lock().unwrap();
 
 				// result was not yet ready, wait until it is finshed.
-				if guard.is_none() {
-					mem::drop(data.condvar.wait(guard).unwrap());
-				}
+				// We need a `wait_while` because `wait` can spuriously wake even when the condvar
+				// was not yet notified.
+				std::mem::drop(data.condvar.wait_while(guard, |x| x.is_none()))
 			}
 			State::Done => {}
 		}
