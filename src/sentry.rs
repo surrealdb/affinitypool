@@ -1,16 +1,16 @@
 use crate::Data;
 use crate::Threadpool;
-use std::sync::Arc;
+use std::sync::Weak;
 
-pub(crate) struct Sentry<'a> {
+pub(crate) struct Sentry {
 	active: bool,
 	coreid: Option<usize>,
-	data: &'a Arc<Data>,
+	data: Weak<Data>,
 }
 
-impl<'a> Sentry<'a> {
+impl Sentry {
 	/// Create a new sentry tracker
-	pub fn new(coreid: Option<usize>, data: &'a Arc<Data>) -> Sentry<'a> {
+	pub fn new(coreid: Option<usize>, data: Weak<Data>) -> Sentry {
 		Sentry {
 			data,
 			coreid,
@@ -23,15 +23,19 @@ impl<'a> Sentry<'a> {
 	}
 }
 
-impl Drop for Sentry<'_> {
+impl Drop for Sentry {
 	fn drop(&mut self) {
+		let Some(data) = self.data.upgrade() else {
+			return;
+		};
+		
 		// If this sentry was still active,
 		// then the task panicked without
 		// properly cancelling the sentry,
 		// so we should start a new thread.
 		if self.active {
 			// Spawn another new thread
-			Threadpool::spin_up(self.coreid, self.data.clone());
+			Threadpool::spin_up(self.coreid, data.clone());
 		}
 	}
 }
