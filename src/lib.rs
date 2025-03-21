@@ -160,16 +160,18 @@ impl Threadpool {
 		if let Some(stack_size) = data.stack_size {
 			builder = builder.stack_size(stack_size);
 		}
+		// Increase the thread count counter
+		data.thread_count.fetch_add(1, Ordering::SeqCst);
+		// Create a new sentry watcher
+		let sentry = Sentry::new(coreid, Arc::downgrade(&data));
+		// Clone receiver
+		let receiver = data.receiver.clone();
 		// Spawn a new worker thread
 		let _ = builder.spawn(move || {
-			// Create a new sentry watcher
-			let sentry = Sentry::new(coreid, &data);
-			// Increase the thread count counter
-			data.thread_count.fetch_add(1, Ordering::SeqCst);
 			// Loop continuously, processing any jobs
 			loop {
 				// Pull a message from the job channel
-				let job = match data.receiver.recv_blocking() {
+				let job = match receiver.recv_blocking() {
 					// We received a job to process
 					Ok(job) => job,
 					// This threadpool was dropped
