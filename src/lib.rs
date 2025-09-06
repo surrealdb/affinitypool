@@ -153,11 +153,11 @@ impl Threadpool {
 	fn spin_up(coreid: Option<usize>, data: Arc<Data>) {
 		// Create a new thread builder
 		let mut builder = std::thread::Builder::new();
-		// Assign a name to the thrads if specified
+		// Assign a name to the threads if specified
 		if let Some(ref name) = data.name {
 			builder = builder.name(name.clone());
 		}
-		// Assign a stack size to the thrads if specified
+		// Assign a stack size to the threads if specified
 		if let Some(stack_size) = data.stack_size {
 			builder = builder.stack_size(stack_size);
 		}
