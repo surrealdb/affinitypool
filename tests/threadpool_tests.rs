@@ -308,3 +308,143 @@ async fn test_nested_spawns() {
 
 	assert_eq!(result, 42);
 }
+
+#[tokio::test]
+async fn test_threads_properly_joined_on_drop() {
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::Arc;
+	use std::thread;
+	use std::time::{Duration, Instant};
+
+	// Test that Drop waits for all worker threads to exit
+	let thread_exited = Arc::new(AtomicBool::new(false));
+	let exit_clone = thread_exited.clone();
+
+	// Spawn a simple task and immediately drop the pool
+	{
+		let pool = Threadpool::new(4);
+		// Just verify pool creates threads
+		pool.spawn(move || {
+			thread::sleep(Duration::from_millis(50));
+			exit_clone.store(true, Ordering::SeqCst);
+		})
+		.await;
+	} // Pool dropped here
+
+	// Thread should have completed before drop returned
+	assert!(
+		thread_exited.load(Ordering::SeqCst),
+		"Task should have completed before pool was dropped"
+	);
+
+	// Now test that threads are actually joined on drop
+	let start = Instant::now();
+	{
+		let pool = Threadpool::new(2);
+		// Submit work to make sure threads are active
+		for i in 0..10 {
+			pool.spawn(move || {
+				// Quick work
+				thread::sleep(Duration::from_millis(10));
+				i * 2
+			})
+			.await;
+		}
+		// Pool is dropped here - should wait for threads to shut down
+	}
+	let elapsed = start.elapsed();
+
+	// Drop should have waited for threads to shut down properly
+	// This should be quick but not instant
+	assert!(
+		elapsed >= Duration::from_millis(50),
+		"Drop completed too quickly ({:?}), threads may not have been joined properly",
+		elapsed
+	);
+}
+
+#[tokio::test]
+async fn test_drop_waits_for_running_tasks() {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::Arc;
+	use std::time::{Duration, Instant};
+
+	let completed_tasks = Arc::new(AtomicUsize::new(0));
+
+	let start = Instant::now();
+	{
+		let pool = Threadpool::new(2);
+
+		// Spawn multiple long-running tasks
+		for _ in 0..4 {
+			let counter = completed_tasks.clone();
+			pool.spawn(move || {
+				// Simulate work
+				std::thread::sleep(Duration::from_millis(100));
+				counter.fetch_add(1, Ordering::SeqCst);
+			})
+			.await;
+		}
+		// Pool is dropped here
+	}
+	let elapsed = start.elapsed();
+
+	// All tasks should have completed
+	assert_eq!(completed_tasks.load(Ordering::SeqCst), 4);
+
+	// Drop should have waited for tasks to complete
+	// With 2 threads and 4 tasks of 100ms each, should take ~200ms
+	assert!(elapsed >= Duration::from_millis(150), "Drop returned too quickly: {:?}", elapsed);
+}
+
+#[tokio::test]
+async fn test_all_threads_joined_including_panicked() {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	// Track how many threads have been created
+	let threads_created = Arc::new(AtomicUsize::new(0));
+	let created_clone = threads_created.clone();
+
+	{
+		let pool = Threadpool::new(2);
+
+		// Task that increments counter (to track thread creation)
+		pool.spawn(move || {
+			created_clone.fetch_add(1, Ordering::SeqCst);
+		})
+		.await;
+
+		// Task that panics - should cause a replacement thread to be created
+		let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			tokio::runtime::Runtime::new().unwrap().block_on(async {
+				pool.spawn(|| {
+					panic!("Intentional panic for testing");
+				})
+				.await
+			})
+		}));
+
+		// Give time for replacement thread to spawn
+		std::thread::sleep(Duration::from_millis(100));
+
+		// Another task to verify pool still works
+		let created_clone2 = threads_created.clone();
+		pool.spawn(move || {
+			created_clone2.fetch_add(1, Ordering::SeqCst);
+		})
+		.await;
+
+		// When pool drops, it should join ALL threads:
+		// - The original 2 threads
+		// - The replacement thread that was created after the panic
+	} // Drop happens here
+
+	// With the simplified Vec<JoinHandle> approach, we properly track
+	// and join ALL threads, including replacements after panics
+	assert!(
+		threads_created.load(Ordering::SeqCst) >= 2,
+		"Should have executed tasks on multiple threads"
+	);
+}

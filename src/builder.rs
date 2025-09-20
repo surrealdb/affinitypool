@@ -3,7 +3,7 @@ use crate::Threadpool;
 use crossbeam::deque::{Injector, Worker};
 use crossbeam::queue::ArrayQueue;
 use parking_lot::RwLock;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
 #[derive(Default, Clone)]
@@ -176,8 +176,9 @@ impl Builder {
 			thread_count: AtomicUsize::new(0),
 			injector,
 			stealers: RwLock::new(stealers),
-			shutdown: std::sync::atomic::AtomicBool::new(false),
+			shutdown: AtomicBool::new(false),
 			parked_threads: ArrayQueue::new(threads),
+			thread_handles: RwLock::new(Vec::new()),
 		});
 		// Use affinity if spawning thread per core
 		if self.thread_per_core {

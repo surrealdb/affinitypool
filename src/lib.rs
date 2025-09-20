@@ -94,8 +94,9 @@ impl Threadpool {
 			thread_count: AtomicUsize::new(0),
 			injector,
 			stealers: RwLock::new(stealers),
-			shutdown: AtomicBool::new(false),
 			parked_threads: ArrayQueue::new(workers),
+			shutdown: AtomicBool::new(false),
+			thread_handles: RwLock::new(Vec::new()),
 		});
 		// Spawn the desired number of workers
 		for (index, worker) in worker_queues.into_iter().enumerate() {
@@ -242,8 +243,10 @@ impl Threadpool {
 		data.thread_count.fetch_add(1, Ordering::SeqCst);
 		// Create a new sentry watcher
 		let sentry = Sentry::new(coreid, index, Arc::downgrade(&data));
+		// Clone data for handle storage
+		let data_clone = data.clone();
 		// Spawn a new worker thread
-		let _ = builder.spawn(move || {
+		let handle = builder.spawn(move || {
 			// Assign this thread to a core
 			if let Some(coreid) = coreid {
 				affinity::set_for_current(coreid.into());
@@ -279,6 +282,11 @@ impl Threadpool {
 			// This thread has exited cleanly
 			sentry.cancel();
 		});
+
+		// Store the thread handle if spawning succeeded
+		if let Ok(handle) = handle {
+			data_clone.thread_handles.write().push(handle);
+		}
 	}
 
 	/// Spins up a new worker thread in this pool.
@@ -301,5 +309,14 @@ impl Drop for Threadpool {
 		while let Some(thread) = self.data.parked_threads.pop() {
 			thread.unpark();
 		}
+		// Take all of the thread handles for joining
+		let handles = self.data.thread_handles.write().drain(..).collect::<Vec<_>>();
+		// Join all worker threads
+		for handle in handles {
+			// Wait for the thread to exit
+			let _ = handle.join();
+		}
+		// Decrement thread count to 0
+		self.data.thread_count.store(0, Ordering::SeqCst);
 	}
 }

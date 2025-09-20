@@ -3,7 +3,7 @@ use crossbeam::deque::{Injector, Stealer};
 use crossbeam::queue::ArrayQueue;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::thread::Thread;
+use std::thread::{JoinHandle, Thread};
 
 /// Data shared between all worker threads
 pub(crate) struct Data {
@@ -19,8 +19,10 @@ pub(crate) struct Data {
 	pub(crate) injector: Injector<OwnedTask<'static>>,
 	/// Stealers for all worker threads
 	pub(crate) stealers: RwLock<Vec<Stealer<OwnedTask<'static>>>>,
-	/// Flag to indicate if workers should shut down
-	pub(crate) shutdown: AtomicBool,
 	/// Queue of parked threads waiting for work
 	pub(crate) parked_threads: ArrayQueue<Thread>,
+	/// Flag to indicate if workers should shut down
+	pub(crate) shutdown: AtomicBool,
+	/// Handles to all worker threads for cleanup
+	pub(crate) thread_handles: RwLock<Vec<JoinHandle<()>>>,
 }
