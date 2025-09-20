@@ -4,8 +4,6 @@ use std::mem;
 
 use libc::{c_int, c_uint, pthread_self};
 
-use num_cpus;
-
 use super::CoreId;
 
 type kern_return_t = c_int;
@@ -36,9 +34,8 @@ extern "C" {
 pub fn get_core_ids() -> Option<Vec<CoreId>> {
 	Some(
 		(0..(num_cpus::get()))
-			.into_iter()
 			.map(|n| CoreId {
-				id: n as usize,
+				id: n,
 			})
 			.collect::<Vec<_>>(),
 	)
@@ -77,7 +74,7 @@ mod tests {
 				assert_eq!(set.len(), num_cpus::get());
 			}
 			None => {
-				assert!(false);
+				panic!("Failed to get core IDs");
 			}
 		}
 	}
@@ -85,7 +82,7 @@ mod tests {
 	#[test]
 	fn test_macos_set_for_current() {
 		let ids = get_core_ids().unwrap();
-		assert!(ids.len() > 0);
+		assert!(!ids.is_empty());
 		assert!(set_for_current(ids[0]))
 	}
 }
