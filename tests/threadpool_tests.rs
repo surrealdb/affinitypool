@@ -448,3 +448,48 @@ async fn test_all_threads_joined_including_panicked() {
 		"Should have executed tasks on multiple threads"
 	);
 }
+
+#[tokio::test]
+async fn test_no_lost_wakeups_race_condition() {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::Arc;
+	use std::time::{Duration, Instant};
+
+	// This test verifies that the park/unpark race condition is handled correctly
+	// Previously, there was a race where:
+	// 1. Thread adds itself to parked_threads
+	// 2. Another thread pops it and calls unpark
+	// 3. First thread hasn't called park yet, so the wakeup is lost
+
+	let pool = Threadpool::new(2);
+	let tasks_completed = Arc::new(AtomicUsize::new(0));
+
+	// Submit many quick tasks in rapid succession
+	// This increases the chance of hitting the race condition
+	for _ in 0..100 {
+		let counter = tasks_completed.clone();
+		pool.spawn(move || {
+			// Very quick task
+			counter.fetch_add(1, Ordering::SeqCst);
+		})
+		.await;
+
+		// Small delay to let threads potentially park
+		tokio::time::sleep(Duration::from_micros(100)).await;
+	}
+
+	// All tasks should complete quickly
+	let start = Instant::now();
+	while tasks_completed.load(Ordering::SeqCst) < 100 {
+		if start.elapsed() > Duration::from_secs(1) {
+			panic!(
+				"Tasks didn't complete in time, only {} of 100 completed. \
+				 Possible lost wakeup in park/unpark race condition.",
+				tasks_completed.load(Ordering::SeqCst)
+			);
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+
+	assert_eq!(tasks_completed.load(Ordering::SeqCst), 100);
+}

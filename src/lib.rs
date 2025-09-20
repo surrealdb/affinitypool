@@ -262,20 +262,17 @@ impl Threadpool {
 					// Process the task
 					task.run();
 				} else {
-					// No work found, so park this thread
+					// No work found, so register ourselves as parked
 					let _ = data.parked_threads.push(std::thread::current());
-					// Double-check for work (prevent race)
+					// Double-check for work after registering
 					if !data.injector.is_empty() {
-						// Work just arrived, unpark someone (might be us)
+						// Work just arrived, try to wake a thread
 						if let Some(t) = data.parked_threads.pop() {
-							if t.id() != std::thread::current().id() {
-								t.unpark();
-							} else {
-								continue; // It was us, go find work
-							}
+							// Always unpark the thread we popped
+							t.unpark();
 						}
 					}
-					// Park with timeout
+					// Park this thread for a short time
 					std::thread::park_timeout(Duration::from_millis(10));
 				}
 			}
