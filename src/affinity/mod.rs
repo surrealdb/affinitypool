@@ -7,14 +7,14 @@
 //! use std::thread;
 //!
 //! // Retrieve the IDs of all active CPU cores.
-//! let core_ids = crate::affinity::get_core_ids().unwrap();
+//! let core_ids = affinitypool::affinity::get_core_ids().unwrap();
 //!
 //! // Create a thread for each active CPU core.
 //! let handles = core_ids.into_iter().map(|id| {
 //!     thread::spawn(move || {
 //!         // Pin this thread to a single CPU core.
-//!         let res = crate::affinity::set_for_current(id);
-//!         if (res) {
+//!         let res = affinitypool::affinity::set_for_current(id);
+//!         if res {
 //!             // Do more work after this.
 //!         }
 //!     })

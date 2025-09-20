@@ -17,7 +17,7 @@ impl Builder {
 	/// # Examples
 	///
 	/// ```
-	/// let builder = threadpool::Builder::new();
+	/// let builder = affinitypool::Builder::new();
 	/// ```
 	pub fn new() -> Builder {
 		Builder {
@@ -42,15 +42,17 @@ impl Builder {
 	/// ```
 	/// use std::thread;
 	///
-	/// let pool = threadpool::Builder::new()
-	///     .worker_threads(8)
-	///     .build();
+	/// let pool = affinitypool::Builder::new()
+	///         .worker_threads(8)
+	///         .build();
 	///
-	/// for _ in 0..100 {
-	///     pool.execute(|| {
-	///         println!("Hello from a worker thread!")
-	///     })
-	/// }
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	///     for _ in 0..10 {
+	///         pool.spawn(|| {
+	///             println!("Hello from a worker thread!")
+	///         }).await;
+	///     }
+	/// # });
 	/// ```
 	pub fn worker_threads(mut self, num_threads: usize) -> Builder {
 		assert!(num_threads > 0);
@@ -68,15 +70,17 @@ impl Builder {
 	/// ```
 	/// use std::thread;
 	///
-	/// let pool = threadpool::Builder::new()
-	///     .thread_name("foo".into())
+	/// let pool = affinitypool::Builder::new()
+	///     .thread_name("foo")
 	///     .build();
 	///
-	/// for _ in 0..100 {
-	///     pool.execute(|| {
-	///         assert_eq!(thread::current().name(), Some("foo"));
-	///     })
-	/// }
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	///     for _ in 0..10 {
+	///         pool.spawn(|| {
+	///             assert_eq!(thread::current().name(), Some("foo"));
+	///         }).await;
+	///     }
+	/// # });
 	/// ```
 	pub fn thread_name(mut self, name: impl Into<String>) -> Builder {
 		self.thread_name = Some(name.into());
@@ -92,15 +96,17 @@ impl Builder {
 	/// Each thread spawned by this pool will have a 4 MB stack:
 	///
 	/// ```
-	/// let pool = threadpool::Builder::new()
+	/// let pool = affinitypool::Builder::new()
 	///     .thread_stack_size(4_000_000)
 	///     .build();
 	///
-	/// for _ in 0..100 {
-	///     pool.execute(|| {
-	///         println!("This thread has a 4 MB stack size!");
-	///     })
-	/// }
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	///     for _ in 0..10 {
+	///         pool.spawn(|| {
+	///             println!("This thread has a 4 MB stack size!");
+	///         }).await;
+	///     }
+	/// # });
 	/// ```
 	pub fn thread_stack_size(mut self, size: usize) -> Builder {
 		self.thread_stack_size = Some(size);
@@ -114,15 +120,17 @@ impl Builder {
 	/// Each thread spawned will be linked to a separate core:
 	///
 	/// ```
-	/// let pool = threadpool::Builder::new()
+	/// let pool = affinitypool::Builder::new()
 	///     .thread_per_core(true)
 	///     .build();
 	///
-	/// for _ in 0..100 {
-	///     pool.execute(|| {
-	///         println!("This is executed on individual cores!");
-	///     })
-	/// }
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	///     for _ in 0..10 {
+	///         pool.spawn(|| {
+	///             println!("This is executed on individual cores!");
+	///         }).await;
+	///     }
+	/// # });
 	/// ```
 	pub fn thread_per_core(mut self, enabled: bool) -> Builder {
 		self.thread_per_core = enabled;
@@ -134,7 +142,7 @@ impl Builder {
 	/// # Examples
 	///
 	/// ```
-	/// let pool = threadpool::Builder::new()
+	/// let pool = affinitypool::Builder::new()
 	///     .worker_threads(8)
 	///     .thread_stack_size(4_000_000)
 	///     .build();

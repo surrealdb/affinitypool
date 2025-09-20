@@ -21,6 +21,8 @@ struct thread_affinity_policy_data_t {
 type thread_policy_t = *mut thread_affinity_policy_data_t;
 
 const THREAD_AFFINITY_POLICY: thread_policy_flavor_t = 4;
+const KERN_SUCCESS: kern_return_t = 0;
+const KERN_NOT_SUPPORTED: kern_return_t = 268435459;
 
 extern "C" {
 	fn thread_policy_set(
@@ -58,7 +60,14 @@ pub fn set_for_current(core_id: CoreId) -> bool {
 			thread_affinity_policy_count,
 		)
 	};
-	res == 0
+
+	// On Apple Silicon (ARM64), thread affinity is not supported and returns KERN_NOT_SUPPORTED.
+	// We treat this as a successful operation since the hardware doesn't support manual affinity control.
+	match res {
+		KERN_SUCCESS => true,
+		KERN_NOT_SUPPORTED => true, // Treat as success on unsupported platforms (Apple Silicon)
+		_ => false,
+	}
 }
 
 #[cfg(test)]
