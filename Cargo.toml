@@ -16,8 +16,9 @@ resolver = "2"
 default = []
 
 [dependencies]
-async-channel = "2.3.1"
+crossbeam = "0.8.4"
 num_cpus = "1.16.0"
+parking_lot = "0.12.3"
 thiserror = "1.0.63"
 tokio = { version = "1.42.0", features = ["sync"] }
 

@@ -1,9 +1,11 @@
-use async_channel::{Receiver, Sender};
-use std::sync::atomic::AtomicUsize;
-
 use crate::task::OwnedTask;
+use crossbeam::deque::{Injector, Stealer};
+use crossbeam::queue::ArrayQueue;
+use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::thread::Thread;
 
-#[derive(Debug)]
+/// Data shared between all worker threads
 pub(crate) struct Data {
 	/// The name of each thread
 	pub(crate) name: Option<String>,
@@ -13,8 +15,12 @@ pub(crate) struct Data {
 	pub(crate) num_threads: AtomicUsize,
 	/// The current number of threads
 	pub(crate) thread_count: AtomicUsize,
-	/// The sender used for queueing jobs for processing
-	pub(crate) sender: Sender<OwnedTask<'static>>,
-	/// The receiver used for taking jobs to be processed
-	pub(crate) receiver: Receiver<OwnedTask<'static>>,
+	/// The global task queue (injector)
+	pub(crate) injector: Injector<OwnedTask<'static>>,
+	/// Stealers for all worker threads
+	pub(crate) stealers: RwLock<Vec<Stealer<OwnedTask<'static>>>>,
+	/// Flag to indicate if workers should shut down
+	pub(crate) shutdown: AtomicBool,
+	/// Queue of parked threads waiting for work
+	pub(crate) parked_threads: ArrayQueue<Thread>,
 }

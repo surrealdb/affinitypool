@@ -5,7 +5,7 @@ use std::{
 	panic::{self, AssertUnwindSafe},
 	pin::Pin,
 	sync::{Arc, Condvar, Mutex},
-	task::{ready, Context, Poll},
+	task::{Context, Poll},
 };
 
 use crate::{atomic_waker::AtomicWaker, task::OwnedTask, Threadpool};
@@ -19,9 +19,8 @@ struct SpawnFutureData<T> {
 	waker: AtomicWaker,
 }
 
-enum State<'pool, F, R> {
+enum State<F, R> {
 	Init(F),
-	Sending(async_channel::Send<'pool, OwnedTask<'static>>, Arc<SpawnFutureData<R>>),
 	Running(Arc<SpawnFutureData<R>>),
 	Done,
 }
@@ -32,7 +31,7 @@ unsafe impl<T> Sync for SpawnFutureData<T> {}
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SpawnFuture<'pool, F, R> {
 	pool: &'pool Threadpool,
-	state: State<'pool, F, R>,
+	state: State<F, R>,
 }
 
 impl<'pool, F, R> SpawnFuture<'pool, F, R>
@@ -75,13 +74,13 @@ where
 						waker: AtomicWaker::new(),
 					});
 
-					// We need to register a waker immediatly so that if the task finishes before
-					// this thread can transition to State::Running ther is waker present to wake
+					// We need to register a waker immediately so that if the task finishes before
+					// this thread can transition to State::Running there is waker present to wake
 					// the future.
 					data.waker.register(cx.waker());
 
 					let data_clone = data.clone();
-					// send the task of to the thread no we are sure SpawnFuture will drop and not
+					// Send the task off to the thread now we are sure SpawnFuture will drop and not
 					// move.
 					let task = OwnedTask::new(move || {
 						// keep the lock until we are done.
@@ -100,26 +99,17 @@ where
 						// notify possible blocked threads of completion.
 						data_clone.condvar.notify_one();
 					});
-					let future = unsafe { self.pool.data.sender.send(task.erase_lifetime()) };
+
+					// Push the task to the global injector (synchronous operation)
 					unsafe {
-						self.as_mut().get_unchecked_mut().state = State::Sending(future, data);
+						self.pool.data.injector.push(task.erase_lifetime());
 					}
-				}
-				State::Sending(ref mut future, ref data) => {
-					// Make sure the right waker is in place such that we get notified the moment a
-					// the task is ready.
-					data.waker.register(cx.waker());
-					// pinning is structural for State::Sending and maintained by the
-					// implementation
-					unsafe { ready!(Pin::new_unchecked(future).poll(cx)) }.unwrap();
+					// Wake up a parked worker thread
+					if let Some(thread) = self.pool.data.parked_threads.pop() {
+						thread.unpark();
+					}
 
-					let State::Sending(_, data) = std::mem::replace(
-						unsafe { &mut self.as_mut().get_unchecked_mut().state },
-						State::Done,
-					) else {
-						unreachable!()
-					};
-
+					// Transition directly to Running state
 					unsafe {
 						self.as_mut().get_unchecked_mut().state = State::Running(data);
 					}
@@ -159,11 +149,10 @@ impl<F, T> Drop for SpawnFuture<'_, F, T> {
 	fn drop(&mut self) {
 		match self.state {
 			State::Init(_) => {}
-			State::Sending(_, _) => {}
 			State::Running(ref data) => {
 				let guard = data.result.lock().unwrap();
 
-				// result was not yet ready, wait until it is finshed.
+				// result was not yet ready, wait until it is finished.
 				// We need a `wait_while` because `wait` can spuriously wake even when the condvar
 				// was not yet notified.
 				std::mem::drop(data.condvar.wait_while(guard, |x| x.is_none()))

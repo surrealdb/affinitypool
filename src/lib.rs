@@ -1,4 +1,4 @@
-mod affinity;
+pub mod affinity;
 mod atomic_waker;
 mod builder;
 mod data;
@@ -14,10 +14,14 @@ pub use crate::error::Error;
 use crate::data::Data;
 use crate::global::THREADPOOL;
 use crate::sentry::Sentry;
+use crossbeam::deque::{Injector, Worker};
+use crossbeam::queue::ArrayQueue;
 use local::SpawnFuture;
+use parking_lot::RwLock;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use task::OwnedTask;
 use tokio::sync::oneshot;
 
@@ -58,7 +62,6 @@ where
 	}
 }
 
-#[derive(Debug)]
 pub struct Threadpool {
 	data: Arc<Data>,
 }
@@ -72,20 +75,31 @@ impl Default for Threadpool {
 impl Threadpool {
 	/// Create a new thread pool.
 	pub fn new(workers: usize) -> Self {
-		// Create a queuing channel for tasks
-		let (send, recv) = async_channel::unbounded();
+		// Create a global injector for tasks
+		let injector = Injector::new();
+		// Create workers and collect their stealers
+		let mut stealers = Vec::with_capacity(workers);
+		let mut worker_queues = Vec::with_capacity(workers);
+		// Create a Worker deque for each thread
+		for _ in 0..workers {
+			let worker = Worker::new_fifo();
+			stealers.push(worker.stealer());
+			worker_queues.push(worker);
+		}
 		// Create the threadpool shared data
 		let data = Arc::new(Data {
 			name: None,
 			stack_size: None,
 			num_threads: AtomicUsize::new(workers),
 			thread_count: AtomicUsize::new(0),
-			sender: send,
-			receiver: recv,
+			injector,
+			stealers: RwLock::new(stealers),
+			shutdown: AtomicBool::new(false),
+			parked_threads: ArrayQueue::new(workers),
 		});
 		// Spawn the desired number of workers
-		for _ in 0..workers {
-			Self::spin_up(None, data.clone());
+		for (index, worker) in worker_queues.into_iter().enumerate() {
+			Self::spin_up(None, data.clone(), worker, index);
 		}
 		// Return the new threadpool
 		Threadpool {
@@ -106,8 +120,12 @@ impl Threadpool {
 		let task = OwnedTask::new(move || {
 			tx.send(catch_unwind(AssertUnwindSafe(func))).ok();
 		});
-		// Send the function for processing
-		self.data.sender.send(task).await.unwrap();
+		// Push the task to the global injector
+		self.data.injector.push(task);
+		// Wake up a parked worker thread
+		if let Some(thread) = self.data.parked_threads.pop() {
+			thread.unpark();
+		}
 		// The channel has not been closed
 		let res = rx.await.unwrap();
 		// Wait for the function response
@@ -148,9 +166,68 @@ impl Threadpool {
 		self.data.num_threads.load(Ordering::Relaxed)
 	}
 
+	/// Finds the next task to execute.
+	///
+	/// Following the work-stealing pattern from crossbeam:
+	/// 1. Try to pop from the local worker queue
+	/// 2. Try to steal from the global injector
+	/// 3. Try to steal from other workers (if multi-threaded)
+	fn find_task(
+		local: &Worker<OwnedTask<'static>>,
+		data: &Arc<Data>,
+		index: usize,
+	) -> Option<OwnedTask<'static>> {
+		// Pop a task from the local queue, if not empty.
+		local.pop().or_else(|| {
+			// Track the number of retry loops
+			let mut retries = 0;
+			// Otherwise, we need to look for a task elsewhere.
+			std::iter::repeat_with(|| {
+				// Add spin hint on retries to reduce contention
+				if retries > 0 {
+					std::hint::spin_loop();
+				}
+				// Increment the number of retries
+				retries += 1;
+				// Try stealing a batch of tasks from the global queue.
+				let result = data.injector.steal_batch_and_pop(local);
+				// If there's work in the queue, wake a thread to help
+				if !data.injector.is_empty() {
+					if let Some(thread) = data.parked_threads.pop() {
+						thread.unpark();
+					}
+				}
+				// Return the stolen task, if there is one
+				result
+					// Or try stealing from one of the other threads
+					.or_else(|| {
+						// Try to steal from other workers, excluding our own
+						// Acquire read lock only when needed for stealing
+						let stealers = data.stealers.read();
+						stealers
+							.iter()
+							.enumerate()
+							.filter(|(i, _)| *i != index) // Don't steal from ourselves
+							.map(|(_, s)| s.steal())
+							.find(|s| !s.is_retry())
+							.unwrap_or(crossbeam::deque::Steal::Empty)
+					})
+			})
+			// Loop while no task was stolen and any steal operation needs to be retried.
+			.find(|s| !s.is_retry())
+			// Extract the stolen task, if there is one.
+			.and_then(|s| s.success())
+		})
+	}
+
 	/// Spins up a new worker thread in this pool.
 	#[cfg(not(target_family = "wasm"))]
-	fn spin_up(coreid: Option<usize>, data: Arc<Data>) {
+	fn spin_up(
+		coreid: Option<usize>,
+		data: Arc<Data>,
+		local: Worker<OwnedTask<'static>>,
+		index: usize,
+	) {
 		// Create a new thread builder
 		let mut builder = std::thread::Builder::new();
 		// Assign a name to the threads if specified
@@ -164,9 +241,7 @@ impl Threadpool {
 		// Increase the thread count counter
 		data.thread_count.fetch_add(1, Ordering::SeqCst);
 		// Create a new sentry watcher
-		let sentry = Sentry::new(coreid, Arc::downgrade(&data));
-		// Clone receiver
-		let receiver = data.receiver.clone();
+		let sentry = Sentry::new(coreid, index, Arc::downgrade(&data));
 		// Spawn a new worker thread
 		let _ = builder.spawn(move || {
 			// Assign this thread to a core
@@ -175,15 +250,31 @@ impl Threadpool {
 			}
 			// Loop continuously, processing any jobs
 			loop {
-				// Pull a message from the job channel
-				let job = match receiver.recv_blocking() {
-					// We received a job to process
-					Ok(job) => job,
-					// This threadpool was dropped
-					Err(_) => break,
-				};
-				// Process the function callback
-				job.run();
+				// Check if we should shut down
+				if data.shutdown.load(Ordering::Acquire) {
+					break;
+				}
+				// Try to find a task using work-stealing
+				if let Some(task) = Self::find_task(&local, &data, index) {
+					// Process the task
+					task.run();
+				} else {
+					// No work found, so park this thread
+					let _ = data.parked_threads.push(std::thread::current());
+					// Double-check for work (prevent race)
+					if !data.injector.is_empty() {
+						// Work just arrived, unpark someone (might be us)
+						if let Some(t) = data.parked_threads.pop() {
+							if t.id() != std::thread::current().id() {
+								t.unpark();
+							} else {
+								continue; // It was us, go find work
+							}
+						}
+					}
+					// Park with timeout
+					std::thread::park_timeout(Duration::from_millis(10));
+				}
 			}
 			// This thread has exited cleanly
 			sentry.cancel();
@@ -192,7 +283,23 @@ impl Threadpool {
 
 	/// Spins up a new worker thread in this pool.
 	#[cfg(target_family = "wasm")]
-	fn spin_up(coreid: Option<usize>, data: Arc<Data>) {
+	fn spin_up(
+		coreid: Option<usize>,
+		data: Arc<Data>,
+		local: Worker<OwnedTask<'static>>,
+		index: usize,
+	) {
 		// Do nothing in WASM
+	}
+}
+
+impl Drop for Threadpool {
+	fn drop(&mut self) {
+		// Signal all workers to shut down
+		self.data.shutdown.store(true, Ordering::Release);
+		// Wake up all parked workers
+		while let Some(thread) = self.data.parked_threads.pop() {
+			thread.unpark();
+		}
 	}
 }

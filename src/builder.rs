@@ -1,5 +1,8 @@
 use crate::Data;
 use crate::Threadpool;
+use crossbeam::deque::{Injector, Worker};
+use crossbeam::queue::ArrayQueue;
+use parking_lot::RwLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -148,33 +151,44 @@ impl Builder {
 	///     .build();
 	/// ```
 	pub fn build(self) -> Threadpool {
-		// Create a queuing channel for tasks
-		let (send, recv) = async_channel::unbounded();
 		// Calculate how many threads to spawn
-		let workers = if self.thread_per_core || self.num_threads.is_none() {
+		let threads = if self.thread_per_core || self.num_threads.is_none() {
 			num_cpus::get()
 		} else {
 			self.num_threads.unwrap()
 		};
+		// Create a global injector for tasks
+		let injector = Injector::new();
+		// Create workers and collect their stealers
+		let mut workers = Vec::with_capacity(threads);
+		let mut stealers = Vec::with_capacity(threads);
+		// Create a Worker deque for each thread
+		for _ in 0..threads {
+			let worker = Worker::new_fifo();
+			stealers.push(worker.stealer());
+			workers.push(worker);
+		}
 		// Create the threadpool shared data
 		let data = Arc::new(Data {
 			name: self.thread_name,
-			stack_size: None,
-			num_threads: AtomicUsize::new(workers),
+			stack_size: self.thread_stack_size,
+			num_threads: AtomicUsize::new(threads),
 			thread_count: AtomicUsize::new(0),
-			sender: send,
-			receiver: recv,
+			injector,
+			stealers: RwLock::new(stealers),
+			shutdown: std::sync::atomic::AtomicBool::new(false),
+			parked_threads: ArrayQueue::new(threads),
 		});
 		// Use affinity if spawning thread per core
 		if self.thread_per_core {
 			// Spawn the desired number of workers
-			for id in 0..workers {
-				Threadpool::spin_up(Some(id), data.clone());
+			for (id, worker) in workers.into_iter().enumerate() {
+				Threadpool::spin_up(Some(id), data.clone(), worker, id);
 			}
 		} else {
 			// Spawn the desired number of workers
-			for _ in 0..workers {
-				Threadpool::spin_up(None, data.clone());
+			for (index, worker) in workers.into_iter().enumerate() {
+				Threadpool::spin_up(None, data.clone(), worker, index);
 			}
 		}
 		// Return the new threadpool
