@@ -82,6 +82,6 @@ mod tests {
 
 		assert!(ids.len() > 0);
 
-		assert_ne!(set_for_current(ids[0]), 0);
+		assert!(set_for_current(ids[0]));
 	}
 }

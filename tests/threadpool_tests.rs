@@ -2,7 +2,7 @@ use affinitypool::{Builder, Threadpool};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[tokio::test]
 async fn test_basic_task_execution() {
@@ -197,20 +197,22 @@ async fn test_concurrent_spawns() {
 }
 
 #[tokio::test]
-async fn test_work_stealing_efficiency() {
+async fn test_mixed_workload_completion() {
+	// Tests that the threadpool correctly handles a mix of fast and slow tasks,
+	// ensuring all tasks complete and return correct results.
+	// Performance characteristics are measured by the benchmarks.
 	let pool = Threadpool::new(4);
-	let start = Instant::now();
 
 	// Create a mix of fast and slow tasks
 	let mut all_results = Vec::new();
 
-	// Some quick tasks
+	// Some quick tasks (group 1)
 	let mut quick_handles1 = Vec::new();
 	for i in 0..50 {
 		quick_handles1.push(pool.spawn(move || i * 2));
 	}
 
-	// Some slower tasks
+	// Some slower tasks with sleep
 	let mut slow_handles = Vec::new();
 	for i in 0..10 {
 		slow_handles.push(pool.spawn(move || {
@@ -219,13 +221,13 @@ async fn test_work_stealing_efficiency() {
 		}));
 	}
 
-	// More quick tasks
+	// More quick tasks (group 2)
 	let mut quick_handles2 = Vec::new();
 	for i in 0..50 {
 		quick_handles2.push(pool.spawn(move || i * 4));
 	}
 
-	// Collect all results
+	// Collect all results - verifying they all complete
 	for handle in quick_handles1 {
 		all_results.push(handle.await);
 	}
@@ -236,15 +238,24 @@ async fn test_work_stealing_efficiency() {
 		all_results.push(handle.await);
 	}
 
-	let elapsed = start.elapsed();
-
-	// All tasks should complete
+	// Verify all tasks completed
 	assert_eq!(all_results.len(), 110);
 
-	// Should be reasonably efficient (not waiting for all slow tasks sequentially)
-	// With 4 threads and 10 tasks of 10ms each, optimal would be ~30ms
-	// Allow for some overhead
-	assert!(elapsed < Duration::from_millis(200), "Took too long: {:?}", elapsed);
+	// Verify results are correct
+	// First 50 should be 0*2, 1*2, ..., 49*2
+	let group1_results: Vec<_> = all_results[0..50].to_vec();
+	let expected1: Vec<_> = (0..50).map(|i| i * 2).collect();
+	assert_eq!(group1_results, expected1, "First group of quick tasks produced incorrect results");
+
+	// Next 10 should be 0*3, 1*3, ..., 9*3
+	let slow_results: Vec<_> = all_results[50..60].to_vec();
+	let expected_slow: Vec<_> = (0..10).map(|i| i * 3).collect();
+	assert_eq!(slow_results, expected_slow, "Slow tasks produced incorrect results");
+
+	// Last 50 should be 0*4, 1*4, ..., 49*4
+	let group2_results: Vec<_> = all_results[60..110].to_vec();
+	let expected2: Vec<_> = (0..50).map(|i| i * 4).collect();
+	assert_eq!(group2_results, expected2, "Second group of quick tasks produced incorrect results");
 }
 
 #[tokio::test]
