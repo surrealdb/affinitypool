@@ -109,7 +109,7 @@ async fn test_spawn_local() {
 	let pool = Threadpool::new(4);
 
 	// Test that spawn_local works with local borrowing
-	let data = vec![1, 2, 3, 4, 5];
+	let data = [1, 2, 3, 4, 5];
 	let result = pool.spawn_local(|| data.iter().sum::<i32>()).await;
 
 	assert_eq!(result, 15);
@@ -410,8 +410,8 @@ async fn test_nested_spawns() {
 
 #[tokio::test]
 async fn test_threads_properly_joined_on_drop() {
-	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::thread;
 	use std::time::{Duration, Instant};
 
@@ -464,8 +464,8 @@ async fn test_threads_properly_joined_on_drop() {
 
 #[tokio::test]
 async fn test_drop_waits_for_running_tasks() {
-	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::time::{Duration, Instant};
 
 	let completed_tasks = Arc::new(AtomicUsize::new(0));
@@ -498,8 +498,8 @@ async fn test_drop_waits_for_running_tasks() {
 
 #[tokio::test]
 async fn test_all_threads_joined_including_panicked() {
-	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::time::Duration;
 
 	// Track how many threads have been created
@@ -550,8 +550,8 @@ async fn test_all_threads_joined_including_panicked() {
 
 #[tokio::test]
 async fn test_no_lost_wakeups_race_condition() {
-	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::time::{Duration, Instant};
 
 	// This test verifies that the park/unpark race condition is handled correctly
@@ -602,7 +602,7 @@ async fn test_spawn_local_lifetime_safety() {
 
 	// Test 1: Verify no use-after-free with local data
 	{
-		let local_data = vec![1, 2, 3, 4, 5];
+		let local_data = [1, 2, 3, 4, 5];
 
 		let result = pool
 			.spawn_local(move || {
@@ -618,7 +618,7 @@ async fn test_spawn_local_lifetime_safety() {
 	// Test 2: Multiple spawn_local calls with different captured data
 	let mut results = Vec::new();
 	for i in 0..5 {
-		let data = vec![i; 5];
+		let data = [i; 5];
 		results.push(
 			pool.spawn_local(move || {
 				// Each closure captures different data

@@ -21,15 +21,19 @@ unsafe impl Send for OwnedTask<'_> {}
 
 impl<'a> OwnedTask<'a> {
 	unsafe fn call<T: FnOnce() + Send + 'a>(this: NonNull<()>) {
-		let mut this = this.cast::<TaskData<T>>();
-		ManuallyDrop::take(&mut this.as_mut().data)();
-		mem::drop(Box::from_raw(this.as_ptr()));
+		unsafe {
+			let mut this = this.cast::<TaskData<T>>();
+			ManuallyDrop::take(&mut this.as_mut().data)();
+			mem::drop(Box::from_raw(this.as_ptr()));
+		}
 	}
 
 	unsafe fn drop<T>(this: NonNull<()>) {
-		let mut this = this.cast::<TaskData<T>>();
-		ManuallyDrop::drop(&mut this.as_mut().data);
-		mem::drop(Box::from_raw(this.as_ptr()));
+		unsafe {
+			let mut this = this.cast::<TaskData<T>>();
+			ManuallyDrop::drop(&mut this.as_mut().data);
+			mem::drop(Box::from_raw(this.as_ptr()));
+		}
 	}
 
 	fn get_vtable<F: FnOnce() + Send>() -> &'static TaskVTable {

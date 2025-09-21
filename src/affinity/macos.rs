@@ -24,7 +24,7 @@ const THREAD_AFFINITY_POLICY: thread_policy_flavor_t = 4;
 const KERN_SUCCESS: kern_return_t = 0;
 const KERN_NOT_SUPPORTED: kern_return_t = 268435459;
 
-extern "C" {
+unsafe extern "C" {
 	fn thread_policy_set(
 		thread: thread_t,
 		flavor: thread_policy_flavor_t,

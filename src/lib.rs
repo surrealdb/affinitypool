@@ -18,9 +18,9 @@ use crossbeam::deque::{Injector, Worker};
 use crossbeam::queue::ArrayQueue;
 use local::SpawnFuture;
 use parking_lot::RwLock;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use task::OwnedTask;
 use tokio::sync::oneshot;
@@ -198,10 +198,10 @@ impl Threadpool {
 				// Try stealing a batch of tasks from the global queue.
 				let result = data.injector.steal_batch_and_pop(local);
 				// If there's work in the queue, wake a thread to help
-				if !data.injector.is_empty() {
-					if let Some(thread) = data.parked_threads.pop() {
-						thread.unpark();
-					}
+				if !data.injector.is_empty()
+					&& let Some(thread) = data.parked_threads.pop()
+				{
+					thread.unpark();
 				}
 				// Return the stolen task, if there is one
 				result
