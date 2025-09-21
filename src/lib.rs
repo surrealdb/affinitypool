@@ -240,7 +240,7 @@ impl Threadpool {
 			builder = builder.stack_size(stack_size);
 		}
 		// Increase the thread count counter
-		data.thread_count.fetch_add(1, Ordering::SeqCst);
+		data.thread_count.fetch_add(1, Ordering::Relaxed);
 		// Create a new sentry watcher
 		let sentry = Sentry::new(coreid, index, Arc::downgrade(&data));
 		// Clone data for handle storage
@@ -314,6 +314,6 @@ impl Drop for Threadpool {
 			let _ = handle.join();
 		}
 		// Decrement thread count to 0
-		self.data.thread_count.store(0, Ordering::SeqCst);
+		self.data.thread_count.store(0, Ordering::Relaxed);
 	}
 }
