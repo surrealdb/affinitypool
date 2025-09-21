@@ -25,6 +25,9 @@ use std::time::Duration;
 use task::OwnedTask;
 use tokio::sync::oneshot;
 
+/// Maximum number of worker threads allowed in a thread pool.
+pub const MAX_THREADS: usize = 512;
+
 /// Queue a new command for execution on the global threadpool.
 ///
 /// If no global threadpool has been created, then this function
@@ -75,6 +78,8 @@ impl Default for Threadpool {
 impl Threadpool {
 	/// Create a new thread pool.
 	pub fn new(workers: usize) -> Self {
+		// Validate worker count
+		let workers = workers.clamp(1, MAX_THREADS);
 		// Create a global injector for tasks
 		let injector = Injector::new();
 		// Create workers and collect their stealers

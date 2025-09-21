@@ -1,5 +1,6 @@
 use crate::Data;
 use crate::Threadpool;
+use crate::MAX_THREADS;
 use crossbeam::deque::{Injector, Worker};
 use crossbeam::queue::ArrayQueue;
 use parking_lot::RwLock;
@@ -58,7 +59,6 @@ impl Builder {
 	/// # });
 	/// ```
 	pub fn worker_threads(mut self, num_threads: usize) -> Builder {
-		assert!(num_threads > 0);
 		self.num_threads = Some(num_threads);
 		self
 	}
@@ -152,10 +152,12 @@ impl Builder {
 	/// ```
 	pub fn build(self) -> Threadpool {
 		// Calculate how many threads to spawn
-		let threads = if self.thread_per_core || self.num_threads.is_none() {
-			num_cpus::get()
+		let threads = if let Some(num_threads) = self.num_threads {
+			num_threads.clamp(1, MAX_THREADS)
+		} else if self.thread_per_core {
+			num_cpus::get().clamp(1, MAX_THREADS)
 		} else {
-			self.num_threads.unwrap()
+			2
 		};
 		// Create a global injector for tasks
 		let injector = Injector::new();

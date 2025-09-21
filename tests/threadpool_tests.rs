@@ -268,10 +268,109 @@ async fn test_single_thread_pool() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "assertion failed")]
-async fn test_zero_threads_panics() {
-	// This should panic as per the Builder implementation
-	Builder::new().worker_threads(0).build();
+async fn test_zero_threads_clamped_to_one() {
+	// Zero threads should be clamped to 1
+	let pool = Builder::new().worker_threads(0).build();
+	assert_eq!(pool.num_threads(), 1);
+
+	// Verify the pool works
+	let result = pool.spawn(|| 42).await;
+	assert_eq!(result, 42);
+}
+
+#[tokio::test]
+async fn test_zero_threads_direct_clamped_to_one() {
+	// Direct construction with 0 workers should clamp to 1
+	let pool = Threadpool::new(0);
+	assert_eq!(pool.num_threads(), 1);
+
+	// Verify it works
+	let result = pool.spawn(|| "hello").await;
+	assert_eq!(result, "hello");
+}
+
+#[tokio::test]
+async fn test_too_many_threads_clamped_to_max() {
+	// Exceeding MAX_THREADS should clamp to MAX_THREADS (512)
+	let pool = Threadpool::new(1000);
+	assert_eq!(pool.num_threads(), 512);
+
+	// Verify it works
+	let result = pool.spawn(|| 123).await;
+	assert_eq!(result, 123);
+}
+
+#[tokio::test]
+async fn test_builder_too_many_threads_clamped() {
+	// Builder should also clamp to MAX_THREADS
+	let pool = Builder::new().worker_threads(10_000).build();
+	assert_eq!(pool.num_threads(), 512);
+
+	// Verify it works
+	let result = pool.spawn(|| vec![1, 2, 3]).await;
+	assert_eq!(result, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn test_max_threads_allowed() {
+	// Test that exactly MAX_THREADS (512) is allowed
+	let pool = Threadpool::new(512);
+	// Just verify it was created successfully
+	assert_eq!(pool.num_threads(), 512);
+
+	// Test a simple task to ensure the pool works
+	let result = pool.spawn(|| 42).await;
+	assert_eq!(result, 42);
+
+	// Test that values above 512 are clamped
+	let pool2 = Threadpool::new(513);
+	assert_eq!(pool2.num_threads(), 512);
+}
+
+#[tokio::test]
+async fn test_reasonable_thread_counts() {
+	// Test various reasonable thread counts within limits
+	for count in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
+		let pool = Threadpool::new(count);
+		assert_eq!(pool.num_threads(), count);
+
+		// Run a simple task
+		let result = pool.spawn(move || count * 2).await;
+		assert_eq!(result, count * 2);
+	}
+}
+
+#[tokio::test]
+async fn test_clamping_behavior() {
+	// Test that various out-of-bounds values are clamped correctly
+
+	// Values below minimum
+	assert_eq!(Threadpool::new(0).num_threads(), 1);
+
+	// Values above maximum
+	assert_eq!(Threadpool::new(513).num_threads(), 512);
+	assert_eq!(Threadpool::new(1000).num_threads(), 512);
+	assert_eq!(Threadpool::new(usize::MAX).num_threads(), 512);
+
+	// Builder with various values
+	assert_eq!(Builder::new().worker_threads(0).build().num_threads(), 1);
+	assert_eq!(Builder::new().worker_threads(600).build().num_threads(), 512);
+
+	// Default builder behavior (should use 2 threads as fallback)
+	assert_eq!(Builder::new().build().num_threads(), 2);
+}
+
+#[tokio::test]
+async fn test_default_threadpool() {
+	// Default threadpool should use num_cpus clamped to MAX_THREADS
+	let pool = Threadpool::default();
+	let cpu_count = num_cpus::get();
+	let expected = cpu_count.min(512);
+	assert_eq!(pool.num_threads(), expected);
+
+	// Verify it works
+	let result = pool.spawn(|| "default pool").await;
+	assert_eq!(result, "default pool");
 }
 
 #[tokio::test]
