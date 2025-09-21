@@ -1,14 +1,14 @@
 #![cfg(target_os = "freebsd")]
 
 use super::CoreId;
-use libc::cpu_set_t;
-use libc::sched_getaffinity;
-use libc::sched_setaffinity;
 use libc::CPU_ISSET;
 use libc::CPU_LEVEL_WHICH;
 use libc::CPU_SET;
 use libc::CPU_SETSIZE;
 use libc::CPU_WHICH_TID;
+use libc::cpu_set_t;
+use libc::sched_getaffinity;
+use libc::sched_setaffinity;
 use std::mem;
 
 pub fn get_core_ids() -> Option<Vec<CoreId>> {

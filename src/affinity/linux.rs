@@ -1,12 +1,12 @@
 #![cfg(any(target_os = "android", target_os = "linux"))]
 
 use super::CoreId;
-use libc::cpu_set_t;
-use libc::sched_getaffinity;
-use libc::sched_setaffinity;
 use libc::CPU_ISSET;
 use libc::CPU_SET;
 use libc::CPU_SETSIZE;
+use libc::cpu_set_t;
+use libc::sched_getaffinity;
+use libc::sched_setaffinity;
 use std::mem;
 
 pub fn get_core_ids() -> Option<Vec<CoreId>> {
@@ -79,7 +79,7 @@ mod tests {
 		match get_affinity_mask() {
 			Some(_) => {}
 			None => {
-				assert!(false);
+				panic!("Failed to get affinity mask on Linux");
 			}
 		}
 	}
@@ -91,7 +91,7 @@ mod tests {
 				assert_eq!(set.len(), num_cpus::get());
 			}
 			None => {
-				assert!(false);
+				panic!("Failed to get core IDs on Linux");
 			}
 		}
 	}
@@ -100,10 +100,10 @@ mod tests {
 	fn test_linux_set_for_current() {
 		let ids = get_core_ids().unwrap();
 
-		assert!(ids.len() > 0);
+		assert!(!ids.is_empty());
 
 		let res = set_for_current(ids[0]);
-		assert_eq!(res, true);
+		assert!(res);
 
 		// Ensure that the system pinned the current thread
 		// to the specified core.

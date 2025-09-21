@@ -1,7 +1,7 @@
 use affinitypool::{Builder, Threadpool};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 

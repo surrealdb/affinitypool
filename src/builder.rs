@@ -1,11 +1,11 @@
 use crate::Data;
-use crate::Threadpool;
 use crate::MAX_THREADS;
+use crate::Threadpool;
 use crossbeam::deque::{Injector, Worker};
 use crossbeam::queue::ArrayQueue;
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 #[derive(Default, Clone)]
 pub struct Builder {

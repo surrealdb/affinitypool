@@ -4,13 +4,13 @@ use std::{
 	panic::{self, AssertUnwindSafe},
 	pin::Pin,
 	sync::{
-		atomic::{AtomicBool, Ordering},
 		Arc, Condvar, Mutex,
+		atomic::{AtomicBool, Ordering},
 	},
 	task::{Context, Poll},
 };
 
-use crate::{atomic_waker::AtomicWaker, task::OwnedTask, Threadpool};
+use crate::{Threadpool, atomic_waker::AtomicWaker, task::OwnedTask};
 
 struct SpawnFutureData<T> {
 	// Atomic flag to check if result is ready without taking a lock
