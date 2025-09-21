@@ -56,9 +56,20 @@ impl<'a> OwnedTask<'a> {
 		Self(unsafe { NonNull::new_unchecked(Box::into_raw(b).cast()) }, PhantomData)
 	}
 
+	/// Erases the lifetime parameter of this task, converting it to 'static.
+	///
 	/// # Safety
-	/// Caller must ensure that the closure within the task remains valid for the duration of the
-	/// lifetime of the returned object.
+	///
+	/// This is extremely unsafe! The caller must ensure:
+	/// 1. The closure within the task remains valid for the entire lifetime of the returned object
+	/// 2. Any data captured by the closure outlives the task execution
+	/// 3. The task will be executed before any referenced data is deallocated
+	/// 4. Proper synchronization exists to prevent use-after-free
+	///
+	/// In practice, this should only be used when:
+	/// - The task is immediately queued for execution
+	/// - There's a synchronization mechanism (like Drop blocking) that ensures task completion
+	/// - The threadpool joins all threads before deallocation
 	pub unsafe fn erase_lifetime(self) -> OwnedTask<'static> {
 		let res = OwnedTask(self.0, PhantomData);
 		std::mem::forget(self);

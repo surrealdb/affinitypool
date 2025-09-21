@@ -493,3 +493,87 @@ async fn test_no_lost_wakeups_race_condition() {
 
 	assert_eq!(tasks_completed.load(Ordering::SeqCst), 100);
 }
+
+#[tokio::test]
+async fn test_spawn_local_lifetime_safety() {
+	// This test verifies that spawn_local properly handles lifetime erasure
+	// and safely manages local data capture
+
+	let pool = Threadpool::new(2);
+
+	// Test 1: Verify no use-after-free with local data
+	{
+		let local_data = vec![1, 2, 3, 4, 5];
+
+		let result = pool
+			.spawn_local(move || {
+				// Access the local data - this is safe because spawn_local
+				// ensures the task completes before the future is dropped
+				local_data.iter().sum::<i32>()
+			})
+			.await;
+
+		assert_eq!(result, 15);
+	}
+
+	// Test 2: Multiple spawn_local calls with different captured data
+	let mut results = Vec::new();
+	for i in 0..5 {
+		let data = vec![i; 5];
+		results.push(
+			pool.spawn_local(move || {
+				// Each closure captures different data
+				data.iter().sum::<i32>()
+			})
+			.await,
+		);
+	}
+	assert_eq!(results, vec![0, 5, 10, 15, 20]);
+
+	// Test 3: Complex data capture
+	{
+		let string_data = String::from("Hello, World!");
+		let vec_data = vec![1, 2, 3];
+		let tuple_data = (42, "test");
+
+		let result = pool
+			.spawn_local(move || format!("{} - {:?} - {:?}", string_data, vec_data, tuple_data))
+			.await;
+
+		assert_eq!(result, "Hello, World! - [1, 2, 3] - (42, \"test\")");
+	}
+
+	// Test 4: Verify spawn_local can safely reference pool lifetime
+	let value = 100;
+	let result = pool.spawn_local(|| value * 2).await;
+	assert_eq!(result, 200);
+}
+
+#[tokio::test]
+async fn test_spawn_local_no_nested_deadlock() {
+	// Verify we handle the potential deadlock case where SpawnFuture
+	// is dropped from within a pool thread
+
+	let pool = Arc::new(Threadpool::new(2));
+
+	// This would deadlock if not handled properly
+	let pool_clone = pool.clone();
+	let result = pool
+		.spawn(move || {
+			// We're now inside a pool thread
+			let pool = pool_clone;
+
+			// Create a SpawnFuture and immediately drop it
+			// This should NOT deadlock thanks to our detection
+			{
+				let _future = pool.spawn_local(|| 42);
+				// Future dropped here without awaiting
+			}
+
+			// Return something to show we didn't deadlock
+			"no deadlock"
+		})
+		.await;
+
+	assert_eq!(result, "no deadlock");
+}
