@@ -3,18 +3,13 @@ use std::{
 	future::Future,
 	panic::{self, AssertUnwindSafe},
 	pin::Pin,
-	sync::{
-		Arc, Condvar, Mutex,
-		atomic::{AtomicBool, Ordering},
-	},
+	sync::{Arc, Condvar, Mutex},
 	task::{Context, Poll},
 };
 
 use crate::{Threadpool, atomic_waker::AtomicWaker, task::OwnedTask};
 
 struct SpawnFutureData<T> {
-	// Atomic flag to check if result is ready without taking a lock
-	ready: AtomicBool,
 	// cond var to wait on the result of the mutex changing when we find it empty during block.
 	condvar: Condvar,
 	// Waker to notify the runtime of completion of the task.
@@ -65,7 +60,7 @@ where
 			// Safety: We're maintaining pinning guarantees throughout
 			let this = unsafe { self.as_mut().get_unchecked_mut() };
 			// Match on the current state of the future.
-			match &mut this.state {
+			match this.state {
 				State::Init(_) => {
 					// Transition to a Done state before we submit the task to avoid race conditions.
 					let State::Init(task) = std::mem::replace(&mut this.state, State::Done) else {
@@ -73,7 +68,6 @@ where
 					};
 					// Create the data for the future.
 					let data = Arc::new(SpawnFutureData {
-						ready: AtomicBool::new(false),
 						condvar: Condvar::new(),
 						result: Mutex::new(None),
 						waker: AtomicWaker::new(),
@@ -94,8 +88,6 @@ where
 							*lock = Some(res);
 							// Lock drops here automatically.
 						}
-						// Mark result as ready (memory fence before waking)
-						data_clone.ready.store(true, Ordering::Release);
 						// Wake the future.
 						data_clone.waker.wake();
 						// Notify any blocked threads.
@@ -113,21 +105,33 @@ where
 					// Transition this future to the Running state.
 					this.state = State::Running(data);
 				}
-				State::Running(data) => {
-					// Check if result is ready without locking.
-					if !data.ready.load(Ordering::Acquire) {
-						data.waker.register(cx.waker());
-						return Poll::Pending;
+				State::Running(ref data) => {
+					// Clone the Arc so we can work with it without borrowing from state
+					let data = data.clone();
+					// Try to get the result
+					match data.result.try_lock() {
+						Ok(mut guard) => {
+							if let Some(res) = guard.take() {
+								// Result is ready, drop the guard first
+								drop(guard);
+								// Now we can modify state
+								this.state = State::Done;
+								return Poll::Ready(
+									res.unwrap_or_else(|p| panic::resume_unwind(p)),
+								);
+							} else {
+								// Task not complete yet
+								drop(guard);
+								data.waker.register(cx.waker());
+								return Poll::Pending;
+							}
+						}
+						Err(_) => {
+							// Task is currently writing result
+							data.waker.register(cx.waker());
+							return Poll::Pending;
+						}
 					}
-					// Result is ready, take it.
-					let res = {
-						let mut guard = data.result.lock().unwrap();
-						guard.take().expect("ready flag was true but result was None")
-					};
-					// Mark this future as done.
-					this.state = State::Done;
-					// Mark this future as ready.
-					return Poll::Ready(res.unwrap_or_else(|p| panic::resume_unwind(p)));
 				}
 				State::Done => {
 					// We should never get to this state by polling a future once done.
@@ -141,11 +145,7 @@ where
 impl<F, T> Drop for SpawnFuture<'_, F, T> {
 	fn drop(&mut self) {
 		if let State::Running(ref data) = self.state {
-			// Fast path: check if already complete
-			if data.ready.load(Ordering::Acquire) {
-				return;
-			}
-			// Slow path: block and wait for completion
+			// Block and wait for completion
 			let guard = data.result.lock().unwrap();
 			// Wait until result is ready (handling spurious wakeups)
 			let _guard = data.condvar.wait_while(guard, |x| x.is_none()).unwrap();
