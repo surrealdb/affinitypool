@@ -21,7 +21,6 @@ use parking_lot::RwLock;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 use task::OwnedTask;
 use tokio::sync::oneshot;
 
@@ -277,14 +276,17 @@ impl Threadpool {
 							t.unpark();
 						}
 					}
-					// Park this thread for a short time
-					std::thread::park_timeout(Duration::from_millis(10));
+					// Check shutdown flag again before parking
+					if data.shutdown.load(Ordering::Acquire) {
+						break;
+					}
+					// Park this thread indefinitely until woken
+					std::thread::park();
 				}
 			}
 			// This thread has exited cleanly
 			sentry.cancel();
 		});
-
 		// Store the thread handle if spawning succeeded
 		if let Ok(handle) = handle {
 			data_clone.thread_handles.write().push(handle);
