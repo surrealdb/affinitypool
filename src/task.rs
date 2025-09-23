@@ -64,16 +64,16 @@ impl<'a> OwnedTask<'a> {
 	///
 	/// # Safety
 	///
-	/// This is extremely unsafe! The caller must ensure:
-	/// 1. The closure within the task remains valid for the entire lifetime of the returned object
-	/// 2. Any data captured by the closure outlives the task execution
-	/// 3. The task will be executed before any referenced data is deallocated
-	/// 4. Proper synchronization exists to prevent use-after-free
+	/// The caller must ensure that the closure and all data it captures remain
+	/// valid for as long as the returned `OwnedTask<'static>` exists.
 	///
-	/// In practice, this should only be used when:
-	/// - The task is immediately queued for execution
-	/// - There's a synchronization mechanism (like Drop blocking) that ensures task completion
-	/// - The threadpool joins all threads before deallocation
+	/// The returned task can be safely dropped without execution - the Drop impl
+	/// will properly clean up the closure. However, any borrowed data captured
+	/// by the closure must outlive the `OwnedTask<'static>` object.
+	///
+	/// This is safe when the task's actual lifetime is managed externally, such
+	/// as through `Arc` reference counting or when the caller blocks until the
+	/// task completes or is dropped.
 	pub unsafe fn erase_lifetime(self) -> OwnedTask<'static> {
 		let res = OwnedTask(self.0, PhantomData);
 		std::mem::forget(self);
