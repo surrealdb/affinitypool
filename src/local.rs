@@ -1,39 +1,38 @@
 use std::{
 	any::Any,
 	future::Future,
-	mem,
 	panic::{self, AssertUnwindSafe},
 	pin::Pin,
 	sync::{Arc, Condvar, Mutex},
-	task::{ready, Context, Poll},
+	task::{Context, Poll},
 };
 
-use crate::{atomic_waker::AtomicWaker, task::OwnedTask, Threadpool};
+use crate::{Threadpool, atomic_waker::AtomicWaker, task::OwnedTask};
 
 struct SpawnFutureData<T> {
 	// cond var to wait on the result of the mutex changing when we find it empty during block.
 	condvar: Condvar,
-	// The actual value, if the future is properly driven to completion we never block on the mutex.
-	result: Mutex<Option<Result<T, Box<dyn Any + Send>>>>,
 	// Waker to notify the runtime of completion of the task.
 	waker: AtomicWaker,
+	// The actual value, if the future is properly driven to completion we never block on the mutex.
+	result: Mutex<Option<Result<T, Box<dyn Any + Send>>>>,
 }
 
-enum State<'pool, F, R> {
+enum State<F, R> {
 	Init(F),
-	Sending(async_channel::Send<'pool, OwnedTask<'static>>, Arc<SpawnFutureData<R>>),
 	Running(Arc<SpawnFutureData<R>>),
 	Done,
 }
 
-unsafe impl<T> Send for SpawnFutureData<T> {}
-unsafe impl<T> Sync for SpawnFutureData<T> {}
-
+/// A future that spawns a task on the threadpool and returns the result.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SpawnFuture<'pool, F, R> {
 	pool: &'pool Threadpool,
-	state: State<'pool, F, R>,
+	state: State<F, R>,
 }
+
+unsafe impl<T> Send for SpawnFutureData<T> {}
+unsafe impl<T> Sync for SpawnFutureData<T> {}
 
 impl<'pool, F, R> SpawnFuture<'pool, F, R>
 where
@@ -56,99 +55,87 @@ where
 	type Output = T;
 
 	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		// pin is structural for everything.
-		// pinning maintained by function impl.
-
+		// Pin is structural for everything, and is maintained by the function impl.
 		loop {
-			match unsafe { &mut self.as_mut().get_unchecked_mut().state } {
+			// Safety: We're maintaining pinning guarantees throughout
+			let this = unsafe { self.as_mut().get_unchecked_mut() };
+			// Match on the current state of the future.
+			match this.state {
 				State::Init(_) => {
-					let State::Init(task) = std::mem::replace(
-						unsafe { &mut self.as_mut().get_unchecked_mut().state },
-						State::Done,
-					) else {
+					// Transition to a Done state before we submit the task to avoid race conditions.
+					let State::Init(task) = std::mem::replace(&mut this.state, State::Done) else {
 						unreachable!()
 					};
-
+					// Create the data for the future.
 					let data = Arc::new(SpawnFutureData {
 						condvar: Condvar::new(),
 						result: Mutex::new(None),
 						waker: AtomicWaker::new(),
 					});
-
-					// We need to register a waker immediatly so that if the task finishes before
-					// this thread can transition to State::Running ther is waker present to wake
-					// the future.
+					// Register waker before submitting task to avoid race condition.
 					data.waker.register(cx.waker());
-
+					// Clone the data for the future.
 					let data_clone = data.clone();
-					// send the task of to the thread no we are sure SpawnFuture will drop and not
-					// move.
+					// Create the task to run the passed function.
 					let task = OwnedTask::new(move || {
-						// keep the lock until we are done.
+						// Execute task and store result.
 						{
+							// Store the result of the task in the mutex.
 							let mut lock = data_clone.result.lock().unwrap();
+							// Run the task itself, and catch any panics.
 							let res = panic::catch_unwind(AssertUnwindSafe(task));
-
+							// Store the result in the mutex.
 							*lock = Some(res);
-
-							// drop the lock before waking the future.
-							mem::drop(lock);
+							// Lock drops here automatically.
 						}
-
-						// wake the future so that it can retrieve the result.
+						// Wake the future.
 						data_clone.waker.wake();
-						// notify possible blocked threads of completion.
+						// Notify any blocked threads.
 						data_clone.condvar.notify_one();
 					});
-					let future = unsafe { self.pool.data.sender.send(task.erase_lifetime()) };
+					// Safety: task lifetime is erased but we maintain it via Arc<SpawnFutureData>
 					unsafe {
-						self.as_mut().get_unchecked_mut().state = State::Sending(future, data);
+						// Push the task to the global injector.
+						this.pool.data.injector.push(task.erase_lifetime());
 					}
-				}
-				State::Sending(ref mut future, ref data) => {
-					// Make sure the right waker is in place such that we get notified the moment a
-					// the task is ready.
-					data.waker.register(cx.waker());
-					// pinning is structural for State::Sending and maintained by the
-					// implementation
-					unsafe { ready!(Pin::new_unchecked(future).poll(cx)) }.unwrap();
-
-					let State::Sending(_, data) = std::mem::replace(
-						unsafe { &mut self.as_mut().get_unchecked_mut().state },
-						State::Done,
-					) else {
-						unreachable!()
-					};
-
-					unsafe {
-						self.as_mut().get_unchecked_mut().state = State::Running(data);
+					// Wake up a parked worker thread.
+					if let Some(thread) = this.pool.data.parked_threads.pop() {
+						thread.unpark();
 					}
+					// Transition this future to the Running state.
+					this.state = State::Running(data);
 				}
-				State::Running(data) => {
-					let res = {
-						let Some(mut guard) = data.result.try_lock().ok() else {
+				State::Running(ref data) => {
+					// Clone the Arc so we can work with it without borrowing from state
+					let data = data.clone();
+					// Try to get the result
+					match data.result.try_lock() {
+						Ok(mut guard) => {
+							if let Some(res) = guard.take() {
+								// Result is ready, drop the guard first
+								drop(guard);
+								// Now we can modify state
+								this.state = State::Done;
+								return Poll::Ready(
+									res.unwrap_or_else(|p| panic::resume_unwind(p)),
+								);
+							} else {
+								// Task not complete yet
+								drop(guard);
+								data.waker.register(cx.waker());
+								return Poll::Pending;
+							}
+						}
+						Err(_) => {
+							// Task is currently writing result
 							data.waker.register(cx.waker());
 							return Poll::Pending;
-						};
-
-						let Some(res) = guard.take() else {
-							data.waker.register(cx.waker());
-							return Poll::Pending;
-						};
-						res
-					};
-
-					unsafe {
-						self.as_mut().get_unchecked_mut().state = State::Done;
+						}
 					}
-
-					return Poll::Ready(res.unwrap_or_else(|p| panic::resume_unwind(p)));
 				}
 				State::Done => {
-					// Called after the future was already done, there is nothing reasonably we can do
-					// here except panic.
-					unsafe { self.get_unchecked_mut().state = State::Done };
-					panic!("Tried to poll a SpawnFuture which was already done")
+					// We should never get to this state by polling a future once done.
+					panic!("SpawnFuture polled after completion")
 				}
 			};
 		}
@@ -157,18 +144,11 @@ where
 
 impl<F, T> Drop for SpawnFuture<'_, F, T> {
 	fn drop(&mut self) {
-		match self.state {
-			State::Init(_) => {}
-			State::Sending(_, _) => {}
-			State::Running(ref data) => {
-				let guard = data.result.lock().unwrap();
-
-				// result was not yet ready, wait until it is finshed.
-				// We need a `wait_while` because `wait` can spuriously wake even when the condvar
-				// was not yet notified.
-				std::mem::drop(data.condvar.wait_while(guard, |x| x.is_none()))
-			}
-			State::Done => {}
+		if let State::Running(ref data) = self.state {
+			// Block and wait for completion
+			let guard = data.result.lock().unwrap();
+			// Wait until result is ready (handling spurious wakeups)
+			let _guard = data.condvar.wait_while(guard, |x| x.is_none()).unwrap();
 		}
 	}
 }

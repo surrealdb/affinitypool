@@ -1,7 +1,11 @@
 use crate::Data;
+use crate::MAX_THREADS;
 use crate::Threadpool;
-use std::sync::atomic::AtomicUsize;
+use crossbeam::deque::{Injector, Worker};
+use crossbeam::queue::ArrayQueue;
+use parking_lot::RwLock;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 #[derive(Default, Clone)]
 pub struct Builder {
@@ -17,7 +21,7 @@ impl Builder {
 	/// # Examples
 	///
 	/// ```
-	/// let builder = threadpool::Builder::new();
+	/// let builder = affinitypool::Builder::new();
 	/// ```
 	pub fn new() -> Builder {
 		Builder {
@@ -42,18 +46,19 @@ impl Builder {
 	/// ```
 	/// use std::thread;
 	///
-	/// let pool = threadpool::Builder::new()
-	///     .worker_threads(8)
-	///     .build();
+	/// let pool = affinitypool::Builder::new()
+	///         .worker_threads(8)
+	///         .build();
 	///
-	/// for _ in 0..100 {
-	///     pool.execute(|| {
-	///         println!("Hello from a worker thread!")
-	///     })
-	/// }
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	///     for _ in 0..10 {
+	///         pool.spawn(|| {
+	///             println!("Hello from a worker thread!")
+	///         }).await;
+	///     }
+	/// # });
 	/// ```
 	pub fn worker_threads(mut self, num_threads: usize) -> Builder {
-		assert!(num_threads > 0);
 		self.num_threads = Some(num_threads);
 		self
 	}
@@ -68,15 +73,17 @@ impl Builder {
 	/// ```
 	/// use std::thread;
 	///
-	/// let pool = threadpool::Builder::new()
-	///     .thread_name("foo".into())
+	/// let pool = affinitypool::Builder::new()
+	///     .thread_name("foo")
 	///     .build();
 	///
-	/// for _ in 0..100 {
-	///     pool.execute(|| {
-	///         assert_eq!(thread::current().name(), Some("foo"));
-	///     })
-	/// }
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	///     for _ in 0..10 {
+	///         pool.spawn(|| {
+	///             assert_eq!(thread::current().name(), Some("foo"));
+	///         }).await;
+	///     }
+	/// # });
 	/// ```
 	pub fn thread_name(mut self, name: impl Into<String>) -> Builder {
 		self.thread_name = Some(name.into());
@@ -92,15 +99,17 @@ impl Builder {
 	/// Each thread spawned by this pool will have a 4 MB stack:
 	///
 	/// ```
-	/// let pool = threadpool::Builder::new()
+	/// let pool = affinitypool::Builder::new()
 	///     .thread_stack_size(4_000_000)
 	///     .build();
 	///
-	/// for _ in 0..100 {
-	///     pool.execute(|| {
-	///         println!("This thread has a 4 MB stack size!");
-	///     })
-	/// }
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	///     for _ in 0..10 {
+	///         pool.spawn(|| {
+	///             println!("This thread has a 4 MB stack size!");
+	///         }).await;
+	///     }
+	/// # });
 	/// ```
 	pub fn thread_stack_size(mut self, size: usize) -> Builder {
 		self.thread_stack_size = Some(size);
@@ -114,15 +123,17 @@ impl Builder {
 	/// Each thread spawned will be linked to a separate core:
 	///
 	/// ```
-	/// let pool = threadpool::Builder::new()
+	/// let pool = affinitypool::Builder::new()
 	///     .thread_per_core(true)
 	///     .build();
 	///
-	/// for _ in 0..100 {
-	///     pool.execute(|| {
-	///         println!("This is executed on individual cores!");
-	///     })
-	/// }
+	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+	///     for _ in 0..10 {
+	///         pool.spawn(|| {
+	///             println!("This is executed on individual cores!");
+	///         }).await;
+	///     }
+	/// # });
 	/// ```
 	pub fn thread_per_core(mut self, enabled: bool) -> Builder {
 		self.thread_per_core = enabled;
@@ -134,39 +145,53 @@ impl Builder {
 	/// # Examples
 	///
 	/// ```
-	/// let pool = threadpool::Builder::new()
+	/// let pool = affinitypool::Builder::new()
 	///     .worker_threads(8)
 	///     .thread_stack_size(4_000_000)
 	///     .build();
 	/// ```
 	pub fn build(self) -> Threadpool {
-		// Create a queuing channel for tasks
-		let (send, recv) = async_channel::unbounded();
 		// Calculate how many threads to spawn
-		let workers = if self.thread_per_core || self.num_threads.is_none() {
-			num_cpus::get()
+		let threads = if let Some(num_threads) = self.num_threads {
+			num_threads.clamp(1, MAX_THREADS)
+		} else if self.thread_per_core {
+			num_cpus::get().clamp(1, MAX_THREADS)
 		} else {
-			self.num_threads.unwrap()
+			2
 		};
+		// Create a global injector for tasks
+		let injector = Injector::new();
+		// Create workers and collect their stealers
+		let mut workers = Vec::with_capacity(threads);
+		let mut stealers = Vec::with_capacity(threads);
+		// Create a Worker deque for each thread
+		for _ in 0..threads {
+			let worker = Worker::new_fifo();
+			stealers.push(worker.stealer());
+			workers.push(worker);
+		}
 		// Create the threadpool shared data
 		let data = Arc::new(Data {
 			name: self.thread_name,
-			stack_size: None,
-			num_threads: AtomicUsize::new(workers),
+			stack_size: self.thread_stack_size,
+			num_threads: AtomicUsize::new(threads),
 			thread_count: AtomicUsize::new(0),
-			sender: send,
-			receiver: recv,
+			injector,
+			stealers: RwLock::new(stealers),
+			shutdown: AtomicBool::new(false),
+			parked_threads: ArrayQueue::new(threads),
+			thread_handles: RwLock::new(Vec::new()),
 		});
 		// Use affinity if spawning thread per core
 		if self.thread_per_core {
 			// Spawn the desired number of workers
-			for id in 0..workers {
-				Threadpool::spin_up(Some(id), data.clone());
+			for (id, worker) in workers.into_iter().enumerate() {
+				Threadpool::spin_up(Some(id), data.clone(), worker, id);
 			}
 		} else {
 			// Spawn the desired number of workers
-			for _ in 0..workers {
-				Threadpool::spin_up(None, data.clone());
+			for (index, worker) in workers.into_iter().enumerate() {
+				Threadpool::spin_up(None, data.clone(), worker, index);
 			}
 		}
 		// Return the new threadpool

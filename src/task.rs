@@ -21,15 +21,19 @@ unsafe impl Send for OwnedTask<'_> {}
 
 impl<'a> OwnedTask<'a> {
 	unsafe fn call<T: FnOnce() + Send + 'a>(this: NonNull<()>) {
-		let mut this = this.cast::<TaskData<T>>();
-		ManuallyDrop::take(&mut this.as_mut().data)();
-		mem::drop(Box::from_raw(this.as_ptr()));
+		unsafe {
+			let mut this = this.cast::<TaskData<T>>();
+			ManuallyDrop::take(&mut this.as_mut().data)();
+			mem::drop(Box::from_raw(this.as_ptr()));
+		}
 	}
 
 	unsafe fn drop<T>(this: NonNull<()>) {
-		let mut this = this.cast::<TaskData<T>>();
-		ManuallyDrop::drop(&mut this.as_mut().data);
-		mem::drop(Box::from_raw(this.as_ptr()));
+		unsafe {
+			let mut this = this.cast::<TaskData<T>>();
+			ManuallyDrop::drop(&mut this.as_mut().data);
+			mem::drop(Box::from_raw(this.as_ptr()));
+		}
 	}
 
 	fn get_vtable<F: FnOnce() + Send>() -> &'static TaskVTable {
@@ -56,9 +60,20 @@ impl<'a> OwnedTask<'a> {
 		Self(unsafe { NonNull::new_unchecked(Box::into_raw(b).cast()) }, PhantomData)
 	}
 
+	/// Erases the lifetime parameter of this task, converting it to 'static.
+	///
 	/// # Safety
-	/// Caller must ensure that the closure within the task remains valid for the duration of the
-	/// lifetime of the returned object.
+	///
+	/// The caller must ensure that the closure and all data it captures remain
+	/// valid for as long as the returned `OwnedTask<'static>` exists.
+	///
+	/// The returned task can be safely dropped without execution - the Drop impl
+	/// will properly clean up the closure. However, any borrowed data captured
+	/// by the closure must outlive the `OwnedTask<'static>` object.
+	///
+	/// This is safe when the task's actual lifetime is managed externally, such
+	/// as through `Arc` reference counting or when the caller blocks until the
+	/// task completes or is dropped.
 	pub unsafe fn erase_lifetime(self) -> OwnedTask<'static> {
 		let res = OwnedTask(self.0, PhantomData);
 		std::mem::forget(self);
