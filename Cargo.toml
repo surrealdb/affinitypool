@@ -19,7 +19,7 @@ default = []
 crossbeam = "0.8.4"
 num_cpus = "1.16.0"
 parking_lot = "0.12.3"
-thiserror = "1.0.63"
+thiserror = "2.0.16"
 tokio = { version = "1.42.0", features = ["sync"] }
 
 [target.'cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "freebsd"))'.dependencies]
