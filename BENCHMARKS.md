@@ -25,7 +25,7 @@ The benchmark suite tests various scenarios to evaluate the performance characte
 ./run_benchmarks.sh basic_operations
 
 # Run benchmarks using cargo directly
-cargo bench --bench threadpool_benchmarks
+cargo bench --bench threadpool
 ```
 
 ### Benchmark Groups

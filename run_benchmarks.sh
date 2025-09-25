@@ -13,11 +13,11 @@ echo "- Rust version: $(rustc --version)"
 if [ $# -eq 0 ]; then
     echo ""
     echo "Running all benchmarks..."
-    cargo bench --bench threadpool_benchmarks
+    cargo bench --bench threadpool
 else
     echo ""
     echo "Running benchmark: $1"
-    cargo bench --bench threadpool_benchmarks -- "$1"
+    cargo bench --bench threadpool -- "$1"
 fi
 
 echo ""
