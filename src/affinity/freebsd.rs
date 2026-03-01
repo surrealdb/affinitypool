@@ -6,9 +6,9 @@ use libc::CPU_LEVEL_WHICH;
 use libc::CPU_SET;
 use libc::CPU_SETSIZE;
 use libc::CPU_WHICH_TID;
-use libc::cpu_set_t;
-use libc::sched_getaffinity;
-use libc::sched_setaffinity;
+use libc::cpuset_getaffinity;
+use libc::cpuset_setaffinity;
+use libc::cpuset_t;
 use std::mem;
 
 pub fn get_core_ids() -> Option<Vec<CoreId>> {
