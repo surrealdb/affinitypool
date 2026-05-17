@@ -23,7 +23,7 @@ use local::SpawnFuture;
 use parking_lot::Mutex;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use task::OwnedTask;
 
 /// Maximum number of worker threads allowed in a thread pool.
@@ -132,6 +132,12 @@ impl Threadpool {
 		});
 		// Push the task to the global injector
 		self.data.injector.push(task);
+		// SeqCst fence pairs with the consumer's fence in the worker loop.
+		// Together they give a single total order over the producer's release
+		// on `injector` and the consumer's release on `parked_threads`, so the
+		// pop below either observes a worker that has registered itself, or
+		// that worker's re-check observes this push and self-rescues.
+		fence(Ordering::SeqCst);
 		// Wake up a parked worker thread
 		if let Some(thread) = self.data.parked_threads.pop() {
 			thread.unpark();
@@ -203,6 +209,11 @@ impl Threadpool {
 				retries += 1;
 				// Try stealing a batch of tasks from the global queue.
 				let result = data.injector.steal_batch_and_pop(local);
+				// SeqCst fence: same cross-variable handshake as `spawn`.
+				// Establishes a total order with a concurrent producer's fence
+				// so the opportunistic unpark either sees a parked worker or
+				// that worker observes the producer's injector push.
+				fence(Ordering::SeqCst);
 				// If there's work in the queue, wake a thread to help
 				if !data.injector.is_empty()
 					&& let Some(thread) = data.parked_threads.pop()
@@ -275,6 +286,13 @@ impl Threadpool {
 				} else {
 					// No work found, so register ourselves as parked
 					let _ = data.parked_threads.push(std::thread::current());
+					// SeqCst fence pairs with the producer's fence in
+					// `Threadpool::spawn`. Without it the re-check below may
+					// observe a pre-push state of `injector` even though the
+					// producer's `parked_threads.pop()` ran before our push
+					// — a lost wakeup. The fence forces a total order that
+					// rules this out.
+					fence(Ordering::SeqCst);
 					// Double-check for work after registering
 					if !data.injector.is_empty() {
 						// Work just arrived, try to wake a thread
