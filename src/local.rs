@@ -25,14 +25,37 @@ enum State<F, R> {
 }
 
 /// A future that spawns a task on the threadpool and returns the result.
+///
+/// # Leak safety
+///
+/// `SpawnFuture` carries a borrow with lifetime `'pool` and erases that
+/// lifetime internally via [`OwnedTask::erase_lifetime`] before pushing the
+/// task to the global injector. Soundness of `spawn_local` therefore does
+/// **not** depend on this future's `Drop` running.
+///
+/// If the future is `mem::forget`-ed instead of dropped, the
+/// `Arc<SpawnFutureData>` (and through it, the captured closure plus any
+/// `'pool` borrows it holds) stays alive. The only references to that data
+/// live inside the worker-owned `OwnedTask` and the leaked future itself.
+/// The worker runs the closure at most once and then drops its `Arc`, after
+/// which any remaining strong count is held by the leaked future — i.e.
+/// leaked, but never accessed after its lifetime has ended. This is the
+/// standard Rust leak-amplification rule: `mem::forget` is safe but may
+/// leak memory.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SpawnFuture<'pool, F, R> {
 	pool: &'pool Threadpool,
 	state: State<F, R>,
 }
 
-unsafe impl<T> Send for SpawnFutureData<T> {}
-unsafe impl<T> Sync for SpawnFutureData<T> {}
+// Safety: `SpawnFutureData<T>` is only ever shared with another thread via
+// the worker closure that executes the user task. That closure produces a
+// `T`, stores it, and the polling thread later reads it back — so `T` must
+// be `Send`. The `AtomicWaker` and `Mutex<Option<…>>`/`Condvar` provide the
+// synchronisation; declaring the impls conditional on `T: Send` is the
+// minimum sound bound.
+unsafe impl<T: Send> Send for SpawnFutureData<T> {}
+unsafe impl<T: Send> Sync for SpawnFutureData<T> {}
 
 impl<'pool, F, R> SpawnFuture<'pool, F, R>
 where

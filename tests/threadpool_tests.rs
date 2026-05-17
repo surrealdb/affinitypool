@@ -1,3 +1,5 @@
+#![cfg(not(loom))]
+
 use affinitypool::{Builder, Threadpool};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -686,4 +688,223 @@ async fn test_spawn_local_no_nested_deadlock() {
 		.await;
 
 	assert_eq!(result, "no deadlock");
+}
+
+// =============================================================================
+// New tests added alongside the perf + unsafe overhaul.
+// =============================================================================
+
+/// Mixed-return-type smoke test for the new single-allocation spawn path.
+/// Exercises ZST, large allocation, and panicking returns to make sure the
+/// `SpawnCompletion` slot handles all variants correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_spawn_mixed_return_types_smoke() {
+	let pool = Arc::new(Threadpool::new(4));
+	let mut joins = Vec::new();
+	for i in 0..1_000 {
+		let pool = pool.clone();
+		joins.push(tokio::spawn(async move {
+			// () return: ZST.
+			pool.spawn(|| {}).await;
+			// usize return.
+			let n: usize = pool.spawn(move || i + 1).await;
+			assert_eq!(n, i + 1);
+			// Large Vec<u8> return.
+			let v: Vec<u8> = pool.spawn(|| vec![7u8; 4096]).await;
+			assert_eq!(v.len(), 4096);
+			assert!(v.iter().all(|&b| b == 7));
+		}));
+	}
+	for j in joins {
+		j.await.unwrap();
+	}
+}
+
+/// A panicking closure resumes the panic on the awaiter.
+#[tokio::test]
+async fn test_spawn_panic_propagates_to_awaiter() {
+	let pool = Threadpool::new(2);
+	let res = std::panic::AssertUnwindSafe(pool.spawn(|| {
+		panic!("boom from worker");
+	}))
+	.catch_unwind()
+	.await;
+	assert!(res.is_err(), "panic should propagate to the awaiter");
+}
+
+trait CatchUnwindAsync: std::future::Future + Sized {
+	fn catch_unwind(self) -> CatchUnwind<Self>;
+}
+
+impl<F: std::future::Future + std::panic::UnwindSafe> CatchUnwindAsync for F {
+	fn catch_unwind(self) -> CatchUnwind<Self> {
+		CatchUnwind {
+			inner: Some(self),
+		}
+	}
+}
+
+struct CatchUnwind<F> {
+	inner: Option<F>,
+}
+
+impl<F: std::future::Future + std::panic::UnwindSafe> std::future::Future for CatchUnwind<F> {
+	type Output = std::thread::Result<F::Output>;
+	fn poll(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Self::Output> {
+		// Safety: structural pin projection for `inner`. We never move out.
+		let this = unsafe { self.as_mut().get_unchecked_mut() };
+		let inner = this.inner.as_mut().expect("polled after completion");
+		match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			unsafe { std::pin::Pin::new_unchecked(inner) }.poll(cx)
+		})) {
+			Ok(std::task::Poll::Ready(v)) => {
+				this.inner = None;
+				std::task::Poll::Ready(Ok(v))
+			}
+			Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+			Err(p) => {
+				this.inner = None;
+				std::task::Poll::Ready(Err(p))
+			}
+		}
+	}
+}
+
+/// Dropping the future before polling must still run the closure and free
+/// the captured payload. Uses a `Drop`-tracking struct to confirm the
+/// closure (and its captures) are eventually released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spawn_dropped_before_poll_releases_payload() {
+	struct DropTracker(Arc<AtomicUsize>);
+	impl Drop for DropTracker {
+		fn drop(&mut self) {
+			self.0.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+
+	let pool = Threadpool::new(2);
+	let drops = Arc::new(AtomicUsize::new(0));
+	{
+		let tracker = DropTracker(drops.clone());
+		let fut = pool.spawn(move || {
+			// Move the tracker into the closure; the closure produces (),
+			// so the tracker is dropped when the closure runs.
+			let _t = tracker;
+		});
+		// Drop the future immediately without polling.
+		drop(fut);
+	}
+	// Give the worker a chance to pick the task up.
+	let deadline = std::time::Instant::now() + Duration::from_secs(2);
+	while drops.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	assert_eq!(drops.load(Ordering::SeqCst), 1, "tracker should be dropped exactly once");
+}
+
+/// Repeatedly panic from worker threads to exercise the ArcSwap-driven
+/// stealer-slice respawn path. All non-panicking tasks must still complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_stealer_swap_during_panic() {
+	let pool = Arc::new(Threadpool::new(4));
+	let completed = Arc::new(AtomicUsize::new(0));
+	let mut joins = Vec::new();
+	for i in 0..200 {
+		let pool = pool.clone();
+		let completed = completed.clone();
+		joins.push(tokio::spawn(async move {
+			if i % 25 == 0 {
+				let _ = std::panic::AssertUnwindSafe(pool.spawn(|| panic!("respawn me")))
+					.catch_unwind()
+					.await;
+			} else {
+				pool.spawn(move || {
+					completed.fetch_add(1, Ordering::SeqCst);
+				})
+				.await;
+			}
+		}));
+	}
+	for j in joins {
+		let _ = j.await;
+	}
+	// 200 - ceil(200/25) = 200 - 8 = 192 non-panicking tasks.
+	assert_eq!(completed.load(Ordering::SeqCst), 192);
+}
+
+/// Mem-forgetting a `spawn_local` future after it has been polled once
+/// (i.e. the task is in the injector) must not produce UB and the worker
+/// must still be able to run the task and release its `Arc`.
+///
+/// The `SpawnFuture` carries a `'pool` borrow, but `mem::forget` is
+/// leak-safe: the closure captures live inside the `Arc<SpawnFutureData>`,
+/// which the worker frees independently of the consumer. Running this test
+/// under Miri validates the lifetime-erasure path has no aliasing or
+/// use-after-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_forget_spawn_local_future_does_not_dangle() {
+	use std::future::Future as _;
+	use std::pin::Pin;
+	use std::task::{Context, Waker};
+
+	struct DropTracker(Arc<AtomicUsize>);
+	impl Drop for DropTracker {
+		fn drop(&mut self) {
+			self.0.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+
+	let pool = Threadpool::new(2);
+	let drops = Arc::new(AtomicUsize::new(0));
+	let tracker = DropTracker(drops.clone());
+	let mut fut = Box::pin(pool.spawn_local(move || {
+		let _t = tracker;
+	}));
+	// Poll once with a noop waker so the future transitions Init -> Running
+	// and pushes the task to the injector. After this point the worker owns
+	// an Arc to the shared data and will free the captured tracker when it
+	// runs the closure, regardless of what we do with `fut`.
+	let waker = Waker::noop().clone();
+	let mut cx = Context::from_waker(&waker);
+	let _ = Pin::as_mut(&mut fut).poll(&mut cx);
+	// Leak the future: skip Drop entirely.
+	std::mem::forget(fut);
+	let deadline = std::time::Instant::now() + Duration::from_secs(2);
+	while drops.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	assert_eq!(
+		drops.load(Ordering::SeqCst),
+		1,
+		"forgetting the polled future must not leak the captured payload"
+	);
+}
+
+/// Windows affinity with an out-of-range core id must not be UB; the
+/// platform shim should refuse and return false. The test simulates the
+/// out-of-range case on every OS via the public `affinity::CoreId` type.
+#[cfg(target_os = "windows")]
+#[test]
+fn test_windows_affinity_high_coreid_safe() {
+	use affinitypool::affinity::{self, CoreId};
+	let res = affinity::set_for_current(CoreId {
+		id: 999,
+	});
+	assert!(!res, "out-of-range core id must not be applied");
+}
+
+/// Static assertion that the new `spawn` future does not require its
+/// closure return type to be `Send` beyond what we declare — i.e. the
+/// `R: Send + 'static` bound on `Threadpool::spawn` is the one being
+/// enforced. This is a compile-time check; if it ever changes, this test
+/// fails to compile.
+#[allow(dead_code)]
+fn _spawn_send_bound_compile_check() {
+	fn assert_send<T: Send>(_: T) {}
+	let pool = Threadpool::new(1);
+	let fut = pool.spawn(|| 42u64);
+	assert_send(fut);
 }

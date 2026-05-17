@@ -28,8 +28,13 @@ pub fn get_core_ids() -> Option<Vec<CoreId>> {
 }
 
 pub fn set_for_current(core_id: CoreId) -> bool {
-	// Convert `CoreId` back into mask.
-	let mask: u64 = 1 << core_id.id;
+	// Convert `CoreId` back into a bitmask. A shift of 64 or more on `u64`
+	// is undefined behaviour, so reject out-of-range core ids up front
+	// rather than producing a poison mask.
+	if core_id.id >= 64 {
+		return false;
+	}
+	let mask: u64 = 1u64 << core_id.id;
 
 	// Set core affinity for current thread.
 	let res = unsafe { SetThreadAffinityMask(GetCurrentThread(), mask as DWORD_PTR) };

@@ -1,9 +1,10 @@
 use crate::Data;
 use crate::MAX_THREADS;
 use crate::Threadpool;
+use arc_swap::ArcSwap;
 use crossbeam::deque::{Injector, Worker};
 use crossbeam::queue::ArrayQueue;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -177,10 +178,11 @@ impl Builder {
 			num_threads: AtomicUsize::new(threads),
 			thread_count: AtomicUsize::new(0),
 			injector,
-			stealers: RwLock::new(stealers),
+			stealers: ArcSwap::from_pointee(stealers.into_boxed_slice()),
+			stealers_lock: Mutex::new(()),
 			shutdown: AtomicBool::new(false),
 			parked_threads: ArrayQueue::new(threads),
-			thread_handles: RwLock::new(Vec::new()),
+			thread_handles: Mutex::new(Vec::new()),
 		});
 		// Use affinity if spawning thread per core
 		if self.thread_per_core {

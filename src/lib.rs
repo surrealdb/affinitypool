@@ -6,6 +6,7 @@ mod error;
 mod global;
 mod local;
 mod sentry;
+mod spawn;
 mod task;
 
 pub use crate::builder::Builder;
@@ -14,15 +15,16 @@ pub use crate::error::Error;
 use crate::data::Data;
 use crate::global::THREADPOOL;
 use crate::sentry::Sentry;
+use crate::spawn::{SpawnCompletion, SpawnHandle};
+use arc_swap::ArcSwap;
 use crossbeam::deque::{Injector, Worker};
 use crossbeam::queue::ArrayQueue;
 use local::SpawnFuture;
-use parking_lot::RwLock;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use parking_lot::Mutex;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use task::OwnedTask;
-use tokio::sync::oneshot;
 
 /// Maximum number of worker threads allowed in a thread pool.
 pub const MAX_THREADS: usize = 512;
@@ -97,10 +99,11 @@ impl Threadpool {
 			num_threads: AtomicUsize::new(workers),
 			thread_count: AtomicUsize::new(0),
 			injector,
-			stealers: RwLock::new(stealers),
+			stealers: ArcSwap::from_pointee(stealers.into_boxed_slice()),
+			stealers_lock: Mutex::new(()),
 			parked_threads: ArrayQueue::new(workers),
 			shutdown: AtomicBool::new(false),
-			thread_handles: RwLock::new(Vec::new()),
+			thread_handles: Mutex::new(Vec::new()),
 		});
 		// Spawn the desired number of workers
 		for (index, worker) in worker_queues.into_iter().enumerate() {
@@ -119,11 +122,13 @@ impl Threadpool {
 		F: Send + 'static,
 		R: Send + 'static,
 	{
-		// Create a new oneshot channel
-		let (tx, rx) = oneshot::channel();
-		// Enclose the function in a closure
+		// Single-allocation completion shared with the worker.
+		let completion = Arc::new(SpawnCompletion::new());
+		let worker_side = completion.clone();
+		// Enclose the function in a closure that catches panics and writes
+		// the result into the shared completion slot.
 		let task = OwnedTask::new(move || {
-			tx.send(catch_unwind(AssertUnwindSafe(func))).ok();
+			worker_side.complete(catch_unwind(AssertUnwindSafe(func)));
 		});
 		// Push the task to the global injector
 		self.data.injector.push(task);
@@ -131,10 +136,8 @@ impl Threadpool {
 		if let Some(thread) = self.data.parked_threads.pop() {
 			thread.unpark();
 		}
-		// The channel has not been closed
-		let res = rx.await.unwrap();
-		// Wait for the function response
-		res.unwrap_or_else(|err| resume_unwind(err))
+		// Await the result via the completion slot.
+		SpawnHandle::new(completion).await
 	}
 
 	/// Queue a new command for execution on this pool with access to the local variables.
@@ -177,6 +180,10 @@ impl Threadpool {
 	/// 1. Try to pop from the local worker queue
 	/// 2. Try to steal from the global injector
 	/// 3. Try to steal from other workers (if multi-threaded)
+	///
+	/// Spins until a task is found or all queues report empty. Workers stay
+	/// hot between bursts; parking is handled by the outer worker loop only
+	/// when this returns `None`.
 	fn find_task(
 		local: &Worker<OwnedTask<'static>>,
 		data: &Arc<Data>,
@@ -206,13 +213,13 @@ impl Threadpool {
 				result
 					// Or try stealing from one of the other threads
 					.or_else(|| {
-						// Try to steal from other workers, excluding our own
-						// Acquire read lock only when needed for stealing
-						let stealers = data.stealers.read();
+						// Lock-free load of the stealer slice. No locks on
+						// the hot path.
+						let stealers = data.stealers.load();
 						stealers
 							.iter()
 							.enumerate()
-							.filter(|(i, _)| *i != index) // Don't steal from ourselves
+							.filter(|(i, _)| *i != index)
 							.map(|(_, s)| s.steal())
 							.find(|s| !s.is_retry())
 							.unwrap_or(crossbeam::deque::Steal::Empty)
@@ -289,7 +296,7 @@ impl Threadpool {
 		});
 		// Store the thread handle if spawning succeeded
 		if let Ok(handle) = handle {
-			data_clone.thread_handles.write().push(handle);
+			data_clone.thread_handles.lock().push(handle);
 		}
 	}
 
@@ -314,7 +321,7 @@ impl Drop for Threadpool {
 			thread.unpark();
 		}
 		// Take all of the thread handles for joining
-		let handles = self.data.thread_handles.write().drain(..).collect::<Vec<_>>();
+		let handles = self.data.thread_handles.lock().drain(..).collect::<Vec<_>>();
 		// Join all worker threads
 		for handle in handles {
 			// Wait for the thread to exit
