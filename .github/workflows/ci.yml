@@ -109,7 +109,13 @@ jobs:
           # only sound under Tree Borrows. `-Zmiri-ignore-leaks` silences
           # leaks owned by crossbeam-epoch's TLS handle on thread exit.
           MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-ignore-leaks"
-        run: cargo miri test --test miri
+        # `--lib task::` covers the OwnedTask unsafe paths directly (no
+        # threads, no syscalls). `--test miri` covers the integration
+        # tests that are gated to skip `std::thread::park`-heavy paths
+        # that Miri over-reports.
+        run: |
+          cargo miri test --lib task::
+          cargo miri test --test miri
 
   loom:
     name: Loom
