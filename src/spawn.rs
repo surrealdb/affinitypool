@@ -163,3 +163,109 @@ impl<R> Future for SpawnHandle<R> {
 		Poll::Pending
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	//! Single-threaded exercisers for every unsafe block in this module.
+	//! `cargo miri test --lib spawn::` validates these directly without
+	//! involving the work-stealing scheduler.
+
+	use super::*;
+	use std::sync::Arc;
+	use std::task::Waker;
+
+	fn noop_ctx() -> Context<'static> {
+		// `Waker::noop()` returns a `&'static Waker`; we can build a
+		// `Context` from it without actually invoking a runtime.
+		Context::from_waker(Waker::noop())
+	}
+
+	/// Producer completes, then awaiter polls: poll observes `READY` and
+	/// returns `Poll::Ready` with the written value. Exercises the
+	/// `assume_init_read` happy path.
+	#[test]
+	fn poll_after_complete_returns_value() {
+		let completion = Arc::new(SpawnCompletion::<u64>::new());
+		completion.complete(Ok(0xdead_beef));
+		let mut handle = SpawnHandle::new(completion);
+		let mut cx = noop_ctx();
+		match Pin::new(&mut handle).poll(&mut cx) {
+			Poll::Ready(v) => assert_eq!(v, 0xdead_beef),
+			Poll::Pending => panic!("should be Ready after complete"),
+		}
+	}
+
+	/// Awaiter polls first (registers waker), then producer completes,
+	/// then awaiter polls again. Exercises the "register then re-check"
+	/// race-closing path in `SpawnHandle::poll`.
+	#[test]
+	fn poll_pending_then_complete_then_ready() {
+		let completion = Arc::new(SpawnCompletion::<u32>::new());
+		let mut handle = SpawnHandle::new(completion.clone());
+		let mut cx = noop_ctx();
+		match Pin::new(&mut handle).poll(&mut cx) {
+			Poll::Pending => {}
+			Poll::Ready(_) => panic!("should be Pending before complete"),
+		}
+		completion.complete(Ok(42));
+		match Pin::new(&mut handle).poll(&mut cx) {
+			Poll::Ready(v) => assert_eq!(v, 42),
+			Poll::Pending => panic!("should be Ready after complete"),
+		}
+	}
+
+	/// Producer writes a non-trivially-droppable result; awaiter never
+	/// polls and the `SpawnHandle` is dropped. The slot's own `Drop` impl
+	/// must free the payload exactly once. Miri verifies no double-free
+	/// or leak (modulo the `Arc` strong-count drop).
+	#[test]
+	fn drop_without_poll_frees_written_payload() {
+		struct Tracker(Arc<std::sync::atomic::AtomicUsize>);
+		impl Drop for Tracker {
+			fn drop(&mut self) {
+				self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			}
+		}
+		let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let completion: Arc<SpawnCompletion<Tracker>> = Arc::new(SpawnCompletion::new());
+		// Producer writes — slot now owns the Tracker via MaybeUninit.
+		completion.complete(Ok(Tracker(drops.clone())));
+		// Awaiter handle is constructed but never polled, then dropped.
+		let handle = SpawnHandle::new(completion);
+		drop(handle);
+		// Last Arc strong-ref goes away here; `Drop for SpawnCompletion`
+		// must free the Tracker exactly once.
+		assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+	}
+
+	/// Producer never completes; awaiter polls once (registers waker) and
+	/// then drops both the `SpawnHandle` and the only `Arc` to the
+	/// completion. The slot must drop cleanly with no payload to free.
+	#[test]
+	fn drop_without_complete_is_safe() {
+		let completion: Arc<SpawnCompletion<u64>> = Arc::new(SpawnCompletion::new());
+		let mut handle = SpawnHandle::new(completion);
+		let mut cx = noop_ctx();
+		let _ = Pin::new(&mut handle).poll(&mut cx);
+		drop(handle);
+		// Last Arc strong-ref dropped here via test scope exit.
+	}
+
+	/// Producer captures a panic; awaiter polls and the panic is resumed.
+	/// Catches the panic via `catch_unwind` so the test itself doesn't
+	/// abort. Validates that the `Err` arm in `take_ready` works without
+	/// leaking the panic payload (Miri would flag a leak as a UB-adjacent
+	/// concern in strict modes).
+	#[test]
+	fn panic_path_resumes_on_awaiter() {
+		let completion = Arc::new(SpawnCompletion::<u64>::new());
+		let panic_payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+		completion.complete(Err(panic_payload));
+		let mut handle = SpawnHandle::new(completion);
+		let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			let mut cx = noop_ctx();
+			let _ = Pin::new(&mut handle).poll(&mut cx);
+		}));
+		assert!(res.is_err(), "panic must propagate");
+	}
+}
