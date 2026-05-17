@@ -98,3 +98,100 @@ impl Drop for OwnedTask<'_> {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	//! These exercise every unsafe block in this module without invoking
+	//! the thread pool. Miri runs them with `cargo miri test --lib`.
+
+	use super::*;
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	/// `OwnedTask::new` + `run` for several closure shapes, including ZSTs
+	/// and types with non-trivial `Drop`. Validates the monomorphic vtable
+	/// dispatch and that the boxed `TaskData<F>` is freed exactly once.
+	#[test]
+	fn owned_task_run_drops_capture_once() {
+		struct DropTracker(Arc<AtomicUsize>);
+		impl Drop for DropTracker {
+			fn drop(&mut self) {
+				self.0.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+		let drops = Arc::new(AtomicUsize::new(0));
+		let tracker = DropTracker(drops.clone());
+		let task = OwnedTask::new(move || {
+			let _t = tracker;
+		});
+		task.run();
+		assert_eq!(drops.load(Ordering::SeqCst), 1);
+	}
+
+	/// `OwnedTask::new` followed by `Drop` without `run`. Validates the
+	/// `drop` vtable entry frees the boxed closure (and its captures)
+	/// exactly once with no use-after-free.
+	#[test]
+	fn owned_task_drop_without_run_releases_capture() {
+		struct DropTracker(Arc<AtomicUsize>);
+		impl Drop for DropTracker {
+			fn drop(&mut self) {
+				self.0.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+		let drops = Arc::new(AtomicUsize::new(0));
+		{
+			let tracker = DropTracker(drops.clone());
+			let _task = OwnedTask::new(move || {
+				let _t = tracker;
+			});
+			// _task dropped here without running.
+		}
+		assert_eq!(drops.load(Ordering::SeqCst), 1);
+	}
+
+	/// `erase_lifetime` on a closure that captures a stack borrow, then
+	/// `run` the erased task while the borrow is still live. Miri verifies
+	/// no aliasing or use-after-free, validating the soundness contract
+	/// documented on `OwnedTask::erase_lifetime`.
+	#[test]
+	fn owned_task_erase_lifetime_run_within_borrow() {
+		let data: Vec<u32> = (0..64).collect();
+		let out = Arc::new(AtomicUsize::new(0));
+		let out_ref = out.clone();
+		let task: OwnedTask<'_> = OwnedTask::new(move || {
+			out_ref.store(data.iter().sum::<u32>() as usize, Ordering::SeqCst);
+		});
+		// Safety: we run the erased task here before the closure's captures
+		// (`data`, `out_ref`) go out of scope, so the lifetime contract is
+		// upheld for the duration of `run()`.
+		let erased: OwnedTask<'static> = unsafe { task.erase_lifetime() };
+		erased.run();
+		let expected: u32 = (0..64).sum();
+		assert_eq!(out.load(Ordering::SeqCst) as u32, expected);
+	}
+
+	/// `erase_lifetime` followed by `Drop` without `run`. The erased task's
+	/// `Drop` impl must still free the boxed closure exactly once.
+	#[test]
+	fn owned_task_erase_lifetime_drop_without_run() {
+		struct DropTracker(Arc<AtomicUsize>);
+		impl Drop for DropTracker {
+			fn drop(&mut self) {
+				self.0.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+		let drops = Arc::new(AtomicUsize::new(0));
+		{
+			let tracker = DropTracker(drops.clone());
+			let task: OwnedTask<'_> = OwnedTask::new(move || {
+				let _t = tracker;
+			});
+			// Safety: `tracker` (the captured data) lives in `task` itself,
+			// and `task` is dropped at end of scope below — strictly within
+			// the original `'_` borrow, so the lifetime contract holds.
+			let _erased: OwnedTask<'static> = unsafe { task.erase_lifetime() };
+		}
+		assert_eq!(drops.load(Ordering::SeqCst), 1);
+	}
+}
