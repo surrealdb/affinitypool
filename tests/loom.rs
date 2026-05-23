@@ -15,7 +15,7 @@
 #![cfg(loom)]
 
 use loom::sync::Arc;
-use loom::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering, fence};
 use loom::thread;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -111,6 +111,136 @@ fn loom_spawn_completion_release_acquire() {
 		}
 		producer.join().unwrap();
 	});
+}
+
+/// Models the producer↔worker park/unpark handshake in `src/lib.rs`.
+///
+/// `injector_has_work` stands in for the global injector's "non-empty"
+/// state. `worker_parked` stands in for the `parked_threads` queue
+/// containing the worker. `was_unparked` records whether the producer
+/// invoked the wake path (`parked_threads.pop()` succeeded).
+///
+/// The invariant under test is the absence of a lost wakeup: every
+/// model run must terminate with either the worker having self-rescued
+/// (it observed `injector_has_work == true` on its initial poll or its
+/// post-register re-check) or the producer having woken it (the
+/// producer observed `worker_parked == true` and set `was_unparked`).
+///
+/// The protocol mirrors the production code:
+///   producer:  push injector;       fence(SeqCst); read parked_state
+///   worker:    register parked;     fence(SeqCst); read injector
+type ProducerFn = fn(&AtomicBool, &AtomicBool, &AtomicUsize, &AtomicBool);
+type WorkerFn = fn(&AtomicBool, &AtomicBool, &AtomicUsize, &AtomicBool) -> bool;
+
+fn run_handshake_invariant(producer_seq: ProducerFn, worker_seq: WorkerFn) {
+	loom::model(move || {
+		let injector_has_work = Arc::new(AtomicBool::new(false));
+		let worker_parked = Arc::new(AtomicBool::new(false));
+		let parked_count = Arc::new(AtomicUsize::new(0));
+		let was_unparked = Arc::new(AtomicBool::new(false));
+
+		let p_iw = injector_has_work.clone();
+		let p_wp = worker_parked.clone();
+		let p_pc = parked_count.clone();
+		let p_un = was_unparked.clone();
+		let producer = thread::spawn(move || {
+			producer_seq(&p_iw, &p_wp, &p_pc, &p_un);
+		});
+
+		let w_iw = injector_has_work.clone();
+		let w_wp = worker_parked.clone();
+		let w_pc = parked_count.clone();
+		let w_un = was_unparked.clone();
+		let worker = thread::spawn(move || worker_seq(&w_iw, &w_wp, &w_pc, &w_un));
+
+		producer.join().unwrap();
+		let worker_observed_work = worker.join().unwrap();
+		// No lost wakeup: either the worker observed work itself, or the
+		// producer set `was_unparked` (which in production would have
+		// invoked `Thread::unpark`).
+		assert!(
+			worker_observed_work || was_unparked.load(Ordering::Acquire),
+			"lost wakeup: worker did not observe work and producer did not wake it"
+		);
+	});
+}
+
+/// Baseline: the production handshake with SeqCst fences on both sides
+/// and no `parked_count` short-circuit. Validates the existing
+/// invariant under loom — necessary baseline so we can detect a
+/// regression after the parked_count change.
+#[test]
+fn loom_park_unpark_handshake_baseline() {
+	run_handshake_invariant(
+		|injector, parked, _count, unparked| {
+			// Producer: push injector, fence, then attempt to wake.
+			injector.store(true, Ordering::Release);
+			fence(Ordering::SeqCst);
+			if parked.load(Ordering::Acquire) {
+				// Simulate `parked_threads.pop()` succeeding.
+				parked.store(false, Ordering::Release);
+				unparked.store(true, Ordering::Release);
+			}
+		},
+		|injector, parked, _count, _unparked| {
+			// Worker: initial peek (the production code's first
+			// `find_task` call, prior to parking).
+			if injector.load(Ordering::Acquire) {
+				return true;
+			}
+			// Register as parked.
+			parked.store(true, Ordering::Release);
+			fence(Ordering::SeqCst);
+			// Re-check.
+			if injector.load(Ordering::Acquire) {
+				// Self-rescue: undo the registration.
+				parked.store(false, Ordering::Release);
+				return true;
+			}
+			// "Park": in the model we just check whether the producer
+			// has set `unparked`. Loom explores both orderings.
+			false
+		},
+	);
+}
+
+/// Variant: the producer skips `parked_threads.pop()` (i.e. skips the
+/// `parked.load(Acquire)` + write) when `parked_count.load(Acquire) ==
+/// 0`. The worker increments `parked_count` with `Release` before its
+/// SeqCst fence. Validates that this optimisation preserves the
+/// lost-wakeup-free invariant.
+#[test]
+fn loom_park_unpark_handshake_parked_count_gate() {
+	run_handshake_invariant(
+		|injector, parked, count, unparked| {
+			injector.store(true, Ordering::Release);
+			fence(Ordering::SeqCst);
+			// Fast path: skip the expensive parked_threads.pop() if
+			// nobody is registered.
+			if count.load(Ordering::Acquire) == 0 {
+				return;
+			}
+			if parked.load(Ordering::Acquire) {
+				parked.store(false, Ordering::Release);
+				count.fetch_sub(1, Ordering::Release);
+				unparked.store(true, Ordering::Release);
+			}
+		},
+		|injector, parked, count, _unparked| {
+			if injector.load(Ordering::Acquire) {
+				return true;
+			}
+			parked.store(true, Ordering::Release);
+			count.fetch_add(1, Ordering::Release);
+			fence(Ordering::SeqCst);
+			if injector.load(Ordering::Acquire) {
+				parked.store(false, Ordering::Release);
+				count.fetch_sub(1, Ordering::Release);
+				return true;
+			}
+			false
+		},
+	);
 }
 
 /// Model the producer racing with the consumer's `Drop`: if the consumer

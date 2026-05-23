@@ -182,6 +182,7 @@ impl Builder {
 			stealers_lock: Mutex::new(()),
 			shutdown: AtomicBool::new(false),
 			parked_threads: ArrayQueue::new(threads),
+			parked_count: AtomicUsize::new(0),
 			thread_handles: Mutex::new(Vec::new()),
 		});
 		// Use affinity if spawning thread per core

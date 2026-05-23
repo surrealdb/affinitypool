@@ -101,6 +101,7 @@ impl Threadpool {
 			stealers: ArcSwap::from_pointee(stealers.into_boxed_slice()),
 			stealers_lock: Mutex::new(()),
 			parked_threads: ArrayQueue::new(workers),
+			parked_count: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
 			thread_handles: Mutex::new(Vec::new()),
 		});
@@ -132,8 +133,17 @@ impl Threadpool {
 		// pop below either observes a worker that has registered itself, or
 		// that worker's re-check observes this push and self-rescues.
 		fence(Ordering::SeqCst);
-		// Wake up a parked worker thread
-		if let Some(thread) = self.data.parked_threads.pop() {
+		// Fast path: if no worker is parked, skip the `parked_threads.pop()`
+		// (several atomic CAS ops inside crossbeam's `ArrayQueue`). The
+		// `Acquire` load synchronises with the worker's `Release`
+		// `fetch_add` on `parked_count` in the park path. The SeqCst fence
+		// above remains the synchronisation that prevents lost wakeups; the
+		// `parked_count` check is purely a short-circuit. See
+		// `loom_park_unpark_handshake_parked_count_gate` in `tests/loom.rs`.
+		if self.data.parked_count.load(Ordering::Acquire) > 0
+			&& let Some(thread) = self.data.parked_threads.pop()
+		{
+			self.data.parked_count.fetch_sub(1, Ordering::Release);
 			thread.unpark();
 		}
 		// Await the result via the job's completion machinery.
@@ -208,10 +218,13 @@ impl Threadpool {
 				// so the opportunistic unpark either sees a parked worker or
 				// that worker observes the producer's injector push.
 				fence(Ordering::SeqCst);
-				// If there's work in the queue, wake a thread to help
+				// If there's work in the queue, wake a thread to help.
+				// Keep `parked_count` in sync with every `parked_threads`
+				// op so producers can use it as an accurate short-circuit.
 				if !data.injector.is_empty()
 					&& let Some(thread) = data.parked_threads.pop()
 				{
+					data.parked_count.fetch_sub(1, Ordering::Release);
 					thread.unpark();
 				}
 				// Return the stolen task, if there is one
@@ -278,8 +291,14 @@ impl Threadpool {
 					// Process the task
 					task.run();
 				} else {
-					// No work found, so register ourselves as parked
+					// No work found, so register ourselves as parked.
 					let _ = data.parked_threads.push(std::thread::current());
+					// Release the registration to any producer that
+					// subsequently performs an `Acquire` load on
+					// `parked_count` (the spawn fast-path). The SeqCst
+					// fence below remains the synchronisation that
+					// prevents lost wakeups.
+					data.parked_count.fetch_add(1, Ordering::Release);
 					// SeqCst fence pairs with the producer's fence in
 					// `Threadpool::spawn`. Without it the re-check below may
 					// observe a pre-push state of `injector` even though the
@@ -291,6 +310,7 @@ impl Threadpool {
 					if !data.injector.is_empty() {
 						// Work just arrived, try to wake a thread
 						if let Some(t) = data.parked_threads.pop() {
+							data.parked_count.fetch_sub(1, Ordering::Release);
 							// Always unpark the thread we popped
 							t.unpark();
 						}
@@ -328,8 +348,9 @@ impl Drop for Threadpool {
 	fn drop(&mut self) {
 		// Signal all workers to shut down
 		self.data.shutdown.store(true, Ordering::Release);
-		// Wake up all parked workers
+		// Wake up all parked workers, keeping `parked_count` in sync.
 		while let Some(thread) = self.data.parked_threads.pop() {
+			self.data.parked_count.fetch_sub(1, Ordering::Release);
 			thread.unpark();
 		}
 		// Take all of the thread handles for joining
