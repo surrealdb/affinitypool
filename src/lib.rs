@@ -247,16 +247,18 @@ impl Threadpool {
 				}
 				// Rotate the start victim per-worker and per-retry so
 				// every worker no longer hammers stealer 0 first.
-				// Without rotation, every worker iterates `0, 1, 2, ...`
-				// concurrently and stealer 0 becomes the hot contention
-				// point. With `(index + retry) % n` each worker picks
-				// a different start, and the rotation also varies per
-				// retry to break up steady-state hot spots.
 				let start = index.wrapping_add(retry) % n;
 				(0..n)
 					.map(|offset| (start + offset) % n)
 					.filter(|i| *i != index)
-					.map(|i| stealers[i].steal())
+					// Batch-steal: take half of the victim's queue
+					// into our local worker and pop one task to
+					// return. Compared to single-task `steal()` this
+					// amortises the stealing cost across many tasks
+					// when a peer is backed up, and warms our local
+					// queue so subsequent `find_task` calls hit the
+					// fast `local.pop()` path.
+					.map(|i| stealers[i].steal_batch_and_pop(local))
 					.find(|s| !s.is_retry())
 					.unwrap_or(crossbeam::deque::Steal::Empty)
 			});
