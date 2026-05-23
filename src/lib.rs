@@ -241,11 +241,22 @@ impl Threadpool {
 				// Lock-free load of the stealer slice. No locks on the
 				// hot path.
 				let stealers = data.stealers.load();
-				stealers
-					.iter()
-					.enumerate()
-					.filter(|(i, _)| *i != index)
-					.map(|(_, s)| s.steal())
+				let n = stealers.len();
+				if n <= 1 {
+					return crossbeam::deque::Steal::Empty;
+				}
+				// Rotate the start victim per-worker and per-retry so
+				// every worker no longer hammers stealer 0 first.
+				// Without rotation, every worker iterates `0, 1, 2, ...`
+				// concurrently and stealer 0 becomes the hot contention
+				// point. With `(index + retry) % n` each worker picks
+				// a different start, and the rotation also varies per
+				// retry to break up steady-state hot spots.
+				let start = index.wrapping_add(retry) % n;
+				(0..n)
+					.map(|offset| (start + offset) % n)
+					.filter(|i| *i != index)
+					.map(|i| stealers[i].steal())
 					.find(|s| !s.is_retry())
 					.unwrap_or(crossbeam::deque::Steal::Empty)
 			});
