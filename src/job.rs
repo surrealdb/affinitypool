@@ -41,15 +41,32 @@
 //! must synchronise with the other side's writes (worker's result write
 //! or awaiter's `TAKEN` store) so the cleanup branch observes the latest
 //! value of `state`.
+//!
+//! # Closure/result union
+//!
+//! The closure and the result never coexist (the worker consumes the
+//! closure to produce the result), so their `MaybeUninit` cells share
+//! one [`UnsafeCell<Slot<F, R>>`] union. This shrinks each [`Job`]
+//! allocation from `header + sizeof(F) + sizeof(R)` to `header +
+//! max(sizeof(F), sizeof(R))`, which often drops the allocation into a
+//! smaller allocator size class.
+//!
+//! Soundness: which variant of the union is live is dictated entirely
+//! by the [`state`](Job::state) machine. Worker writes to
+//! `slot.closure` are only valid while `state == EMPTY`; worker writes
+//! to `slot.result` only occur after `slot.closure` has been consumed
+//! (via `assume_init_read`) and only before the `EMPTY -> READY`
+//! transition. Awaiter reads of `slot.result` only occur after observing
+//! `state == READY` under `Acquire`. The two windows never overlap.
 
 use crate::atomic_waker::AtomicWaker;
 use crate::task::{OwnedTask, TaskVTable};
 use std::cell::UnsafeCell;
 use std::future::Future;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::panic::{self, AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::ptr::NonNull;
+use std::ptr::{NonNull, addr_of_mut};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::thread;
@@ -65,6 +82,20 @@ const TAKEN: u8 = 2;
 /// The closure has been dropped; `result` was never written.
 const ABORTED: u8 = 3;
 
+/// Storage shared by the closure (live while `state == EMPTY`) and the
+/// result (live while `state` is `READY`). The two never coexist; see
+/// the closure/result union note in the module documentation.
+///
+/// `MaybeUninit` has no `Drop`, so the union itself has no `Drop`, and
+/// Rust's "union field that may have a destructor" rule does not apply.
+/// All cleanup of either variant is driven explicitly by the state
+/// machine in [`Job`].
+#[repr(C)]
+pub(crate) union Slot<F, R> {
+	closure: ManuallyDrop<MaybeUninit<F>>,
+	result: ManuallyDrop<MaybeUninit<thread::Result<R>>>,
+}
+
 #[repr(C)]
 pub(crate) struct Job<F, R> {
 	// SAFETY: must remain the first field. `OwnedTask::from_raw` casts a
@@ -75,8 +106,7 @@ pub(crate) struct Job<F, R> {
 	state: AtomicU8,
 	refs: AtomicUsize,
 	waker: AtomicWaker,
-	closure: UnsafeCell<MaybeUninit<F>>,
-	result: UnsafeCell<MaybeUninit<thread::Result<R>>>,
+	slot: UnsafeCell<Slot<F, R>>,
 }
 
 // Safety: the closure and the result move between threads inside
@@ -84,6 +114,70 @@ pub(crate) struct Job<F, R> {
 // both `F` and `R` are `Send` (the worker constructs `R` from `F()`).
 unsafe impl<F: Send, R: Send> Send for Job<F, R> {}
 unsafe impl<F: Send, R: Send> Sync for Job<F, R> {}
+
+impl<F, R> Job<F, R> {
+	/// Read the closure out of the slot in place. Caller must ensure
+	/// the `closure` variant is the live one (i.e. `state == EMPTY`
+	/// and no concurrent worker access).
+	#[inline]
+	unsafe fn read_closure(slot: *mut Slot<F, R>) -> F {
+		// `addr_of_mut!` avoids creating an intermediate `&mut` to the
+		// union field, which would otherwise be flagged as
+		// `deref_nullptr`-adjacent UB in some toolchains. The pointer
+		// we form is a raw pointer-to-MaybeUninit<F> through the
+		// union's `closure` variant.
+		unsafe {
+			let closure_field: *mut ManuallyDrop<MaybeUninit<F>> =
+				addr_of_mut!((*slot).closure);
+			(*closure_field).assume_init_read()
+		}
+	}
+
+	/// Drop the closure in place. Caller must ensure the `closure`
+	/// variant is the live one.
+	#[inline]
+	unsafe fn drop_closure(slot: *mut Slot<F, R>) {
+		unsafe {
+			let closure_field: *mut ManuallyDrop<MaybeUninit<F>> =
+				addr_of_mut!((*slot).closure);
+			(*closure_field).assume_init_drop();
+		}
+	}
+
+	/// Write the result into the slot in place. Caller must ensure the
+	/// closure has already been consumed and no concurrent reader can
+	/// see the slot until `state` transitions to `READY`.
+	#[inline]
+	unsafe fn write_result(slot: *mut Slot<F, R>, value: thread::Result<R>) {
+		unsafe {
+			let result_field: *mut ManuallyDrop<MaybeUninit<thread::Result<R>>> =
+				addr_of_mut!((*slot).result);
+			std::ptr::write(result_field, ManuallyDrop::new(MaybeUninit::new(value)));
+		}
+	}
+
+	/// Read the result out of the slot. Caller must ensure the
+	/// `result` variant is the live one (i.e. `state == READY`).
+	#[inline]
+	unsafe fn read_result(slot: *mut Slot<F, R>) -> thread::Result<R> {
+		unsafe {
+			let result_field: *mut ManuallyDrop<MaybeUninit<thread::Result<R>>> =
+				addr_of_mut!((*slot).result);
+			(*result_field).assume_init_read()
+		}
+	}
+
+	/// Drop the result in place. Caller must ensure the `result`
+	/// variant is the live one.
+	#[inline]
+	unsafe fn drop_result(slot: *mut Slot<F, R>) {
+		unsafe {
+			let result_field: *mut ManuallyDrop<MaybeUninit<thread::Result<R>>> =
+				addr_of_mut!((*slot).result);
+			(*result_field).assume_init_drop();
+		}
+	}
+}
 
 impl<F, R> Job<F, R>
 where
@@ -98,8 +192,9 @@ where
 			state: AtomicU8::new(EMPTY),
 			refs: AtomicUsize::new(2),
 			waker: AtomicWaker::new(),
-			closure: UnsafeCell::new(MaybeUninit::new(f)),
-			result: UnsafeCell::new(MaybeUninit::uninit()),
+			slot: UnsafeCell::new(Slot {
+				closure: ManuallyDrop::new(MaybeUninit::new(f)),
+			}),
 		});
 		// Safety: a `Box::into_raw` pointer is never null.
 		let ptr: NonNull<Job<F, R>> = unsafe { NonNull::new_unchecked(Box::into_raw(boxed)) };
@@ -130,18 +225,22 @@ where
 	unsafe fn call_worker(this: NonNull<()>) {
 		let job_ptr = this.cast::<Job<F, R>>();
 		let job_ref: &Job<F, R> = unsafe { job_ptr.as_ref() };
-		// Move the closure out of its cell. After this read the cell's
+		// Move the closure out of its slot. After this read the slot's
 		// storage is logically uninhabited until `result` is written.
 		// Safety: we have exclusive worker access until `state` leaves
 		// `EMPTY`, and `state` is `EMPTY` here (the worker has not yet
-		// transitioned it).
-		let closure: F = unsafe { (*job_ref.closure.get()).assume_init_read() };
+		// transitioned it). The closure variant of the union is the
+		// live one while `state == EMPTY`.
+		let closure: F = unsafe { Self::read_closure(job_ref.slot.get()) };
 		// Catch panics so they don't unwind through the worker loop.
 		let outcome = catch_unwind(AssertUnwindSafe(closure));
 		// Safety: same exclusivity argument — no other thread reads or
-		// writes `result` while `state` is `EMPTY`.
+		// writes the slot while `state` is `EMPTY`. The closure has been
+		// consumed, so writing the `result` variant of the union is the
+		// next legal access. The transition `EMPTY -> READY` happens
+		// after this write.
 		unsafe {
-			(*job_ref.result.get()).write(outcome);
+			Self::write_result(job_ref.slot.get(), outcome);
 		}
 		// Release the write of `result` to any consumer that observes
 		// `READY` under an `Acquire` load.
@@ -162,9 +261,10 @@ where
 	unsafe fn drop_worker(this: NonNull<()>) {
 		let job_ptr = this.cast::<Job<F, R>>();
 		let job_ref: &Job<F, R> = unsafe { job_ptr.as_ref() };
-		// Safety: same exclusivity argument as `call_worker`.
+		// Safety: same exclusivity argument as `call_worker`. The closure
+		// variant of the union is live while `state == EMPTY`.
 		unsafe {
-			(*job_ref.closure.get()).assume_init_drop();
+			Self::drop_closure(job_ref.slot.get());
 		}
 		job_ref.state.store(ABORTED, Ordering::Release);
 		job_ref.waker.wake();
@@ -188,10 +288,11 @@ where
 			if final_state == READY {
 				// Worker wrote a result the awaiter never took. Drop it
 				// before deallocating.
-				// Safety: state == READY guarantees the slot is
-				// initialised, and refs == 0 guarantees no other reference.
+				// Safety: state == READY guarantees the result variant
+				// of the slot is initialised, and refs == 0 guarantees
+				// no other reference.
 				unsafe {
-					(*job_ref.result.get()).assume_init_drop();
+					Self::drop_result(job_ref.slot.get());
 				}
 			}
 			// Reclaim the allocation.
@@ -230,12 +331,12 @@ where
 	fn take_ready(&mut self) -> Poll<R> {
 		let ptr = self.ptr.take().expect("JobHandle polled after completion");
 		let job_ref: &Job<F, R> = unsafe { ptr.as_ref() };
-		// Safety: state == READY guarantees `result` is initialised, and
-		// because we observed it under `Acquire` the write of `result` is
-		// visible. Marking `state` as `TAKEN` immediately after keeps the
-		// invariant that exactly one side will see `READY` on the cleanup
-		// path.
-		let value = unsafe { (*job_ref.result.get()).assume_init_read() };
+		// Safety: state == READY guarantees the `result` variant of the
+		// slot is initialised, and because we observed it under
+		// `Acquire` the write is visible. Marking `state` as `TAKEN`
+		// immediately after keeps the invariant that exactly one side
+		// will see `READY` on the cleanup path.
+		let value = unsafe { Job::<F, R>::read_result(job_ref.slot.get()) };
 		job_ref.state.store(TAKEN, Ordering::Release);
 		// Release our reference. May or may not be the last.
 		unsafe { Job::<F, R>::release_ref(ptr) };
@@ -324,15 +425,15 @@ impl<F, R> Job<F, R> {
 			let final_state = job_ref.state.load(Ordering::Relaxed);
 			if final_state == READY {
 				unsafe {
-					(*job_ref.result.get()).assume_init_drop();
+					Self::drop_result(job_ref.slot.get());
 				}
 			} else if final_state == EMPTY {
 				// Defensive: should not be reachable in normal flow
 				// (the worker always transitions away from EMPTY before
 				// releasing its ref). If it ever is, drop the closure
-				// so we don't leak it.
+				// variant so we don't leak it.
 				unsafe {
-					(*job_ref.closure.get()).assume_init_drop();
+					Self::drop_closure(job_ref.slot.get());
 				}
 			}
 			drop(unsafe { Box::from_raw(ptr.as_ptr()) });
@@ -443,6 +544,35 @@ mod tests {
 			Poll::Ready(v) => assert_eq!(v, 7),
 			Poll::Pending => panic!("should be Ready after run"),
 		}
+	}
+
+	/// Confirms the closure/result union actually shrinks `Job<F, R>`
+	/// when `sizeof(F)` and `sizeof(R)` overlap usefully. With separate
+	/// fields the slot would occupy `sizeof(F) + sizeof(thread::Result<R>)`;
+	/// with the union it occupies `max(sizeof(F), sizeof(thread::Result<R>))`.
+	#[test]
+	fn slot_union_shrinks_job_size() {
+		use std::mem::size_of;
+		// Stand-in for a closure that captures four usize-sized values:
+		// `Slot<F, u8>` has the same size as `Slot<FakeClosure, u8>`
+		// because layout depends only on `size_of` / `align_of`, not on
+		// the trait-object-ness of F.
+		#[repr(transparent)]
+		#[allow(dead_code)]
+		struct FakeClosure([usize; 4]);
+		let f_size = size_of::<FakeClosure>();
+		let r_size = size_of::<thread::Result<u8>>();
+		let slot_size = size_of::<super::Slot<FakeClosure, u8>>();
+		assert_eq!(
+			slot_size,
+			f_size.max(r_size),
+			"slot ({slot_size}) should equal max(F={f_size}, R={r_size}) under the union"
+		);
+		assert!(
+			slot_size < f_size + r_size,
+			"slot ({slot_size}) should be strictly smaller than F+R={}",
+			f_size + r_size,
+		);
 	}
 
 	/// Result type that owns a heap allocation. Validates that the slot
