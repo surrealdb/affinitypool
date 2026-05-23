@@ -1,8 +1,4 @@
-use std::{
-	marker::PhantomData,
-	mem::{self, ManuallyDrop},
-	ptr::NonNull,
-};
+use std::{marker::PhantomData, ptr::NonNull};
 
 /// VTable for type-erased task dispatch.
 ///
@@ -17,211 +13,168 @@ pub(crate) struct TaskVTable {
 	pub(crate) drop: unsafe fn(NonNull<()>),
 }
 
-#[repr(C)]
-struct TaskData<T> {
-	table: &'static TaskVTable,
-	data: ManuallyDrop<T>,
-}
-
-pub struct OwnedTask<'a>(NonNull<TaskData<u8>>, PhantomData<&'a mut &'a ()>);
+/// Type-erased handle to a task allocation managed elsewhere
+/// (`crate::job::Job` for `spawn`, `crate::local::LocalJob` for
+/// `spawn_local`). The pointed-to allocation must begin with a
+/// `&'static TaskVTable` so the vtable's `call`/`drop` can dispatch
+/// back to the concrete type.
+pub struct OwnedTask<'a>(NonNull<()>, PhantomData<&'a mut &'a ()>);
 
 unsafe impl Send for OwnedTask<'_> {}
 
 impl<'a> OwnedTask<'a> {
-	unsafe fn call<T: FnOnce() + Send + 'a>(this: NonNull<()>) {
-		unsafe {
-			let mut this = this.cast::<TaskData<T>>();
-			ManuallyDrop::take(&mut this.as_mut().data)();
-			mem::drop(Box::from_raw(this.as_ptr()));
-		}
-	}
-
-	unsafe fn drop<T>(this: NonNull<()>) {
-		unsafe {
-			let mut this = this.cast::<TaskData<T>>();
-			ManuallyDrop::drop(&mut this.as_mut().data);
-			mem::drop(Box::from_raw(this.as_ptr()));
-		}
-	}
-
-	fn get_vtable<F: FnOnce() + Send>() -> &'static TaskVTable {
-		trait HasVTable {
-			const TABLE: TaskVTable;
-		}
-
-		impl<T: FnOnce() + Send> HasVTable for T {
-			const TABLE: TaskVTable = TaskVTable {
-				call: OwnedTask::call::<T>,
-				drop: OwnedTask::drop::<T>,
-			};
-		}
-
-		&<F as HasVTable>::TABLE
-	}
-
-	#[inline]
-	pub fn new<F: FnOnce() + Send + 'a>(f: F) -> Self {
-		let b = Box::new(TaskData {
-			table: Self::get_vtable::<F>(),
-			data: ManuallyDrop::new(f),
-		});
-		// Safety: a box can never have a null pointer inside it.
-		Self(unsafe { NonNull::new_unchecked(Box::into_raw(b).cast()) }, PhantomData)
-	}
-
 	/// Wrap a raw pointer to an externally-managed allocation as an
-	/// [`OwnedTask`]. The allocation must begin with a `&'static TaskVTable`
-	/// field whose `call` and `drop` functions know how to cast `ptr` back
-	/// to the concrete type.
+	/// [`OwnedTask`]. The allocation must begin with a
+	/// `&'static TaskVTable` field whose `call` and `drop` functions
+	/// know how to cast `ptr` back to the concrete type.
 	///
 	/// # Safety
 	///
 	/// * `ptr` must point to a live allocation whose first field is a
 	///   `&'static TaskVTable`.
-	/// * The vtable's `call` is invoked at most once by [`Self::run`]; the
-	///   vtable's `drop` is invoked at most once by [`Drop`]. The callee is
-	///   responsible for any release of the allocation itself; this wrapper
-	///   does not free the allocation (compare [`Self::new`] which does).
+	/// * The vtable's `call` is invoked at most once by [`Self::run`];
+	///   the vtable's `drop` is invoked at most once by [`Drop`]. The
+	///   callee is responsible for any release of the allocation
+	///   itself; this wrapper does not free the allocation.
 	/// * Any captured borrows of `'a` must outlive the returned
 	///   `OwnedTask<'a>`.
 	#[inline]
 	pub(crate) unsafe fn from_raw(ptr: NonNull<()>) -> Self {
-		Self(ptr.cast(), PhantomData)
+		Self(ptr, PhantomData)
 	}
 
-	/// Erases the lifetime parameter of this task, converting it to 'static.
-	///
-	/// # Safety
-	///
-	/// The caller must ensure that the closure and all data it captures remain
-	/// valid for as long as the returned `OwnedTask<'static>` exists.
-	///
-	/// The returned task can be safely dropped without execution - the Drop impl
-	/// will properly clean up the closure. However, any borrowed data captured
-	/// by the closure must outlive the `OwnedTask<'static>` object.
-	///
-	/// This is safe when the task's actual lifetime is managed externally, such
-	/// as through `Arc` reference counting or when the caller blocks until the
-	/// task completes or is dropped.
-	pub unsafe fn erase_lifetime(self) -> OwnedTask<'static> {
-		let res = OwnedTask(self.0, PhantomData);
-		std::mem::forget(self);
-		res
+	/// Read the vtable from the allocation. Safe because the vtable
+	/// pointer is the first field by contract.
+	#[inline]
+	unsafe fn vtable(&self) -> &'static TaskVTable {
+		unsafe { self.0.cast::<&'static TaskVTable>().as_ref() }
 	}
 
 	#[inline]
 	pub fn run(self) {
-		unsafe {
-			let call = self.0.as_ref().table.call;
-			call(self.0.cast());
-		}
-		// calling handles drop the data, don't drop the task twice.
+		let vtable = unsafe { self.vtable() };
+		unsafe { (vtable.call)(self.0) };
+		// `call` is responsible for the allocation; don't run our `Drop`.
 		std::mem::forget(self);
 	}
 }
 
 impl Drop for OwnedTask<'_> {
 	fn drop(&mut self) {
-		unsafe {
-			let drop = self.0.as_ref().table.drop;
-			drop(self.0.cast());
-		}
+		let vtable = unsafe { self.vtable() };
+		unsafe { (vtable.drop)(self.0) };
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	//! These exercise every unsafe block in this module without invoking
-	//! the thread pool. Miri runs them with `cargo miri test --lib`.
+	//! Exercise the vtable dispatch in [`OwnedTask`] without invoking
+	//! the thread pool. Miri walks every unsafe block here.
+	//!
+	//! The unsafe machinery that *uses* `OwnedTask` (`Job`,
+	//! `LocalJob`) has its own dedicated unit-test modules; these
+	//! tests cover only the wrapper's dispatch contract.
 
 	use super::*;
+	use std::cell::UnsafeCell;
 	use std::sync::Arc;
-	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-	/// `OwnedTask::new` + `run` for several closure shapes, including ZSTs
-	/// and types with non-trivial `Drop`. Validates the monomorphic vtable
-	/// dispatch and that the boxed `TaskData<F>` is freed exactly once.
-	#[test]
-	fn owned_task_run_drops_capture_once() {
-		struct DropTracker(Arc<AtomicUsize>);
-		impl Drop for DropTracker {
-			fn drop(&mut self) {
-				self.0.fetch_add(1, Ordering::SeqCst);
-			}
-		}
-		let drops = Arc::new(AtomicUsize::new(0));
-		let tracker = DropTracker(drops.clone());
-		let task = OwnedTask::new(move || {
-			let _t = tracker;
+	/// Minimal vtabled allocation: a single bool tracking whether the
+	/// `call` or `drop` vtable entry fired.
+	#[repr(C)]
+	struct TestTask {
+		table: &'static TaskVTable,
+		ran: UnsafeCell<bool>,
+		dropped: Arc<AtomicBool>,
+	}
+
+	unsafe fn test_call(this: NonNull<()>) {
+		let p = this.cast::<TestTask>().as_ptr();
+		unsafe { *(*p).ran.get() = true };
+		// `call` takes ownership: free the allocation.
+		drop(unsafe { Box::from_raw(p) });
+	}
+
+	unsafe fn test_drop(this: NonNull<()>) {
+		let p = this.cast::<TestTask>().as_ptr();
+		unsafe { (*p).dropped.store(true, Ordering::SeqCst) };
+		drop(unsafe { Box::from_raw(p) });
+	}
+
+	static TEST_VTABLE: TaskVTable = TaskVTable {
+		call: test_call,
+		drop: test_drop,
+	};
+
+	fn make_task(dropped: Arc<AtomicBool>) -> (OwnedTask<'static>, NonNull<TestTask>) {
+		let boxed = Box::new(TestTask {
+			table: &TEST_VTABLE,
+			ran: UnsafeCell::new(false),
+			dropped,
 		});
+		let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(boxed)) };
+		let task = unsafe { OwnedTask::from_raw(ptr.cast()) };
+		(task, ptr)
+	}
+
+	/// `OwnedTask::run` invokes the vtable's `call`. The allocation is
+	/// freed inside `call` and the wrapper does not run its own `Drop`.
+	#[test]
+	fn run_dispatches_to_call_and_skips_drop() {
+		let dropped = Arc::new(AtomicBool::new(false));
+		let (task, ptr) = make_task(dropped.clone());
 		task.run();
-		assert_eq!(drops.load(Ordering::SeqCst), 1);
+		// `call` set `ran = true` and freed the box. We can't deref
+		// `ptr` after free; the assertion is that `dropped` was never
+		// set (drop vtable did not fire).
+		assert!(!dropped.load(Ordering::SeqCst));
+		let _ = ptr; // suppress unused warning
 	}
 
-	/// `OwnedTask::new` followed by `Drop` without `run`. Validates the
-	/// `drop` vtable entry frees the boxed closure (and its captures)
-	/// exactly once with no use-after-free.
+	/// Dropping `OwnedTask` without `run` invokes the vtable's `drop`.
 	#[test]
-	fn owned_task_drop_without_run_releases_capture() {
-		struct DropTracker(Arc<AtomicUsize>);
-		impl Drop for DropTracker {
-			fn drop(&mut self) {
-				self.0.fetch_add(1, Ordering::SeqCst);
+	fn drop_dispatches_to_drop_vtable() {
+		let dropped = Arc::new(AtomicBool::new(false));
+		let (task, _ptr) = make_task(dropped.clone());
+		drop(task);
+		assert!(dropped.load(Ordering::SeqCst));
+	}
+
+	/// Many distinct vtables can coexist for distinct allocation
+	/// shapes. Miri also walks an allocation with non-trivial payload
+	/// to catch any aliasing slipups in `vtable()`.
+	#[test]
+	fn vtable_first_field_is_observed_correctly() {
+		#[repr(C)]
+		struct Tracker {
+			table: &'static TaskVTable,
+			counter: Arc<AtomicUsize>,
+			payload: Vec<u8>,
+		}
+		unsafe fn call(this: NonNull<()>) {
+			let p = this.cast::<Tracker>().as_ptr();
+			unsafe {
+				(*p).counter.fetch_add((*p).payload.len(), Ordering::SeqCst);
 			}
+			drop(unsafe { Box::from_raw(p) });
 		}
-		let drops = Arc::new(AtomicUsize::new(0));
-		{
-			let tracker = DropTracker(drops.clone());
-			let _task = OwnedTask::new(move || {
-				let _t = tracker;
-			});
-			// _task dropped here without running.
+		unsafe fn drop_fn(this: NonNull<()>) {
+			drop(unsafe { Box::from_raw(this.cast::<Tracker>().as_ptr()) });
 		}
-		assert_eq!(drops.load(Ordering::SeqCst), 1);
-	}
-
-	/// `erase_lifetime` on a closure that captures a stack borrow, then
-	/// `run` the erased task while the borrow is still live. Miri verifies
-	/// no aliasing or use-after-free, validating the soundness contract
-	/// documented on `OwnedTask::erase_lifetime`.
-	#[test]
-	fn owned_task_erase_lifetime_run_within_borrow() {
-		let data: Vec<u32> = (0..64).collect();
-		let out = Arc::new(AtomicUsize::new(0));
-		let out_ref = out.clone();
-		let task: OwnedTask<'_> = OwnedTask::new(move || {
-			out_ref.store(data.iter().sum::<u32>() as usize, Ordering::SeqCst);
+		static VT: TaskVTable = TaskVTable {
+			call,
+			drop: drop_fn,
+		};
+		let counter = Arc::new(AtomicUsize::new(0));
+		let boxed = Box::new(Tracker {
+			table: &VT,
+			counter: counter.clone(),
+			payload: vec![1, 2, 3, 4, 5],
 		});
-		// Safety: we run the erased task here before the closure's captures
-		// (`data`, `out_ref`) go out of scope, so the lifetime contract is
-		// upheld for the duration of `run()`.
-		let erased: OwnedTask<'static> = unsafe { task.erase_lifetime() };
-		erased.run();
-		let expected: u32 = (0..64).sum();
-		assert_eq!(out.load(Ordering::SeqCst) as u32, expected);
-	}
-
-	/// `erase_lifetime` followed by `Drop` without `run`. The erased task's
-	/// `Drop` impl must still free the boxed closure exactly once.
-	#[test]
-	fn owned_task_erase_lifetime_drop_without_run() {
-		struct DropTracker(Arc<AtomicUsize>);
-		impl Drop for DropTracker {
-			fn drop(&mut self) {
-				self.0.fetch_add(1, Ordering::SeqCst);
-			}
-		}
-		let drops = Arc::new(AtomicUsize::new(0));
-		{
-			let tracker = DropTracker(drops.clone());
-			let task: OwnedTask<'_> = OwnedTask::new(move || {
-				let _t = tracker;
-			});
-			// Safety: `tracker` (the captured data) lives in `task` itself,
-			// and `task` is dropped at end of scope below — strictly within
-			// the original `'_` borrow, so the lifetime contract holds.
-			let _erased: OwnedTask<'static> = unsafe { task.erase_lifetime() };
-		}
-		assert_eq!(drops.load(Ordering::SeqCst), 1);
+		let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(boxed)) };
+		let task = unsafe { OwnedTask::from_raw(ptr.cast()) };
+		task.run();
+		assert_eq!(counter.load(Ordering::SeqCst), 5);
 	}
 }
