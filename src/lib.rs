@@ -219,9 +219,15 @@ impl Threadpool {
 				// that worker observes the producer's injector push.
 				fence(Ordering::SeqCst);
 				// If there's work in the queue, wake a thread to help.
-				// Keep `parked_count` in sync with every `parked_threads`
-				// op so producers can use it as an accurate short-circuit.
+				// Gate the `parked_threads.pop()` (multiple CAS ops in
+				// crossbeam's ArrayQueue) on `parked_count > 0` — same
+				// short-circuit as in `Threadpool::spawn`. The
+				// `Acquire` load synchronises with the worker's
+				// `Release` `fetch_add` on `parked_count` in the park
+				// path; the SeqCst fence above remains the
+				// synchronisation that prevents lost wakeups.
 				if !data.injector.is_empty()
+					&& data.parked_count.load(Ordering::Acquire) > 0
 					&& let Some(thread) = data.parked_threads.pop()
 				{
 					data.parked_count.fetch_sub(1, Ordering::Release);
