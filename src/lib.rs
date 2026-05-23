@@ -213,6 +213,14 @@ impl Threadpool {
 		if let Some(task) = local.pop() {
 			return Some(task);
 		}
+		// Hoist the stealer-slice load out of the retry loop. The slice
+		// is owned by an `ArcSwap` and only changes on sentry respawn
+		// (rare); per-retry reloading paid a refcount-Guard cost on
+		// every iteration of the spin. A stealer that has been
+		// replaced mid-loop still returns `Empty` (the dead worker's
+		// queue is empty), so reading from a stale snapshot is sound.
+		let stealers = data.stealers.load();
+		let n = stealers.len();
 		// Look for work elsewhere with a bounded spin.
 		for retry in 0..Self::STEAL_RETRY_BUDGET {
 			// Spin hint on retries to reduce contention.
@@ -238,10 +246,6 @@ impl Threadpool {
 			// directly; an `Empty` falls through to peer stealers; a
 			// `Retry` re-enters the loop.
 			let combined = injector_result.or_else(|| {
-				// Lock-free load of the stealer slice. No locks on the
-				// hot path.
-				let stealers = data.stealers.load();
-				let n = stealers.len();
 				if n <= 1 {
 					return crossbeam::deque::Steal::Empty;
 				}
