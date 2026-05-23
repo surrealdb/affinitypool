@@ -194,10 +194,17 @@ impl Threadpool {
 	/// Bounded spin budget before `find_task` returns `None` and the
 	/// caller parks. `Steal::Retry` is transient (another thread is
 	/// concurrently stealing the same slot), so a burst of retries
-	/// usually resolves within a handful of iterations. After this
-	/// many we give up and let the worker park; a subsequent producer
-	/// will wake us via `parked_threads`.
-	const STEAL_RETRY_BUDGET: usize = 32;
+	/// usually resolves within a handful of iterations.
+	///
+	/// Set high enough that workers don't park between fast-arriving
+	/// tasks — empirically, budget=32 caused workers to park on every
+	/// empty-closure-style task with sub-µs producer gaps, regressing
+	/// `spawn_overhead` and `park_unpark_handshake` by 10–17% on the
+	/// microbenchmark suite. 4096 lets the worker spin through
+	/// realistic producer pauses (≈50–100 µs at this budget on Apple
+	/// Silicon) before committing to a syscall, while still bounding
+	/// the worst case so a permanently quiet pool eventually parks.
+	const STEAL_RETRY_BUDGET: usize = 4096;
 
 	/// Spins up to [`STEAL_RETRY_BUDGET`] times waiting for a non-retry
 	/// outcome; returns `None` if every probe reports `Empty` or the
