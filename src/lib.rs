@@ -301,12 +301,13 @@ impl Threadpool {
 			if let Some(coreid) = coreid {
 				affinity::set_for_current(coreid.into());
 			}
-			// Loop continuously, processing any jobs
+			// Loop continuously, processing any jobs. Shutdown is observed
+			// in a single place — the pre-park check below — so the busy
+			// path (find-task → run → repeat) does not pay an Acquire
+			// load every iteration. Tasks already in the injector are
+			// drained before the worker exits on shutdown, which is
+			// strictly better behaviour than the previous abrupt exit.
 			loop {
-				// Check if we should shut down
-				if data.shutdown.load(Ordering::Acquire) {
-					break;
-				}
 				// Try to find a task using work-stealing
 				if let Some(task) = Self::find_task(&local, &data, index) {
 					// Process the task
