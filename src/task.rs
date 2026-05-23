@@ -59,6 +59,7 @@ impl<'a> OwnedTask<'a> {
 		&<F as HasVTable>::TABLE
 	}
 
+	#[inline]
 	pub fn new<F: FnOnce() + Send + 'a>(f: F) -> Self {
 		let b = Box::new(TaskData {
 			table: Self::get_vtable::<F>(),
@@ -83,6 +84,7 @@ impl<'a> OwnedTask<'a> {
 	///   does not free the allocation (compare [`Self::new`] which does).
 	/// * Any captured borrows of `'a` must outlive the returned
 	///   `OwnedTask<'a>`.
+	#[inline]
 	pub(crate) unsafe fn from_raw(ptr: NonNull<()>) -> Self {
 		Self(ptr.cast(), PhantomData)
 	}
@@ -107,6 +109,7 @@ impl<'a> OwnedTask<'a> {
 		res
 	}
 
+	#[inline]
 	pub fn run(self) {
 		unsafe {
 			let call = self.0.as_ref().table.call;

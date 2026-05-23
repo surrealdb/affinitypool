@@ -186,6 +186,7 @@ where
 {
 	/// Allocate a fresh job and split it into an [`OwnedTask`] for the
 	/// worker side and a [`JobHandle`] for the awaiter side.
+	#[inline]
 	pub(crate) fn allocate(f: F) -> (OwnedTask<'static>, JobHandle<F, R>) {
 		let boxed = Box::new(Job {
 			_table: Self::vtable(),
@@ -222,6 +223,7 @@ where
 	/// Worker entry point. Runs the closure (catching panics), writes the
 	/// result, transitions `EMPTY -> READY`, wakes the awaiter, and
 	/// releases the worker's reference.
+	#[inline]
 	unsafe fn call_worker(this: NonNull<()>) {
 		let job_ptr = this.cast::<Job<F, R>>();
 		let job_ref: &Job<F, R> = unsafe { job_ptr.as_ref() };
@@ -275,6 +277,7 @@ where
 
 	/// Decrement the refcount. On the final decrement, drop any value
 	/// still in the slot and free the allocation.
+	#[inline]
 	unsafe fn release_ref(ptr: NonNull<Job<F, R>>) {
 		let job_ref: &Job<F, R> = unsafe { ptr.as_ref() };
 		// AcqRel: this release synchronises with concurrent writes to
@@ -328,6 +331,7 @@ where
 
 	/// Consume the ready result. Caller must have already observed
 	/// `state == READY` under an `Acquire` load.
+	#[inline]
 	fn take_ready(&mut self) -> Poll<R> {
 		let ptr = self.ptr.take().expect("JobHandle polled after completion");
 		let job_ref: &Job<F, R> = unsafe { ptr.as_ref() };
@@ -354,6 +358,7 @@ where
 {
 	type Output = R;
 
+	#[inline]
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		// JobHandle has no pinned fields.
 		let this = Pin::into_inner(self);
