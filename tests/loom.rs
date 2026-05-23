@@ -2,7 +2,7 @@
 //!
 //! Loom exhaustively explores thread interleavings on a re-implementation of
 //! the algorithm. The models here mirror the production code in
-//! `src/spawn.rs`, `src/atomic_waker.rs`, and the park/unpark interaction in
+//! `src/job.rs`, `src/atomic_waker.rs`, and the park/unpark interaction in
 //! `src/lib.rs` so any reordering bug in the algorithm is caught
 //! independently of the real implementation.
 //!
@@ -28,7 +28,8 @@ const EMPTY: u8 = 0;
 const READY: u8 = 1;
 const TAKEN: u8 = 2;
 
-/// Mirror of `SpawnCompletion<R>` with a hand-rolled "waker" stand-in to
+/// Mirror of the completion slot in `Job<F, R>` with a hand-rolled
+/// "waker" stand-in to
 /// avoid pulling the real `AtomicWaker` (which uses `std` atomics). The
 /// invariant under test: every successful "complete" must be observed by
 /// the consumer with the result fully initialised.
@@ -61,7 +62,7 @@ impl Completion {
 	}
 
 	fn try_take(&self) -> Option<u32> {
-		// Mimic SpawnHandle::poll: register first, then load state.
+		// Mimic JobHandle::poll: register first, then load state.
 		let _ = self.signal.load(Ordering::Acquire);
 		match self.state.load(Ordering::Acquire) {
 			READY => {
@@ -76,7 +77,7 @@ impl Completion {
 
 impl Drop for Completion {
 	fn drop(&mut self) {
-		// Mirror SpawnCompletion::drop in src/spawn.rs: drop the result
+		// Mirror Job::release_ref on final-drop in src/job.rs: drop the result
 		// payload iff it was written but never taken. We hold `&mut self`
 		// here, so no concurrent access is possible; a relaxed load is OK
 		// (Loom's `AtomicU8` does not expose `get_mut`).

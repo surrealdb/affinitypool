@@ -4,9 +4,17 @@ use std::{
 	ptr::NonNull,
 };
 
-struct TaskVTable {
-	call: unsafe fn(NonNull<()>),
-	drop: unsafe fn(NonNull<()>),
+/// VTable for type-erased task dispatch.
+///
+/// The `call` and `drop` function pointers take a `NonNull<()>` to the
+/// owning allocation. Each per-(closure-type, payload-type) static
+/// vtable instance knows how to cast the pointer back to its concrete
+/// type. The first field of any allocation referenced by an
+/// [`OwnedTask`] must be a `&'static TaskVTable`; this is what makes
+/// the polymorphic dispatch sound.
+pub(crate) struct TaskVTable {
+	pub(crate) call: unsafe fn(NonNull<()>),
+	pub(crate) drop: unsafe fn(NonNull<()>),
 }
 
 #[repr(C)]
@@ -58,6 +66,25 @@ impl<'a> OwnedTask<'a> {
 		});
 		// Safety: a box can never have a null pointer inside it.
 		Self(unsafe { NonNull::new_unchecked(Box::into_raw(b).cast()) }, PhantomData)
+	}
+
+	/// Wrap a raw pointer to an externally-managed allocation as an
+	/// [`OwnedTask`]. The allocation must begin with a `&'static TaskVTable`
+	/// field whose `call` and `drop` functions know how to cast `ptr` back
+	/// to the concrete type.
+	///
+	/// # Safety
+	///
+	/// * `ptr` must point to a live allocation whose first field is a
+	///   `&'static TaskVTable`.
+	/// * The vtable's `call` is invoked at most once by [`Self::run`]; the
+	///   vtable's `drop` is invoked at most once by [`Drop`]. The callee is
+	///   responsible for any release of the allocation itself; this wrapper
+	///   does not free the allocation (compare [`Self::new`] which does).
+	/// * Any captured borrows of `'a` must outlive the returned
+	///   `OwnedTask<'a>`.
+	pub(crate) unsafe fn from_raw(ptr: NonNull<()>) -> Self {
+		Self(ptr.cast(), PhantomData)
 	}
 
 	/// Erases the lifetime parameter of this task, converting it to 'static.

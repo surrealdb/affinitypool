@@ -4,9 +4,9 @@ mod builder;
 mod data;
 mod error;
 mod global;
+mod job;
 mod local;
 mod sentry;
-mod spawn;
 mod task;
 
 pub use crate::builder::Builder;
@@ -14,14 +14,13 @@ pub use crate::error::Error;
 
 use crate::data::Data;
 use crate::global::THREADPOOL;
+use crate::job::Job;
 use crate::sentry::Sentry;
-use crate::spawn::{SpawnCompletion, SpawnHandle};
 use arc_swap::ArcSwap;
 use crossbeam::deque::{Injector, Worker};
 use crossbeam::queue::ArrayQueue;
 use local::SpawnFuture;
 use parking_lot::Mutex;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use task::OwnedTask;
@@ -122,14 +121,9 @@ impl Threadpool {
 		F: Send + 'static,
 		R: Send + 'static,
 	{
-		// Single-allocation completion shared with the worker.
-		let completion = Arc::new(SpawnCompletion::new());
-		let worker_side = completion.clone();
-		// Enclose the function in a closure that catches panics and writes
-		// the result into the shared completion slot.
-		let task = OwnedTask::new(move || {
-			worker_side.complete(catch_unwind(AssertUnwindSafe(func)));
-		});
+		// Single allocation for the closure, result slot, state machine,
+		// waker, and refcount. See `crate::job` for the layout.
+		let (task, handle) = Job::allocate(func);
 		// Push the task to the global injector
 		self.data.injector.push(task);
 		// SeqCst fence pairs with the consumer's fence in the worker loop.
@@ -142,8 +136,8 @@ impl Threadpool {
 		if let Some(thread) = self.data.parked_threads.pop() {
 			thread.unpark();
 		}
-		// Await the result via the completion slot.
-		SpawnHandle::new(completion).await
+		// Await the result via the job's completion machinery.
+		handle.await
 	}
 
 	/// Queue a new command for execution on this pool with access to the local variables.

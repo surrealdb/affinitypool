@@ -109,7 +109,7 @@ jobs:
           # only sound under Tree Borrows. `-Zmiri-ignore-leaks` silences
           # leaks owned by crossbeam-epoch's TLS handle on thread exit.
           MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-ignore-leaks"
-        # Run lib unit tests in the `task::` and `spawn::` modules — these
+        # Run lib unit tests in the `task::` and `job::` modules — these
         # exercise every unsafe block in the crate without invoking the
         # work-stealing scheduler. Miri's `std::thread::park` modelling
         # over-reports deadlocks for the scheduler, so threaded tests live
@@ -117,7 +117,7 @@ jobs:
         # and `tests/loom.rs` (validated exhaustively under Loom).
         run: |
           cargo miri test --lib task::
-          cargo miri test --lib spawn::
+          cargo miri test --lib job::
 
   loom:
     name: Loom
