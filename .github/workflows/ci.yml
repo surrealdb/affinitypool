@@ -85,14 +85,69 @@ jobs:
       - name: Check benchmarks compile
         run: cargo bench --no-run
 
-  # NOTE: task allocation and waker synchronization were moved to the
-  # `async-task` crate (which carries its own miri + loom coverage
-  # upstream) in the 0.6.0 rewrite. The only remaining first-party
-  # unsafe block is the `spawn_unchecked` call inside
-  # `Threadpool::spawn_local`, where soundness is enforced by the
-  # `SpawnFuture::drop`-blocks-on-cancel contract rather than by any
-  # bespoke synchronization protocol. End-to-end behavior is covered
-  # on real threads across Linux/macOS/Windows by
-  # `tests/threadpool_tests.rs` and `tests/async_task_smoke.rs`. The
-  # previous standalone miri and loom jobs are therefore no longer
-  # needed and have been removed.
+  # The 0.6.0 rewrite shrank the unsafe surface (task allocation and
+  # waker synchronisation moved into `async-task`, which carries its
+  # own miri + loom coverage upstream), but it introduced a new
+  # first-party concurrency protocol — the arm-then-rescan park
+  # handshake in `src/queue.rs`. The remaining first-party `unsafe`
+  # is `Builder::spawn_unchecked` in `Threadpool::spawn_local`, whose
+  # soundness relies on `SpawnFuture::drop` blocking until the
+  # runnable stops. The jobs below cover both:
+  #
+  # * `miri` runs the async-task smoke tests and the crate's unit
+  #   tests under MIRI to catch UB on the `spawn_unchecked` boundary
+  #   and the `Runnable` cross-thread transfer.
+  # * `loom` runs a model of the queue's parking handshake
+  #   (`tests/loom_queue.rs`) that exhaustively explores producer/
+  #   worker interleavings against the protocol described in
+  #   `src/queue.rs`.
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust nightly with Miri
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run Miri
+        env:
+          # `-Zmiri-disable-isolation` lets thread-local time/CPU
+          # queries used by `async-task` and the test harness succeed
+          # without external syscalls.
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        # Scope: the `async_task_smoke` integration suite exercises
+        # the `spawn_unchecked` lifetime contract and the `Runnable`
+        # send-across-thread path that the new design depends on;
+        # `--lib` picks up the small set of crate-internal unit
+        # tests. The full `threadpool_tests` suite uses a tokio
+        # multi-thread runtime that is impractical under miri.
+        run: |
+          cargo miri test --lib
+          cargo miri test --test async_task_smoke
+
+  loom:
+    name: Loom
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run Loom models
+        env:
+          RUSTFLAGS: "--cfg loom"
+          LOOM_MAX_PREEMPTIONS: "3"
+        run: cargo test --release --test loom_queue
