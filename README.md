@@ -84,7 +84,10 @@ Unlike `tokio::spawn_blocking`, affinitypool preserves **CPU affinity** — the 
 To reproduce:
 
 ```bash
-cargo bench --bench vs_tokio          # head-to-head with tokio
+cargo bench --bench vs_tokio          # vs tokio::task::spawn_blocking
+cargo bench --bench vs_blocking       # vs blocking::unblock (async-std / smol)
+cargo bench --bench vs_rayon          # vs rayon::ThreadPool::spawn
+cargo bench --bench vs_threadpool     # vs threadpool::ThreadPool::execute
 cargo bench --bench microbench        # internal microbenchmarks
 ./run_benchmarks.sh                   # full suite
 ```
