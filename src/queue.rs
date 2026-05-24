@@ -108,6 +108,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 use crate::cpu;
 
+/// Per-worker stealer slot. `Option` so the panic-respawn path can
+/// replace a worker's slot when a fresh thread takes over;
+/// `CachePadded` to keep slots on separate cache lines and avoid
+/// false sharing during the cross-worker scan.
+type StealerSlot = CachePadded<Mutex<Option<Stealer<Runnable>>>>;
+
 /// Hard cap on the shard count. Picked empirically: 8 saturates
 /// producer-side distribution on common topologies (≤8-core boxes
 /// map one shard per core, 32-core boxes share 4 cores per shard)
@@ -136,9 +142,9 @@ pub(crate) struct Queue {
 	/// Lock-free sharded injectors. Producers push here.
 	injectors: Box<[CachePadded<Injector<Runnable>>]>,
 	/// Stealers for every worker's local deque, indexed by worker
-	/// index. `Option` so the panic-respawn path can replace a
-	/// worker's slot when a fresh thread takes over.
-	stealers: Box<[CachePadded<Mutex<Option<Stealer<Runnable>>>>]>,
+	/// index. See [`StealerSlot`] for the cache-padding + Option
+	/// rationale.
+	stealers: Box<[StealerSlot]>,
 	/// `num_shards - 1`. `num_shards` is always a power of two.
 	mask: usize,
 	/// Held briefly by producers to notify, and by workers across
@@ -172,7 +178,7 @@ impl Queue {
 		let num_shards = num_workers.next_power_of_two().clamp(1, MAX_SHARDS);
 		let injectors: Vec<CachePadded<Injector<Runnable>>> =
 			(0..num_shards).map(|_| CachePadded::new(Injector::new())).collect();
-		let stealers: Vec<CachePadded<Mutex<Option<Stealer<Runnable>>>>> =
+		let stealers: Vec<StealerSlot> =
 			(0..num_workers).map(|_| CachePadded::new(Mutex::new(None))).collect();
 		Self {
 			injectors: injectors.into_boxed_slice(),
@@ -330,10 +336,10 @@ impl Queue {
 		for offset in 1..num_workers {
 			let victim = (ctx.idx + offset) % num_workers;
 			let stealer = self.stealers[victim].lock().clone();
-			if let Some(stealer) = stealer {
-				if let Some(r) = retry_steal(|| stealer.steal_batch_and_pop(&ctx.deque)) {
-					return Some(r);
-				}
+			if let Some(stealer) = stealer
+				&& let Some(r) = retry_steal(|| stealer.steal_batch_and_pop(&ctx.deque))
+			{
+				return Some(r);
 			}
 		}
 
