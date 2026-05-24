@@ -236,40 +236,30 @@ Unlike any of these alternatives, affinitypool gives you a dedicated pool sized 
 
 Tasks are delivered from producers to workers through a sharded MPMC queue. Each producer routes to a shard via a thread-local cache of its current CPU (`sched_getcpu()` on Linux, `GetCurrentProcessorNumber()` on Windows), so a producer running on core *N* consistently lands on shard `N & mask`. Each worker has a preferred shard (`worker_idx & mask`) and falls back to scanning the remaining shards in cyclic order before parking — there are no private deques and no work-stealing handshake.
 
-```mermaid
-flowchart LR
-    subgraph Producers["Producers (any async task)"]
-        P0["producer @ core 0"]
-        P1["producer @ core 1"]
-        P2["producer @ core N"]
-    end
-
-    subgraph Queue["Sharded queue (num_workers.next_power_of_two().min(8))"]
-        S0["Shard 0<br/>Mutex&lt;VecDeque&lt;Runnable&gt;&gt;"]
-        S1["Shard 1<br/>Mutex&lt;VecDeque&lt;Runnable&gt;&gt;"]
-        SN["Shard k<br/>Mutex&lt;VecDeque&lt;Runnable&gt;&gt;"]
-        Park["park: Mutex&lt;()&gt; + Condvar<br/>parked: AtomicUsize"]
-    end
-
-    subgraph Workers["Worker threads (optionally pinned)"]
-        W0["worker 0<br/>preferred: shard 0"]
-        W1["worker 1<br/>preferred: shard 1"]
-        WN["worker k<br/>preferred: shard k"]
-    end
-
-    P0 -- "cpu &amp; mask" --> S0
-    P1 -- "cpu &amp; mask" --> S1
-    P2 -- "cpu &amp; mask" --> SN
-
-    S0 --> W0
-    S1 --> W1
-    SN --> WN
-
-    W0 -. "scan on empty" .-> S1
-    W1 -. "scan on empty" .-> SN
-    WN -. "park if all empty" .-> Park
-    Park -. "notify_one" .-> WN
+```text
+Producers (any async task)
+   +----------------+   +----------------+   +----------------+
+   | producer @ c0  |   | producer @ c1  |   | producer @ cN  |
+   +----------------+   +----------------+   +----------------+
+           |                    |                    |
+           v                    v                    v
+Sharded queue  (num_workers.next_power_of_two().min(8))
+   +----------------+   +----------------+   +----------------+
+   |    Shard 0     |   |    Shard 1     |   |    Shard k     |
+   |   Mutex<       |   |   Mutex<       |   |   Mutex<       |
+   |    VecDeque<   |   |    VecDeque<   |   |    VecDeque<   |
+   |    Runnable>>  |   |    Runnable>>  |   |    Runnable>>  |
+   +----------------+   +----------------+   +----------------+
+           |                    |                    |
+           v                    v                    v
+Worker threads (optionally pinned)
+   +----------------+   +----------------+   +----------------+
+   |    worker 0    |   |    worker 1    |   |    worker k    |
+   |  pref: shard 0 |   |  pref: shard 1 |   |  pref: shard k |
+   +----------------+   +----------------+   +----------------+
 ```
+
+On an empty preferred shard a worker scans the remaining shards in cyclic order, then parks on a shared `Mutex<()> + Condvar` (counted by an `AtomicUsize`). Producers check that counter after pushing; if any worker may be parked, they briefly take the park mutex to `notify_one`.
 
 Each task is a single heap allocation (the [`async-task`](https://crates.io/crates/async-task) layout — fused header + closure + result slot + waker). The park/unpark handshake is lost-wakeup-free; the proof sketch lives in [src/queue.rs](src/queue.rs) and the model in [tests/loom_queue.rs](tests/loom_queue.rs).
 
