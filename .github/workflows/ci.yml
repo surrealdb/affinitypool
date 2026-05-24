@@ -85,57 +85,14 @@ jobs:
       - name: Check benchmarks compile
         run: cargo bench --no-run
 
-  miri:
-    name: Miri
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install Rust nightly with Miri
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with:
-          toolchain: nightly
-          components: miri
-
-      - name: Cache cargo dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Run Miri
-        env:
-          # Crossbeam-deque relies on int-to-ptr provenance internally and is
-          # only sound under Tree Borrows. `-Zmiri-ignore-leaks` silences
-          # leaks owned by crossbeam-epoch's TLS handle on thread exit.
-          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-ignore-leaks"
-        # Run lib unit tests in the `task::` and `job::` modules — these
-        # exercise every unsafe block in the crate without invoking the
-        # work-stealing scheduler. Miri's `std::thread::park` modelling
-        # over-reports deadlocks for the scheduler, so threaded tests live
-        # in `tests/threadpool_tests.rs` (validated on real threads in CI)
-        # and `tests/loom.rs` (validated exhaustively under Loom).
-        run: |
-          cargo miri test --lib task::
-          cargo miri test --lib job::
-
-  loom:
-    name: Loom
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      - name: Cache cargo dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Run Loom models
-        env:
-          RUSTFLAGS: "--cfg loom"
-          LOOM_MAX_PREEMPTIONS: "3"
-        run: cargo test --test loom --release
+  # NOTE: task allocation and waker synchronization were moved to the
+  # `async-task` crate (which carries its own miri + loom coverage
+  # upstream) in the 0.6.0 rewrite. The only remaining first-party
+  # unsafe block is the `spawn_unchecked` call inside
+  # `Threadpool::spawn_local`, where soundness is enforced by the
+  # `SpawnFuture::drop`-blocks-on-cancel contract rather than by any
+  # bespoke synchronization protocol. End-to-end behavior is covered
+  # on real threads across Linux/macOS/Windows by
+  # `tests/threadpool_tests.rs` and `tests/async_task_smoke.rs`. The
+  # previous standalone miri and loom jobs are therefore no longer
+  # needed and have been removed.
