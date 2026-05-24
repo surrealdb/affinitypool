@@ -122,6 +122,24 @@ design intent.
   `async_task::Task` semantics, and makes `spawn` consistent with
   `spawn_local`.
 
+- The concrete future type returned by `Threadpool::spawn_local`
+  changed from `SpawnFuture<'pool, F, R>` to `SpawnFuture<'pool, R>`
+  (the closure type parameter was dropped — the closure now lives
+  inside an `async_task::Task<R>`). Callers that named the type in
+  a `where` clause, stored it in a struct, or returned it from a
+  function will need to drop the `F` parameter. Callers that only
+  used the returned value as a `Future` (the common case) are
+  unaffected.
+
+- `spawn_local` keeps the pre-0.6.0 lazy-schedule semantic: the
+  runnable is pushed onto the queue on first poll of the returned
+  `SpawnFuture`, not at the call site. Constructing and dropping a
+  `SpawnFuture` without ever polling it is a no-op and never touches
+  a worker — required so a 1-worker pool can't deadlock when the
+  only worker does `let _ = pool.spawn_local(...)`. Only `spawn`
+  (which has no `'pool` borrow and no drop-blocking contract) was
+  switched to eager scheduling.
+
 ### Internal changes
 
 - Task allocation, refcounting, completion state machine, and waker
