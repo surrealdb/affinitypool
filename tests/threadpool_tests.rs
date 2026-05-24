@@ -945,3 +945,16 @@ fn _spawn_send_bound_compile_check() {
 	let fut = pool.spawn(|| 42u64);
 	assert_send(fut);
 }
+
+/// `SpawnFuture` should be `Send` whenever `R: Send` purely via the
+/// auto-impl (async-task gives us `Task<R>: Send where R: Send`, and
+/// the only other field is `PhantomData<&Threadpool>`). This is here
+/// to make sure the previously hand-rolled `unsafe impl Send` is
+/// genuinely unnecessary.
+#[allow(dead_code)]
+fn _spawn_local_send_bound_compile_check() {
+	fn assert_send<T: Send>(_: T) {}
+	let pool = Threadpool::new(1);
+	let fut = pool.spawn_local(|| 42u64);
+	assert_send(fut);
+}
