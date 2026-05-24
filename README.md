@@ -4,6 +4,93 @@ A threadpool for running blocking jobs on a dedicated thread pool. Blocking task
 
 For optimised workloads, the affinity of each thread can be specified, ensuring that each thread can request to be pinned to a certain CPU core, allowing for more parallelism, and better performance guarantees for blocking workloads.
 
+## Architecture
+
+Tasks are delivered from producers to workers through a sharded MPMC queue. Each producer routes to a shard via a thread-local cache of its current CPU (`sched_getcpu()` on Linux, `GetCurrentProcessorNumber()` on Windows), so a producer running on core *N* consistently lands on shard `N & mask`. Each worker has a preferred shard (`worker_idx & mask`) and falls back to scanning the remaining shards in cyclic order before parking — there are no private deques and no work-stealing handshake.
+
+```mermaid
+flowchart LR
+    subgraph Producers["Producers (any async task)"]
+        P0["producer @ core 0"]
+        P1["producer @ core 1"]
+        P2["producer @ core N"]
+    end
+
+    subgraph Queue["Sharded queue (num_workers.next_power_of_two().min(8))"]
+        S0["Shard 0<br/>Mutex&lt;VecDeque&lt;Runnable&gt;&gt;"]
+        S1["Shard 1<br/>Mutex&lt;VecDeque&lt;Runnable&gt;&gt;"]
+        SN["Shard k<br/>Mutex&lt;VecDeque&lt;Runnable&gt;&gt;"]
+        Park["park: Mutex&lt;()&gt; + Condvar<br/>parked: AtomicUsize"]
+    end
+
+    subgraph Workers["Worker threads (optionally pinned)"]
+        W0["worker 0<br/>preferred: shard 0"]
+        W1["worker 1<br/>preferred: shard 1"]
+        WN["worker k<br/>preferred: shard k"]
+    end
+
+    P0 -- "cpu &amp; mask" --> S0
+    P1 -- "cpu &amp; mask" --> S1
+    P2 -- "cpu &amp; mask" --> SN
+
+    S0 --> W0
+    S1 --> W1
+    SN --> WN
+
+    W0 -. "scan on empty" .-> S1
+    W1 -. "scan on empty" .-> SN
+    WN -. "park if all empty" .-> Park
+    Park -. "notify_one" .-> WN
+```
+
+Each task is a single heap allocation (the [`async-task`](https://crates.io/crates/async-task) layout — fused header + closure + result slot + waker). The park/unpark handshake is lost-wakeup-free; the proof sketch lives in [src/queue.rs](src/queue.rs) and the model in [tests/loom_queue.rs](tests/loom_queue.rs).
+
+Shard count rules of thumb:
+
+| Workers | Shards |
+|---|---|
+| 1 | 1 (no scan cost, no extra mutex) |
+| 2–3 | 2–4 |
+| ≥ 5 | 8 (capped) |
+
+## Benchmarks
+
+Head-to-head versus [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html). Same producer code drives both: a `current_thread` Tokio runtime for the producer side, and either an affinitypool `Threadpool::new(N)` or `tokio::runtime::Builder::max_blocking_threads(N)` for the worker side. Numbers from `cargo bench --bench vs_tokio -- --quick` on a quiet Linux box.
+
+| Benchmark | affinitypool 0.5.0 | affinitypool 0.6.0 | `tokio::spawn_blocking` | 0.6.0 vs Tokio |
+|---|---|---|---|---|
+| `spawn_overhead/1w/1` | 6.71 µs | 3.20 µs | 7.14 µs | **AP wins 2.2×** |
+| `spawn_overhead/1w/100` | 681 µs | 13.6 µs | 17.7 µs | **AP wins 1.3×** |
+| `spawn_overhead/1w/1000` | 2.72 ms | 137 µs | 163 µs | **AP wins 1.2×** |
+| `spawn_overhead/1w/10000` | 68.8 ms | 1.06 ms | 2.21 ms | **AP wins 2.1×** |
+| `spawn_overhead/4w/1` | 3.04 µs | 7.05 µs | 2.99 µs | tokio wins 2.4× |
+| `spawn_overhead/4w/100` | 728 µs | 172 µs | 61.7 µs | tokio wins 2.8× |
+| `spawn_overhead/4w/1000` | 3.36 ms | 1.79 ms | 531 µs | tokio wins 3.4× |
+| `spawn_overhead/4w/10000` | 48.4 ms | 16.2 ms | 6.99 ms | tokio wins 2.3× |
+| `round_trip/1w` | 6.73 µs | 6.88 µs | 6.81 µs | parity |
+| `round_trip/4w` | 6.30 µs | 4.93 µs | 7.14 µs | **AP wins 1.5×** |
+| `round_trip/8w` | 6.69 µs | 6.00 µs | 5.59 µs | parity |
+| `multi_producer/2p_1w` | 8.61 ms | 219 µs | 288 µs | **AP wins 1.3×** |
+| `multi_producer/2p_4w` | 7.91 ms | 570 µs | 876 µs | **AP wins 1.5×** |
+| `multi_producer/4p_1w` | 2.63 ms | 576 µs | 816 µs | **AP wins 1.4×** |
+| `multi_producer/4p_4w` | 5.03 ms | 1.74 ms | 1.53 ms | tokio wins 1.1× |
+| `multi_producer/8p_1w` | 2.22 ms | 3.24 ms | 2.94 ms | tokio wins 1.1× |
+| `multi_producer/8p_4w` | 6.68 ms | 5.68 ms | 2.89 ms | tokio wins 2.0× |
+
+**Summary**: against 0.5.0, AP wins on 7 benches, parity on 2, loses on 8 — all losses on `4w+` batched-spawn cases where mutex contention on the shared worker queue dominates. Before 0.6.0, AP lost on every batched-spawn bench by 8–15×; now it wins outright on the majority of head-to-heads, with sustained throughput of ~1.9 M tasks/s on 4 workers and ~2.5 M tasks/s on 8 workers.
+
+Unlike `tokio::spawn_blocking`, affinitypool preserves **CPU affinity** — the feature this library exists for — and gives you a dedicated pool sized for blocking work rather than sharing tokio's general blocking pool.
+
+To reproduce:
+
+```bash
+cargo bench --bench vs_tokio          # head-to-head with tokio
+cargo bench --bench microbench        # internal microbenchmarks
+./run_benchmarks.sh                   # full suite
+```
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the full bench suite and methodology.
+
 ## Examples
 
 ### Basic Usage

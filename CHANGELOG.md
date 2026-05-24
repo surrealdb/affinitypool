@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — async-task rewrite + sharded queue
+## 0.6.0 — 2026-05-24 — async-task rewrite + sharded queue
 
 A major internal rewrite that closes the 8-15× performance gap versus
 `tokio::task::spawn_blocking` and ends up beating it on most
