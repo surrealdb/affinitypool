@@ -216,7 +216,7 @@ affinitypool wins outright on 7 of 17 benches and is at parity on 2 more. The re
 
 Unlike `tokio::spawn_blocking`, affinitypool gives you a dedicated pool sized for blocking work (rather than sharing tokio's general blocking pool) and preserves **CPU affinity** — the feature this library exists for.
 
-See [BENCHMARKS.md](BENCHMARKS.md) for the full bench suite, methodology, and instructions for reproducing the numbers, including head-to-head comparisons against [`blocking::unblock`](https://docs.rs/blocking) (async-std / smol), [`rayon::ThreadPool::spawn`](https://docs.rs/rayon), and [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool).
+Head-to-head benches are also provided against [`blocking::unblock`](https://docs.rs/blocking) (async-std / smol), [`rayon::ThreadPool::spawn`](https://docs.rs/rayon), and [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool).
 
 ## Architecture
 
