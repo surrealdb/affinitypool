@@ -65,19 +65,12 @@ impl Snapshot {
 	}
 
 	fn delta(self, prior: Snapshot) -> (usize, usize, usize) {
-		(
-			self.allocs - prior.allocs,
-			self.deallocs - prior.deallocs,
-			self.bytes - prior.bytes,
-		)
+		(self.allocs - prior.allocs, self.deallocs - prior.deallocs, self.bytes - prior.bytes)
 	}
 }
 
 fn main() {
-	let rt = tokio::runtime::Builder::new_current_thread()
-		.enable_all()
-		.build()
-		.unwrap();
+	let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
 	rt.block_on(async {
 		let pool = Threadpool::new(2);

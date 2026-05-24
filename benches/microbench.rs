@@ -85,43 +85,39 @@ fn bench_steady_state_busy(c: &mut Criterion) {
 	for &workers in &[1usize, 4, 8] {
 		let total_tasks = workers * TASK_PER_WORKER;
 		group.throughput(Throughput::Elements(total_tasks as u64));
-		group.bench_with_input(
-			BenchmarkId::new("workers", workers),
-			&workers,
-			|b, &workers| {
-				b.iter_custom(|iters| {
-					rt.block_on(async move {
-						let pool = Threadpool::new(workers);
-						// Warm up.
-						let _ = pool.spawn(|| ()).await;
-						let mut total = Duration::ZERO;
-						for _ in 0..iters {
-							let start = Instant::now();
-							let mut handles = Vec::with_capacity(total_tasks);
-							// Submit all tasks before awaiting any: workers
-							// will always find something in the injector
-							// or each other's queues and never park.
-							for i in 0..total_tasks {
-								handles.push(pool.spawn(move || {
-									// Tiny non-trivial work so the
-									// compiler can't optimise away.
-									let mut s = i;
-									for _ in 0..8 {
-										s = s.wrapping_mul(17).wrapping_add(1);
-									}
-									black_box(s)
-								}));
-							}
-							for h in handles {
-								black_box(h.await);
-							}
-							total += start.elapsed();
+		group.bench_with_input(BenchmarkId::new("workers", workers), &workers, |b, &workers| {
+			b.iter_custom(|iters| {
+				rt.block_on(async move {
+					let pool = Threadpool::new(workers);
+					// Warm up.
+					let _ = pool.spawn(|| ()).await;
+					let mut total = Duration::ZERO;
+					for _ in 0..iters {
+						let start = Instant::now();
+						let mut handles = Vec::with_capacity(total_tasks);
+						// Submit all tasks before awaiting any: workers
+						// will always find something in the injector
+						// or each other's queues and never park.
+						for i in 0..total_tasks {
+							handles.push(pool.spawn(move || {
+								// Tiny non-trivial work so the
+								// compiler can't optimise away.
+								let mut s = i;
+								for _ in 0..8 {
+									s = s.wrapping_mul(17).wrapping_add(1);
+								}
+								black_box(s)
+							}));
 						}
-						total
-					})
-				});
-			},
-		);
+						for h in handles {
+							black_box(h.await);
+						}
+						total += start.elapsed();
+					}
+					total
+				})
+			});
+		});
 	}
 	group.finish();
 }
@@ -136,30 +132,26 @@ fn bench_park_unpark_handshake(c: &mut Criterion) {
 	group.measurement_time(Duration::from_secs(10));
 
 	for &workers in &[1usize, 4, 8] {
-		group.bench_with_input(
-			BenchmarkId::new("workers", workers),
-			&workers,
-			|b, &workers| {
-				b.iter_custom(|iters| {
-					rt.block_on(async move {
-						let pool = Threadpool::new(workers);
-						// Warm the workers and let them park.
-						let _ = pool.spawn(|| ()).await;
-						// A short delay encourages all workers to be
-						// parked before the measured iterations begin.
-						tokio::time::sleep(Duration::from_millis(2)).await;
-						let mut total = Duration::ZERO;
-						for _ in 0..iters {
-							let start = Instant::now();
-							let v = pool.spawn(|| black_box(42u64)).await;
-							total += start.elapsed();
-							black_box(v);
-						}
-						total
-					})
-				});
-			},
-		);
+		group.bench_with_input(BenchmarkId::new("workers", workers), &workers, |b, &workers| {
+			b.iter_custom(|iters| {
+				rt.block_on(async move {
+					let pool = Threadpool::new(workers);
+					// Warm the workers and let them park.
+					let _ = pool.spawn(|| ()).await;
+					// A short delay encourages all workers to be
+					// parked before the measured iterations begin.
+					tokio::time::sleep(Duration::from_millis(2)).await;
+					let mut total = Duration::ZERO;
+					for _ in 0..iters {
+						let start = Instant::now();
+						let v = pool.spawn(|| black_box(42u64)).await;
+						total += start.elapsed();
+						black_box(v);
+					}
+					total
+				})
+			});
+		});
 	}
 	group.finish();
 }
@@ -168,11 +160,8 @@ fn bench_park_unpark_handshake(c: &mut Criterion) {
 /// concurrently. Stresses contention on the global injector and the
 /// bounded `parked_threads` queue from the producer side.
 fn bench_multi_producer_contention(c: &mut Criterion) {
-	let rt = tokio::runtime::Builder::new_multi_thread()
-		.worker_threads(8)
-		.enable_all()
-		.build()
-		.unwrap();
+	let rt =
+		tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap();
 	let mut group = c.benchmark_group("multi_producer_contention");
 	group.measurement_time(Duration::from_secs(10));
 
@@ -182,10 +171,7 @@ fn bench_multi_producer_contention(c: &mut Criterion) {
 			let total = producers * TASKS_PER_PRODUCER;
 			group.throughput(Throughput::Elements(total as u64));
 			group.bench_with_input(
-				BenchmarkId::new(
-					format!("{}_producers_{}_workers", producers, workers),
-					total,
-				),
+				BenchmarkId::new(format!("{}_producers_{}_workers", producers, workers), total),
 				&(producers, workers),
 				|b, &(producers, workers)| {
 					b.iter_custom(|iters| {

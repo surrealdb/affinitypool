@@ -135,8 +135,7 @@ impl<F, R> Slot<F, R> {
 		// we form is a raw pointer-to-MaybeUninit<F> through the
 		// union's `closure` variant.
 		unsafe {
-			let closure_field: *mut ManuallyDrop<MaybeUninit<F>> =
-				addr_of_mut!((*slot).closure);
+			let closure_field: *mut ManuallyDrop<MaybeUninit<F>> = addr_of_mut!((*slot).closure);
 			(*closure_field).assume_init_read()
 		}
 	}
@@ -146,8 +145,7 @@ impl<F, R> Slot<F, R> {
 	#[inline]
 	pub(crate) unsafe fn drop_closure(slot: *mut Slot<F, R>) {
 		unsafe {
-			let closure_field: *mut ManuallyDrop<MaybeUninit<F>> =
-				addr_of_mut!((*slot).closure);
+			let closure_field: *mut ManuallyDrop<MaybeUninit<F>> = addr_of_mut!((*slot).closure);
 			(*closure_field).assume_init_drop();
 		}
 	}
