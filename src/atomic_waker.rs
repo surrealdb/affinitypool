@@ -174,6 +174,7 @@ impl AtomicWaker {
 	/// idea. Concurrent calls to `register` will attempt to register different
 	/// tasks to be notified. One of the callers will win and have its task set,
 	/// but there is no guarantee as to which caller will succeed.
+	#[inline]
 	pub fn register(&self, waker: &Waker) {
 		match self
 			.state
@@ -272,6 +273,7 @@ impl AtomicWaker {
 	/// Calls `wake` on the last `Waker` passed to `register`.
 	///
 	/// If `register` has not been called yet, then this does nothing.
+	#[inline]
 	pub fn wake(&self) {
 		if let Some(waker) = self.take() {
 			waker.wake();
@@ -286,6 +288,7 @@ impl AtomicWaker {
 	/// atomic action.
 	///
 	/// If a waker has not been registered, this returns `None`.
+	#[inline]
 	pub fn take(&self) -> Option<Waker> {
 		// AcqRel ordering is used in order to acquire the value of the `task`
 		// cell as well as to establish a `release` ordering with whatever

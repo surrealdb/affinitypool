@@ -31,6 +31,21 @@ pub(crate) struct Data {
 	pub(crate) stealers_lock: Mutex<()>,
 	/// Queue of parked threads waiting for work
 	pub(crate) parked_threads: ArrayQueue<Thread>,
+	/// Number of threads currently registered in `parked_threads`.
+	///
+	/// Producers consult this before attempting `parked_threads.pop()`,
+	/// which is several atomic CAS ops inside crossbeam's `ArrayQueue`.
+	/// In the steady state (no parked workers) the pop is wasted work;
+	/// gating it on `parked_count != 0` short-circuits the common path.
+	///
+	/// Every push to `parked_threads` must be paired with a `fetch_add`
+	/// here, and every pop with a `fetch_sub`. The SeqCst fences in the
+	/// spawn/park handshake remain in place — `parked_count` is purely
+	/// an optimisation, not a replacement for those fences.
+	///
+	/// Soundness of the gate is validated under loom in
+	/// `tests/loom.rs::loom_park_unpark_handshake_parked_count_gate`.
+	pub(crate) parked_count: AtomicUsize,
 	/// Flag to indicate if workers should shut down
 	pub(crate) shutdown: AtomicBool,
 	/// Handles to all worker threads for cleanup. Only touched on

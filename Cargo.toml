@@ -40,5 +40,12 @@ loom = "0.7"
 name = "threadpool"
 harness = false
 
+[[bench]]
+name = "microbench"
+harness = false
+
+[[example]]
+name = "alloc_count"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

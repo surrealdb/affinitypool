@@ -4,9 +4,9 @@ mod builder;
 mod data;
 mod error;
 mod global;
+mod job;
 mod local;
 mod sentry;
-mod spawn;
 mod task;
 
 pub use crate::builder::Builder;
@@ -14,14 +14,13 @@ pub use crate::error::Error;
 
 use crate::data::Data;
 use crate::global::THREADPOOL;
+use crate::job::Job;
 use crate::sentry::Sentry;
-use crate::spawn::{SpawnCompletion, SpawnHandle};
 use arc_swap::ArcSwap;
 use crossbeam::deque::{Injector, Worker};
 use crossbeam::queue::ArrayQueue;
 use local::SpawnFuture;
 use parking_lot::Mutex;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use task::OwnedTask;
@@ -102,6 +101,7 @@ impl Threadpool {
 			stealers: ArcSwap::from_pointee(stealers.into_boxed_slice()),
 			stealers_lock: Mutex::new(()),
 			parked_threads: ArrayQueue::new(workers),
+			parked_count: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
 			thread_handles: Mutex::new(Vec::new()),
 		});
@@ -122,14 +122,9 @@ impl Threadpool {
 		F: Send + 'static,
 		R: Send + 'static,
 	{
-		// Single-allocation completion shared with the worker.
-		let completion = Arc::new(SpawnCompletion::new());
-		let worker_side = completion.clone();
-		// Enclose the function in a closure that catches panics and writes
-		// the result into the shared completion slot.
-		let task = OwnedTask::new(move || {
-			worker_side.complete(catch_unwind(AssertUnwindSafe(func)));
-		});
+		// Single allocation for the closure, result slot, state machine,
+		// waker, and refcount. See `crate::job` for the layout.
+		let (task, handle) = Job::allocate(func);
 		// Push the task to the global injector
 		self.data.injector.push(task);
 		// SeqCst fence pairs with the consumer's fence in the worker loop.
@@ -138,12 +133,21 @@ impl Threadpool {
 		// pop below either observes a worker that has registered itself, or
 		// that worker's re-check observes this push and self-rescues.
 		fence(Ordering::SeqCst);
-		// Wake up a parked worker thread
-		if let Some(thread) = self.data.parked_threads.pop() {
+		// Fast path: if no worker is parked, skip the `parked_threads.pop()`
+		// (several atomic CAS ops inside crossbeam's `ArrayQueue`). The
+		// `Acquire` load synchronises with the worker's `Release`
+		// `fetch_add` on `parked_count` in the park path. The SeqCst fence
+		// above remains the synchronisation that prevents lost wakeups; the
+		// `parked_count` check is purely a short-circuit. See
+		// `loom_park_unpark_handshake_parked_count_gate` in `tests/loom.rs`.
+		if self.data.parked_count.load(Ordering::Acquire) > 0
+			&& let Some(thread) = self.data.parked_threads.pop()
+		{
+			self.data.parked_count.fetch_sub(1, Ordering::Release);
 			thread.unpark();
 		}
-		// Await the result via the completion slot.
-		SpawnHandle::new(completion).await
+		// Await the result via the job's completion machinery.
+		handle.await
 	}
 
 	/// Queue a new command for execution on this pool with access to the local variables.
@@ -187,60 +191,95 @@ impl Threadpool {
 	/// 2. Try to steal from the global injector
 	/// 3. Try to steal from other workers (if multi-threaded)
 	///
-	/// Spins until a task is found or all queues report empty. Workers stay
-	/// hot between bursts; parking is handled by the outer worker loop only
-	/// when this returns `None`.
+	/// Bounded spin budget before `find_task` returns `None` and the
+	/// caller parks. `Steal::Retry` is transient (another thread is
+	/// concurrently stealing the same slot), so a burst of retries
+	/// usually resolves within a handful of iterations.
+	///
+	/// Set high enough that workers don't park between fast-arriving
+	/// tasks — empirically, budget=32 caused workers to park on every
+	/// empty-closure-style task with sub-µs producer gaps, regressing
+	/// `spawn_overhead` and `park_unpark_handshake` by 10–17% on the
+	/// microbenchmark suite. 4096 lets the worker spin through
+	/// realistic producer pauses (≈50–100 µs at this budget on Apple
+	/// Silicon) before committing to a syscall, while still bounding
+	/// the worst case so a permanently quiet pool eventually parks.
+	const STEAL_RETRY_BUDGET: usize = 4096;
+
+	/// Spins up to [`STEAL_RETRY_BUDGET`] times waiting for a non-retry
+	/// outcome; returns `None` if every probe reports `Empty` or the
+	/// budget is exhausted. Workers stay hot between bursts; parking
+	/// is handled by the outer worker loop only when this returns
+	/// `None`.
 	fn find_task(
 		local: &Worker<OwnedTask<'static>>,
 		data: &Arc<Data>,
 		index: usize,
 	) -> Option<OwnedTask<'static>> {
 		// Pop a task from the local queue, if not empty.
-		local.pop().or_else(|| {
-			// Track the number of retry loops
-			let mut retries = 0;
-			// Otherwise, we need to look for a task elsewhere.
-			std::iter::repeat_with(|| {
-				// Add spin hint on retries to reduce contention
-				if retries > 0 {
-					std::hint::spin_loop();
+		if let Some(task) = local.pop() {
+			return Some(task);
+		}
+		// Hoist the stealer-slice load out of the retry loop. The slice
+		// is owned by an `ArcSwap` and only changes on sentry respawn
+		// (rare); per-retry reloading paid a refcount-Guard cost on
+		// every iteration of the spin. A stealer that has been
+		// replaced mid-loop still returns `Empty` (the dead worker's
+		// queue is empty), so reading from a stale snapshot is sound.
+		let stealers = data.stealers.load();
+		let n = stealers.len();
+		// Look for work elsewhere with a bounded spin.
+		for retry in 0..Self::STEAL_RETRY_BUDGET {
+			// Spin hint on retries to reduce contention.
+			if retry > 0 {
+				std::hint::spin_loop();
+			}
+			// Try stealing a batch of tasks from the global queue.
+			let injector_result = data.injector.steal_batch_and_pop(local);
+			// SeqCst fence: same cross-variable handshake as `spawn`.
+			// Establishes a total order with a concurrent producer's fence
+			// so the opportunistic unpark either sees a parked worker or
+			// that worker observes the producer's injector push.
+			fence(Ordering::SeqCst);
+			// If there's work in the queue, wake a thread to help.
+			if !data.injector.is_empty()
+				&& data.parked_count.load(Ordering::Acquire) > 0
+				&& let Some(thread) = data.parked_threads.pop()
+			{
+				data.parked_count.fetch_sub(1, Ordering::Release);
+				thread.unpark();
+			}
+			// Resolve the injector outcome: a successful steal returns
+			// directly; an `Empty` falls through to peer stealers; a
+			// `Retry` re-enters the loop.
+			let combined = injector_result.or_else(|| {
+				if n <= 1 {
+					return crossbeam::deque::Steal::Empty;
 				}
-				// Increment the number of retries
-				retries += 1;
-				// Try stealing a batch of tasks from the global queue.
-				let result = data.injector.steal_batch_and_pop(local);
-				// SeqCst fence: same cross-variable handshake as `spawn`.
-				// Establishes a total order with a concurrent producer's fence
-				// so the opportunistic unpark either sees a parked worker or
-				// that worker observes the producer's injector push.
-				fence(Ordering::SeqCst);
-				// If there's work in the queue, wake a thread to help
-				if !data.injector.is_empty()
-					&& let Some(thread) = data.parked_threads.pop()
-				{
-					thread.unpark();
-				}
-				// Return the stolen task, if there is one
-				result
-					// Or try stealing from one of the other threads
-					.or_else(|| {
-						// Lock-free load of the stealer slice. No locks on
-						// the hot path.
-						let stealers = data.stealers.load();
-						stealers
-							.iter()
-							.enumerate()
-							.filter(|(i, _)| *i != index)
-							.map(|(_, s)| s.steal())
-							.find(|s| !s.is_retry())
-							.unwrap_or(crossbeam::deque::Steal::Empty)
-					})
-			})
-			// Loop while no task was stolen and any steal operation needs to be retried.
-			.find(|s| !s.is_retry())
-			// Extract the stolen task, if there is one.
-			.and_then(|s| s.success())
-		})
+				// Rotate the start victim per-worker and per-retry so
+				// every worker no longer hammers stealer 0 first.
+				let start = index.wrapping_add(retry) % n;
+				(0..n)
+					.map(|offset| (start + offset) % n)
+					.filter(|i| *i != index)
+					// Batch-steal: take half of the victim's queue
+					// into our local worker and pop one task to
+					// return. Compared to single-task `steal()` this
+					// amortises the stealing cost across many tasks
+					// when a peer is backed up, and warms our local
+					// queue so subsequent `find_task` calls hit the
+					// fast `local.pop()` path.
+					.map(|i| stealers[i].steal_batch_and_pop(local))
+					.find(|s| !s.is_retry())
+					.unwrap_or(crossbeam::deque::Steal::Empty)
+			});
+			if !combined.is_retry() {
+				return combined.success();
+			}
+		}
+		// Retry budget exhausted. Let the caller park; the next producer
+		// will wake us via the `parked_threads` queue.
+		None
 	}
 
 	/// Spins up a new worker thread in this pool.
@@ -273,19 +312,26 @@ impl Threadpool {
 			if let Some(coreid) = coreid {
 				affinity::set_for_current(coreid.into());
 			}
-			// Loop continuously, processing any jobs
+			// Loop continuously, processing any jobs. Shutdown is observed
+			// in a single place — the pre-park check below — so the busy
+			// path (find-task → run → repeat) does not pay an Acquire
+			// load every iteration. Tasks already in the injector are
+			// drained before the worker exits on shutdown, which is
+			// strictly better behaviour than the previous abrupt exit.
 			loop {
-				// Check if we should shut down
-				if data.shutdown.load(Ordering::Acquire) {
-					break;
-				}
 				// Try to find a task using work-stealing
 				if let Some(task) = Self::find_task(&local, &data, index) {
 					// Process the task
 					task.run();
 				} else {
-					// No work found, so register ourselves as parked
+					// No work found, so register ourselves as parked.
 					let _ = data.parked_threads.push(std::thread::current());
+					// Release the registration to any producer that
+					// subsequently performs an `Acquire` load on
+					// `parked_count` (the spawn fast-path). The SeqCst
+					// fence below remains the synchronisation that
+					// prevents lost wakeups.
+					data.parked_count.fetch_add(1, Ordering::Release);
 					// SeqCst fence pairs with the producer's fence in
 					// `Threadpool::spawn`. Without it the re-check below may
 					// observe a pre-push state of `injector` even though the
@@ -297,6 +343,7 @@ impl Threadpool {
 					if !data.injector.is_empty() {
 						// Work just arrived, try to wake a thread
 						if let Some(t) = data.parked_threads.pop() {
+							data.parked_count.fetch_sub(1, Ordering::Release);
 							// Always unpark the thread we popped
 							t.unpark();
 						}
@@ -334,8 +381,9 @@ impl Drop for Threadpool {
 	fn drop(&mut self) {
 		// Signal all workers to shut down
 		self.data.shutdown.store(true, Ordering::Release);
-		// Wake up all parked workers
+		// Wake up all parked workers, keeping `parked_count` in sync.
 		while let Some(thread) = self.data.parked_threads.pop() {
+			self.data.parked_count.fetch_sub(1, Ordering::Release);
 			thread.unpark();
 		}
 		// Take all of the thread handles for joining
