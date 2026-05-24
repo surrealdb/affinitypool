@@ -188,6 +188,89 @@ async fn main() {
 }
 ```
 
+## Benchmarks
+
+Head-to-head against the most common alternatives for running blocking work in async Rust:
+
+* [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html) — Tokio's built-in blocking pool.
+* [`blocking::unblock`](https://docs.rs/blocking) — the auto-scaling pool used by `async-std` and the smol ecosystem.
+* [`rayon::ThreadPool::spawn`](https://docs.rs/rayon) — Rayon's work-stealing pool. Tasks are wrapped in a `tokio::sync::oneshot` so the producer can await; that handshake is part of what's measured.
+* [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool) — the crate this library was originally forked from. Same `oneshot` wrap as Rayon.
+
+Three workloads run against each pool: `spawn_overhead` (submit N closures, await each), `round_trip` (submit-and-await one closure at a time), and `multi_producer` (P concurrent producers each pushing 1k tasks). Numbers are criterion midpoint estimates from `--quick` runs on a quiet Linux bench machine. **Bold** = affinitypool is the fastest in the row.
+
+| Benchmark | affinitypool | tokio | blocking† | rayon | threadpool |
+|---|---|---|---|---|---|
+| `spawn_overhead/1w/1` | 5.84 µs | 6.36 µs | 2.49 µs | 1.03 µs | 5.76 µs |
+| `spawn_overhead/4w/1` | 6.77 µs | 5.71 µs | 2.49 µs | 1.53 µs | 6.54 µs |
+| `spawn_overhead/1w/100` | **18.0 µs** | 35.7 µs | 181 µs | 20.7 µs | 27.1 µs |
+| `spawn_overhead/4w/100` | 98.8 µs | 87.3 µs | 181 µs | 39.5 µs | 27.2 µs |
+| `spawn_overhead/1w/1000` | **208 µs** | 286 µs | 1.86 ms | 270 µs | 278 µs |
+| `spawn_overhead/4w/1000` | 875 µs | 1.19 ms | 1.86 ms | 332 µs | 240 µs |
+| `spawn_overhead/1w/10000` | 2.26 ms | 2.40 ms | 21.3 ms | 2.20 ms | 2.09 ms |
+| `spawn_overhead/4w/10000` | 12.0 ms | 10.4 ms | 21.3 ms | 3.37 ms | 2.19 ms |
+| `round_trip/1w` | 5.54 µs | 5.76 µs | 2.49 µs | 1.01 µs | 4.45 µs |
+| `round_trip/4w` | 6.19 µs | 6.57 µs | 2.49 µs | 1.44 µs | 6.24 µs |
+| `round_trip/8w` | 6.56 µs | 5.37 µs | 2.49 µs | 2.24 µs | 6.78 µs |
+| `multi_producer/2p_1w` | **367 µs** | 409 µs | 4.88 ms | 524 µs | 385 µs |
+| `multi_producer/2p_4w` | 1.12 ms | 1.73 ms | 4.88 ms | 731 µs | 426 µs |
+| `multi_producer/4p_1w` | 1.00 ms | 1.16 ms | 11.2 ms | 973 µs | 890 µs |
+| `multi_producer/4p_4w` | 1.16 ms | 1.80 ms | 11.2 ms | 938 µs | 976 µs |
+| `multi_producer/8p_1w` | 3.97 ms | 3.29 ms | 27.3 ms | 1.94 ms | 2.35 ms |
+| `multi_producer/8p_4w` | **1.61 ms** | 5.42 ms | 27.3 ms | 1.73 ms | 1.94 ms |
+
+† `blocking` uses a single auto-scaled global pool; its column doesn't vary with the worker count.
+
+### How affinitypool compares
+
+* **vs `tokio::spawn_blocking`** — affinitypool wins or ties on most workloads, including a 3.4× lead on `multi_producer/8p_4w`. Tokio still leads on the single-task `4w` cases.
+* **vs `blocking::unblock`** — affinitypool dominates batched workloads (5–14× faster) and loses single-task latency (`blocking` is consistently ~2.5 µs). Trade-off: `blocking`'s pool grows unboundedly and is shared globally with any other crate using it.
+* **vs `rayon::ThreadPool::spawn`** — Rayon's lock-free deques win single-task latency (3–6×) and most `4w` batched workloads. affinitypool wins on `multi_producer/8p_4w` and ties or wins most `1w` workloads. Rayon is built for work-stealing CPU parallelism, not async producer / worker handoff.
+* **vs `threadpool::ThreadPool::execute`** — the original. Parity on `1w` workloads, threadpool wins big (4–5×) on `4w` batched spawn (no sharding overhead), affinitypool wins on `multi_producer/8p_4w` and `2p_1w`.
+
+The pattern: affinitypool loses to the single-queue and work-stealing alternatives on `4w/N` batched-spawn workloads where one producer fans out fast and pays for crossing shards. It wins where shard locality pays back — `1w` (no scan cost), and multi-producer workloads where each producer naturally lands on a different shard via the CPU cache.
+
+Unlike any of these alternatives, affinitypool gives you a dedicated pool sized for blocking work and preserves **CPU affinity** — the feature this library exists for.
+
+## Architecture
+
+Tasks are delivered from producers to workers through a sharded MPMC queue. Each producer routes to a shard via a thread-local cache of its current CPU (`sched_getcpu()` on Linux, `GetCurrentProcessorNumber()` on Windows), so a producer running on core *N* consistently lands on shard `N & mask`. Each worker has a preferred shard (`worker_idx & mask`) and falls back to scanning the remaining shards in cyclic order before parking — there are no private deques and no work-stealing handshake.
+
+```text
+Producers (any async task)
+   +----------------+   +----------------+   +----------------+
+   | producer @ c0  |   | producer @ c1  |   | producer @ cN  |
+   +----------------+   +----------------+   +----------------+
+           |                    |                    |
+           v                    v                    v
+Sharded queue  (num_workers.next_power_of_two().min(8))
+   +----------------+   +----------------+   +----------------+
+   |    Shard 0     |   |    Shard 1     |   |    Shard k     |
+   |   Mutex<       |   |   Mutex<       |   |   Mutex<       |
+   |    VecDeque<   |   |    VecDeque<   |   |    VecDeque<   |
+   |    Runnable>>  |   |    Runnable>>  |   |    Runnable>>  |
+   +----------------+   +----------------+   +----------------+
+           |                    |                    |
+           v                    v                    v
+Worker threads (optionally pinned)
+   +----------------+   +----------------+   +----------------+
+   |    worker 0    |   |    worker 1    |   |    worker k    |
+   |  pref: shard 0 |   |  pref: shard 1 |   |  pref: shard k |
+   +----------------+   +----------------+   +----------------+
+```
+
+On an empty preferred shard a worker scans the remaining shards in cyclic order, then parks on a shared `Mutex<()> + Condvar` (counted by an `AtomicUsize`). Producers check that counter after pushing; if any worker may be parked, they briefly take the park mutex to `notify_one`.
+
+Each task is a single heap allocation (the [`async-task`](https://crates.io/crates/async-task) layout — fused header + closure + result slot + waker). The park/unpark handshake is lost-wakeup-free; the proof sketch lives in [src/queue.rs](src/queue.rs) and the model in [tests/loom_queue.rs](tests/loom_queue.rs).
+
+Shard count rules of thumb:
+
+| Workers | Shards |
+|---|---|
+| 1 | 1 (no scan cost, no extra mutex) |
+| 2–3 | 2–4 |
+| ≥ 5 | 8 (capped) |
+
 #### Original
 
 This code is heavily inspired by [threadpool](https://crates.io/crates/threadpool), with the CPU-based affinity code forked originally from [core-affinity](https://crates.io/crates/core_affinity). Both are licensed under the Apache License 2.0 and MIT licenses.

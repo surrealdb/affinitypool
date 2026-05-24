@@ -28,8 +28,11 @@ libc = "^0.2.186"
 winapi = { version = "^0.3.9", features = ["processthreadsapi", "winbase"] }
 
 [target.'cfg(not(loom))'.dev-dependencies]
+blocking = "1.6.2"
 criterion = { version = "0.8", features = ["html_reports"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+rayon = "1.12.0"
+threadpool = "1.8.1"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync"] }
 trybuild = "1.0"
 
 [target.'cfg(loom)'.dev-dependencies]
@@ -45,6 +48,18 @@ harness = false
 
 [[bench]]
 name = "vs_tokio"
+harness = false
+
+[[bench]]
+name = "vs_blocking"
+harness = false
+
+[[bench]]
+name = "vs_rayon"
+harness = false
+
+[[bench]]
+name = "vs_threadpool"
 harness = false
 
 [[bench]]
