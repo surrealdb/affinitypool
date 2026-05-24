@@ -152,9 +152,35 @@ impl Threadpool {
 	/// Queue a new command for execution on this pool with access to
 	/// the local variables.
 	///
-	/// The returned future blocks the current thread on `Drop` if the
-	/// closure is currently being executed (so closure borrows of
-	/// `'pool` data cannot dangle).
+	/// Unlike [`spawn`](Self::spawn), the closure is scheduled lazily
+	/// on first poll of the returned future. Dropping a
+	/// [`SpawnFuture`] without ever polling it never queues the
+	/// runnable to a worker, so the drop returns immediately. Once
+	/// polled, dropping the future cancels the task; if the worker is
+	/// currently running the closure, the dropping thread is parked
+	/// until the worker has finished, so closure borrows of `'pool`
+	/// data cannot dangle.
+	///
+	/// # Drop-blocking caveats
+	///
+	/// The `Drop` impl on a polled `SpawnFuture` blocks the dropping
+	/// thread synchronously. Two consequences are worth keeping in
+	/// mind:
+	///
+	/// 1. **Async-context footgun.** Dropping a polled `SpawnFuture`
+	///    from inside an async task — for example by holding it in a
+	///    `select!`/`tokio::join!` branch that loses — blocks the
+	///    underlying async runtime's worker thread for the duration
+	///    of the closure. On a multi-thread runtime this just stalls
+	///    one worker; on a current-thread runtime it can deadlock the
+	///    whole runtime if the cancellation depends on other tasks
+	///    on the same executor.
+	/// 2. **Lazy scheduling is intentional.** A `SpawnFuture`
+	///    constructed and dropped without polling never queues the
+	///    runnable, so a 1-worker pool can safely do
+	///    `let _ = pool.spawn_local(|| …);` from inside its own
+	///    worker. Polling once and *then* dropping still queues and
+	///    cancels normally.
 	pub fn spawn_local<'pool, F, R>(&'pool self, func: F) -> SpawnFuture<'pool, R>
 	where
 		F: FnOnce() -> R,
