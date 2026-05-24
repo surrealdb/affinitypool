@@ -61,31 +61,27 @@ fn bench_spawn_overhead(c: &mut Criterion) {
 		}
 
 		// blocking::unblock (pool size is global / auto-scaled)
-		group.bench_with_input(
-			BenchmarkId::new("blocking", count),
-			&count,
-			|b, &count| {
-				let rt = affinitypool_runtime();
-				b.iter_custom(|iters| {
-					rt.block_on(async move {
-						let _ = blocking::unblock(|| 0u32).await;
-						let mut total = Duration::ZERO;
-						for _ in 0..iters {
-							let start = Instant::now();
-							let mut handles = Vec::with_capacity(count);
-							for i in 0..count {
-								handles.push(blocking::unblock(move || black_box(i)));
-							}
-							for h in handles {
-								black_box(h.await);
-							}
-							total += start.elapsed();
+		group.bench_with_input(BenchmarkId::new("blocking", count), &count, |b, &count| {
+			let rt = affinitypool_runtime();
+			b.iter_custom(|iters| {
+				rt.block_on(async move {
+					let _ = blocking::unblock(|| 0u32).await;
+					let mut total = Duration::ZERO;
+					for _ in 0..iters {
+						let start = Instant::now();
+						let mut handles = Vec::with_capacity(count);
+						for i in 0..count {
+							handles.push(blocking::unblock(move || black_box(i)));
 						}
-						total
-					})
-				});
-			},
-		);
+						for h in handles {
+							black_box(h.await);
+						}
+						total += start.elapsed();
+					}
+					total
+				})
+			});
+		});
 	}
 	group.finish();
 }
