@@ -43,12 +43,27 @@
 //!    shard mutex happens-before the worker's acquire of that shard
 //!    in the re-scan. Worker finds the push in the re-scan and
 //!    doesn't wait.
-//! 2. **Producer push after worker arms**: producer's `parked.load`
-//!    sees the worker's `parked.fetch_add` (Release/Acquire pair), so
-//!    producer acquires `park.lock` and notifies. The producer's
-//!    `park.lock` is blocked until the worker's `cv.wait` atomically
-//!    releases `park.lock` and parks, so the notify always lands on
-//!    a worker that is actually waiting.
+//! 2. **Producer push after worker arms**: the cross-variable
+//!    happens-before edge runs through the shard mutex, not directly
+//!    through the `parked` atomic. Specifically:
+//!
+//!    * worker `parked.fetch_add(1, Release)` is *sequenced-before*
+//!      its re-scan acquire of `shard[idx]`;
+//!    * worker's `shard[idx]` unlock *synchronises-with* the
+//!      producer's later `shard[idx]` lock (mutex pair);
+//!    * producer's `shard[idx]` unlock is *sequenced-before* its
+//!      `parked.load(Acquire)`.
+//!
+//!    By transitivity the worker's `fetch_add` happens-before the
+//!    producer's load, so the load is guaranteed to observe ≥1 and
+//!    the producer takes the `park.lock` + `notify_one` path. The
+//!    `Release`/`Acquire` ordering on `parked` itself only governs
+//!    coherence of the counter's value; the cross-variable visibility
+//!    that closes the race comes from the shard mutex.
+//!
+//!    The producer's `park.lock` then blocks until the worker's
+//!    `cv.wait` atomically releases `park.lock` and parks, so the
+//!    `notify_one` always lands on a worker that is actually waiting.
 //!
 //! Lock-hold pairs never overlap on the producer side (shard then
 //! park, with a release in between), so there is no AB-BA deadlock
@@ -94,6 +109,11 @@ struct Shard {
 
 impl Queue {
 	pub(crate) fn new(num_workers: usize) -> Self {
+		// `next_power_of_two()` panics on overflow; that's fine as
+		// long as `num_workers <= usize::MAX / 2 + 1`. The public
+		// `MAX_THREADS = 512` constant in `lib.rs` clamps the input,
+		// so the panic is unreachable today — but if `MAX_THREADS`
+		// is ever raised, keep that invariant in mind.
 		let num_shards = num_workers.next_power_of_two().clamp(1, MAX_SHARDS);
 		let shards: Vec<Shard> = (0..num_shards)
 			.map(|_| Shard {
