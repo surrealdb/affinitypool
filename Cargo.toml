@@ -16,8 +16,7 @@ resolver = "2"
 default = []
 
 [dependencies]
-arc-swap = "1.9"
-crossbeam = "0.8.4"
+async-task = "4"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
 thiserror = "2.0.18"
@@ -42,6 +41,14 @@ harness = false
 
 [[bench]]
 name = "microbench"
+harness = false
+
+[[bench]]
+name = "vs_tokio"
+harness = false
+
+[[bench]]
+name = "high_load"
 harness = false
 
 [[example]]

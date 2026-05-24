@@ -1,29 +1,26 @@
 pub mod affinity;
-mod atomic_waker;
 mod builder;
+mod cpu;
 mod data;
 mod error;
 mod global;
-mod job;
 mod local;
+mod queue;
 mod sentry;
-mod task;
 
 pub use crate::builder::Builder;
 pub use crate::error::Error;
+pub use crate::local::SpawnFuture;
 
 use crate::data::Data;
 use crate::global::THREADPOOL;
-use crate::job::Job;
+use crate::queue::Queue;
 use crate::sentry::Sentry;
-use arc_swap::ArcSwap;
-use crossbeam::deque::{Injector, Worker};
-use crossbeam::queue::ArrayQueue;
-use local::SpawnFuture;
+use async_task::{Builder as TaskBuilder, Runnable};
 use parking_lot::Mutex;
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
-use task::OwnedTask;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Maximum number of worker threads allowed in a thread pool.
 pub const MAX_THREADS: usize = 512;
@@ -66,7 +63,7 @@ where
 }
 
 pub struct Threadpool {
-	data: Arc<Data>,
+	pub(crate) data: Arc<Data>,
 }
 
 impl Default for Threadpool {
@@ -78,99 +75,156 @@ impl Default for Threadpool {
 impl Threadpool {
 	/// Create a new thread pool.
 	pub fn new(workers: usize) -> Self {
-		// Validate worker count
+		// Validate worker count.
 		let workers = workers.clamp(1, MAX_THREADS);
-		// Create a global injector for tasks
-		let injector = Injector::new();
-		// Create workers and collect their stealers
-		let mut stealers = Vec::with_capacity(workers);
-		let mut worker_queues = Vec::with_capacity(workers);
-		// Create a Worker deque for each thread
-		for _ in 0..workers {
-			let worker = Worker::new_fifo();
-			stealers.push(worker.stealer());
-			worker_queues.push(worker);
-		}
-		// Create the threadpool shared data
+		// Create the threadpool shared data.
 		let data = Arc::new(Data {
 			name: None,
 			stack_size: None,
 			num_threads: AtomicUsize::new(workers),
 			thread_count: AtomicUsize::new(0),
-			injector,
-			stealers: ArcSwap::from_pointee(stealers.into_boxed_slice()),
-			stealers_lock: Mutex::new(()),
-			parked_threads: ArrayQueue::new(workers),
-			parked_count: AtomicUsize::new(0),
-			shutdown: AtomicBool::new(false),
+			queue: Arc::new(Queue::new(workers)),
 			thread_handles: Mutex::new(Vec::new()),
 		});
-		// Spawn the desired number of workers
-		for (index, worker) in worker_queues.into_iter().enumerate() {
-			Self::spin_up(None, data.clone(), worker, index);
+		// Spawn the desired number of workers.
+		for index in 0..workers {
+			Self::spin_up(None, data.clone(), index);
 		}
-		// Return the new threadpool
+		// Return the new threadpool.
 		Threadpool {
 			data,
 		}
 	}
 
 	/// Queue a new command for execution on this pool.
-	pub async fn spawn<F, R>(&self, func: F) -> R
+	///
+	/// The closure is scheduled **immediately** — by the time this
+	/// function returns, the task is already on the worker queue and
+	/// may already be running. The returned future resolves to the
+	/// closure's return value. Dropping the future before completion
+	/// cancels the task: a queued-but-unrun task is dropped without
+	/// running; a currently-running task completes but its result is
+	/// discarded.
+	///
+	/// Returning a future (rather than being an `async fn`) means
+	/// pipelined producers — e.g. `let h1 = pool.spawn(a); let h2 =
+	/// pool.spawn(b)` — start both `a` and `b` on workers
+	/// concurrently, before any `.await`. This matches the semantics
+	/// of `tokio::task::spawn_blocking`.
+	pub fn spawn<F, R>(&self, func: F) -> impl Future<Output = R> + Send + 'static
 	where
 		F: FnOnce() -> R,
 		F: Send + 'static,
 		R: Send + 'static,
 	{
-		// Single allocation for the closure, result slot, state machine,
-		// waker, and refcount. See `crate::job` for the layout.
-		let (task, handle) = Job::allocate(func);
-		// Push the task to the global injector
-		self.data.injector.push(task);
-		// SeqCst fence pairs with the consumer's fence in the worker loop.
-		// Together they give a single total order over the producer's release
-		// on `injector` and the consumer's release on `parked_threads`, so the
-		// pop below either observes a worker that has registered itself, or
-		// that worker's re-check observes this push and self-rescues.
-		fence(Ordering::SeqCst);
-		// Fast path: if no worker is parked, skip the `parked_threads.pop()`
-		// (several atomic CAS ops inside crossbeam's `ArrayQueue`). The
-		// `Acquire` load synchronises with the worker's `Release`
-		// `fetch_add` on `parked_count` in the park path. The SeqCst fence
-		// above remains the synchronisation that prevents lost wakeups; the
-		// `parked_count` check is purely a short-circuit. See
-		// `loom_park_unpark_handshake_parked_count_gate` in `tests/loom.rs`.
-		if self.data.parked_count.load(Ordering::Acquire) > 0
-			&& let Some(thread) = self.data.parked_threads.pop()
-		{
-			self.data.parked_count.fetch_sub(1, Ordering::Release);
-			thread.unpark();
+		// Clone the Arc<Queue> into the schedule closure. The closure
+		// is `Fn(Runnable) + Send + Sync + 'static`, which is what
+		// async-task requires.
+		let queue = self.data.queue.clone();
+		let schedule = move |runnable: Runnable| queue.push(runnable);
+		// Wrap the closure in `catch_unwind` so a panic inside the
+		// closure is reified into a `Result::Err(payload)` on the
+		// worker side instead of propagating up through
+		// `Runnable::run` and unwinding the worker thread. The
+		// awaiter then `resume_unwind`s the payload, matching the
+		// previous behaviour where panics surfaced on the `.await`
+		// side, not the worker side. Without this wrapper, a
+		// panicking closure would tear down the worker and force the
+		// sentry to respawn a thread on every panic.
+		let (runnable, task) = TaskBuilder::new().spawn(
+			move |()| async move { std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) },
+			schedule,
+		);
+		// Push the runnable onto the queue right now so a worker can
+		// start processing it before the caller awaits.
+		runnable.schedule();
+		// Returning the future to the caller — dropping it cancels.
+		// The outer async block re-raises any captured panic, so the
+		// future's output type stays `R` (not `Result<R, _>`).
+		async move {
+			match task.await {
+				Ok(value) => value,
+				Err(payload) => std::panic::resume_unwind(payload),
+			}
 		}
-		// Await the result via the job's completion machinery.
-		handle.await
 	}
 
-	/// Queue a new command for execution on this pool with access to the local variables.
+	/// Queue a new command for execution on this pool with access to
+	/// the local variables.
 	///
-	/// The future of this function will block the current thread if it is not fully completed.
-	pub fn spawn_local<'pool, F, R>(&'pool self, func: F) -> SpawnFuture<'pool, F, R>
+	/// Unlike [`spawn`](Self::spawn), the closure is scheduled lazily
+	/// on first poll of the returned future. Dropping a
+	/// [`SpawnFuture`] without ever polling it never queues the
+	/// runnable to a worker, so the drop returns immediately. Once
+	/// polled, dropping the future cancels the task; if the worker is
+	/// currently running the closure, the dropping thread is parked
+	/// until the worker has finished, so closure borrows of `'pool`
+	/// data cannot dangle.
+	///
+	/// # Drop-blocking caveats
+	///
+	/// The `Drop` impl on a polled `SpawnFuture` blocks the dropping
+	/// thread synchronously. Two consequences are worth keeping in
+	/// mind:
+	///
+	/// 1. **Async-context footgun.** Dropping a polled `SpawnFuture`
+	///    from inside an async task — for example by holding it in a
+	///    `select!`/`tokio::join!` branch that loses — blocks the
+	///    underlying async runtime's worker thread for the duration
+	///    of the closure. On a multi-thread runtime this just stalls
+	///    one worker; on a current-thread runtime it can deadlock the
+	///    whole runtime if the cancellation depends on other tasks
+	///    on the same executor.
+	/// 2. **Lazy scheduling is intentional.** A `SpawnFuture`
+	///    constructed and dropped without polling never queues the
+	///    runnable, so a 1-worker pool can safely do
+	///    `let _ = pool.spawn_local(|| …);` from inside its own
+	///    worker. Polling once and *then* dropping still queues and
+	///    cancels normally.
+	pub fn spawn_local<'pool, F, R>(&'pool self, func: F) -> SpawnFuture<'pool, R>
 	where
 		F: FnOnce() -> R,
 		F: Send + 'pool,
 		R: Send + 'pool,
 	{
-		SpawnFuture::new(self, func)
+		let queue = self.data.queue.clone();
+		let schedule = move |runnable: Runnable| queue.push(runnable);
+		// Same `catch_unwind` wrapper rationale as `spawn` — keep
+		// panics off the worker thread, surface them on the awaiter.
+		// SAFETY: `async_task::Builder::spawn_unchecked` lifts the
+		// `'static` bound on the future. Soundness is preserved by:
+		//   1. `SpawnFuture<'pool, R>` carries the `'pool` borrow, so
+		//      the future cannot outlive the pool.
+		//   2. `SpawnFuture::drop` blocks (via `Task::cancel().await`)
+		//      until the runnable has stopped, so the closure's
+		//      `'pool` borrows are not accessed after they expire.
+		//   3. The same `mem::forget` caveat as the previous
+		//      implementation applies — see `local.rs` module docs.
+		let (runnable, task) = unsafe {
+			TaskBuilder::new().spawn_unchecked(
+				move |()| async move { std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) },
+				schedule,
+			)
+		};
+		// Defer `runnable.schedule()` to first poll. Eager scheduling
+		// here would deadlock a 1-worker pool whenever the only worker
+		// constructs and drops a `SpawnFuture` without polling: the
+		// worker would block in `Drop` waiting for itself to consume
+		// the runnable it just queued. The runnable is handed to
+		// `SpawnFuture`, which schedules it from its `poll` and drops
+		// it cleanly if the caller never polls.
+		SpawnFuture::new(runnable, task)
 	}
 
 	/// Set this threadpool as the global threadpool.
 	pub fn build_global(self) -> Result<(), Error> {
-		// Check if the threadpool has been created
+		// Check if the threadpool has been created.
 		if THREADPOOL.get().is_some() {
 			return Err(Error::GlobalThreadpoolExists);
 		}
-		// Set this threadpool as the global threadpool
+		// Set this threadpool as the global threadpool.
 		THREADPOOL.get_or_init(|| self);
-		// Global threadpool was created successfully
+		// Global threadpool was created successfully.
 		Ok(())
 	}
 
@@ -184,216 +238,71 @@ impl Threadpool {
 		self.data.num_threads.load(Ordering::Relaxed)
 	}
 
-	/// Finds the next task to execute.
-	///
-	/// Following the work-stealing pattern from crossbeam:
-	/// 1. Try to pop from the local worker queue
-	/// 2. Try to steal from the global injector
-	/// 3. Try to steal from other workers (if multi-threaded)
-	///
-	/// Bounded spin budget before `find_task` returns `None` and the
-	/// caller parks. `Steal::Retry` is transient (another thread is
-	/// concurrently stealing the same slot), so a burst of retries
-	/// usually resolves within a handful of iterations.
-	///
-	/// Set high enough that workers don't park between fast-arriving
-	/// tasks — empirically, budget=32 caused workers to park on every
-	/// empty-closure-style task with sub-µs producer gaps, regressing
-	/// `spawn_overhead` and `park_unpark_handshake` by 10–17% on the
-	/// microbenchmark suite. 4096 lets the worker spin through
-	/// realistic producer pauses (≈50–100 µs at this budget on Apple
-	/// Silicon) before committing to a syscall, while still bounding
-	/// the worst case so a permanently quiet pool eventually parks.
-	const STEAL_RETRY_BUDGET: usize = 4096;
-
-	/// Spins up to [`STEAL_RETRY_BUDGET`] times waiting for a non-retry
-	/// outcome; returns `None` if every probe reports `Empty` or the
-	/// budget is exhausted. Workers stay hot between bursts; parking
-	/// is handled by the outer worker loop only when this returns
-	/// `None`.
-	fn find_task(
-		local: &Worker<OwnedTask<'static>>,
-		data: &Arc<Data>,
-		index: usize,
-	) -> Option<OwnedTask<'static>> {
-		// Pop a task from the local queue, if not empty.
-		if let Some(task) = local.pop() {
-			return Some(task);
-		}
-		// Hoist the stealer-slice load out of the retry loop. The slice
-		// is owned by an `ArcSwap` and only changes on sentry respawn
-		// (rare); per-retry reloading paid a refcount-Guard cost on
-		// every iteration of the spin. A stealer that has been
-		// replaced mid-loop still returns `Empty` (the dead worker's
-		// queue is empty), so reading from a stale snapshot is sound.
-		let stealers = data.stealers.load();
-		let n = stealers.len();
-		// Look for work elsewhere with a bounded spin.
-		for retry in 0..Self::STEAL_RETRY_BUDGET {
-			// Spin hint on retries to reduce contention.
-			if retry > 0 {
-				std::hint::spin_loop();
-			}
-			// Try stealing a batch of tasks from the global queue.
-			let injector_result = data.injector.steal_batch_and_pop(local);
-			// SeqCst fence: same cross-variable handshake as `spawn`.
-			// Establishes a total order with a concurrent producer's fence
-			// so the opportunistic unpark either sees a parked worker or
-			// that worker observes the producer's injector push.
-			fence(Ordering::SeqCst);
-			// If there's work in the queue, wake a thread to help.
-			if !data.injector.is_empty()
-				&& data.parked_count.load(Ordering::Acquire) > 0
-				&& let Some(thread) = data.parked_threads.pop()
-			{
-				data.parked_count.fetch_sub(1, Ordering::Release);
-				thread.unpark();
-			}
-			// Resolve the injector outcome: a successful steal returns
-			// directly; an `Empty` falls through to peer stealers; a
-			// `Retry` re-enters the loop.
-			let combined = injector_result.or_else(|| {
-				if n <= 1 {
-					return crossbeam::deque::Steal::Empty;
-				}
-				// Rotate the start victim per-worker and per-retry so
-				// every worker no longer hammers stealer 0 first.
-				let start = index.wrapping_add(retry) % n;
-				(0..n)
-					.map(|offset| (start + offset) % n)
-					.filter(|i| *i != index)
-					// Batch-steal: take half of the victim's queue
-					// into our local worker and pop one task to
-					// return. Compared to single-task `steal()` this
-					// amortises the stealing cost across many tasks
-					// when a peer is backed up, and warms our local
-					// queue so subsequent `find_task` calls hit the
-					// fast `local.pop()` path.
-					.map(|i| stealers[i].steal_batch_and_pop(local))
-					.find(|s| !s.is_retry())
-					.unwrap_or(crossbeam::deque::Steal::Empty)
-			});
-			if !combined.is_retry() {
-				return combined.success();
-			}
-		}
-		// Retry budget exhausted. Let the caller park; the next producer
-		// will wake us via the `parked_threads` queue.
-		None
-	}
-
-	/// Spins up a new worker thread in this pool.
+	/// Spin up a new worker thread in this pool.
 	#[cfg(not(target_family = "wasm"))]
-	fn spin_up(
-		coreid: Option<usize>,
-		data: Arc<Data>,
-		local: Worker<OwnedTask<'static>>,
-		index: usize,
-	) {
-		// Create a new thread builder
+	pub(crate) fn spin_up(coreid: Option<usize>, data: Arc<Data>, index: usize) {
+		// Create a new thread builder.
 		let mut builder = std::thread::Builder::new();
-		// Assign a name to the threads if specified
+		// Assign a name to the thread if specified.
 		if let Some(ref name) = data.name {
 			builder = builder.name(name.clone());
 		}
-		// Assign a stack size to the threads if specified
+		// Assign a stack size to the thread if specified.
 		if let Some(stack_size) = data.stack_size {
 			builder = builder.stack_size(stack_size);
 		}
-		// Increase the thread count counter
+		// Increase the thread count counter.
 		data.thread_count.fetch_add(1, Ordering::Relaxed);
-		// Create a new sentry watcher
+		// Create a new sentry watcher.
 		let sentry = Sentry::new(coreid, index, Arc::downgrade(&data));
-		// Clone data for handle storage
+		// Clone the queue handle for the worker loop.
+		let queue = data.queue.clone();
+		// Clone data for handle storage.
 		let data_clone = data.clone();
-		// Spawn a new worker thread
+		// Spawn a new worker thread.
 		let handle = builder.spawn(move || {
-			// Assign this thread to a core
+			// Assign this thread to a core.
 			if let Some(coreid) = coreid {
 				affinity::set_for_current(coreid.into());
 			}
-			// Loop continuously, processing any jobs. Shutdown is observed
-			// in a single place — the pre-park check below — so the busy
-			// path (find-task → run → repeat) does not pay an Acquire
-			// load every iteration. Tasks already in the injector are
-			// drained before the worker exits on shutdown, which is
-			// strictly better behaviour than the previous abrupt exit.
-			loop {
-				// Try to find a task using work-stealing
-				if let Some(task) = Self::find_task(&local, &data, index) {
-					// Process the task
-					task.run();
-				} else {
-					// No work found, so register ourselves as parked.
-					let _ = data.parked_threads.push(std::thread::current());
-					// Release the registration to any producer that
-					// subsequently performs an `Acquire` load on
-					// `parked_count` (the spawn fast-path). The SeqCst
-					// fence below remains the synchronisation that
-					// prevents lost wakeups.
-					data.parked_count.fetch_add(1, Ordering::Release);
-					// SeqCst fence pairs with the producer's fence in
-					// `Threadpool::spawn`. Without it the re-check below may
-					// observe a pre-push state of `injector` even though the
-					// producer's `parked_threads.pop()` ran before our push
-					// — a lost wakeup. The fence forces a total order that
-					// rules this out.
-					fence(Ordering::SeqCst);
-					// Double-check for work after registering
-					if !data.injector.is_empty() {
-						// Work just arrived, try to wake a thread
-						if let Some(t) = data.parked_threads.pop() {
-							data.parked_count.fetch_sub(1, Ordering::Release);
-							// Always unpark the thread we popped
-							t.unpark();
-						}
-					}
-					// Check shutdown flag again before parking
-					if data.shutdown.load(Ordering::Acquire) {
-						break;
-					}
-					// Park this thread indefinitely until woken
-					std::thread::park();
-				}
+			// Worker loop: pop a runnable, run it, repeat. The worker
+			// passes its `index` so the queue can route the pop to
+			// its preferred shard, falling back to scanning peers.
+			// Parking is handled by `Queue::pop_blocking` via its
+			// Condvar.
+			while let Some(runnable) = queue.pop_blocking(index) {
+				runnable.run();
 			}
-			// This thread has exited cleanly
+			// Clean exit — cancel the sentry so its Drop does not
+			// trigger a respawn.
 			sentry.cancel();
 		});
-		// Store the thread handle if spawning succeeded
+		// Store the thread handle if spawning succeeded.
 		if let Ok(handle) = handle {
 			data_clone.thread_handles.lock().push(handle);
 		}
 	}
 
-	/// Spins up a new worker thread in this pool.
+	/// WASM stub — affinity and worker threads are not supported.
 	#[cfg(target_family = "wasm")]
-	fn spin_up(
-		coreid: Option<usize>,
-		data: Arc<Data>,
-		local: Worker<OwnedTask<'static>>,
-		index: usize,
-	) {
-		// Do nothing in WASM
+	pub(crate) fn spin_up(_coreid: Option<usize>, _data: Arc<Data>, _index: usize) {
+		// Do nothing in WASM.
 	}
 }
 
 impl Drop for Threadpool {
 	fn drop(&mut self) {
-		// Signal all workers to shut down
-		self.data.shutdown.store(true, Ordering::Release);
-		// Wake up all parked workers, keeping `parked_count` in sync.
-		while let Some(thread) = self.data.parked_threads.pop() {
-			self.data.parked_count.fetch_sub(1, Ordering::Release);
-			thread.unpark();
-		}
-		// Take all of the thread handles for joining
+		// Signal all workers to shut down. The Condvar wakes everyone
+		// blocked in `pop_blocking`; once the queue drains, each worker
+		// observes `None` and exits.
+		self.data.queue.shutdown();
+		// Take all of the thread handles for joining.
 		let handles = self.data.thread_handles.lock().drain(..).collect::<Vec<_>>();
-		// Join all worker threads
+		// Join all worker threads.
 		for handle in handles {
-			// Wait for the thread to exit
 			let _ = handle.join();
 		}
-		// Decrement thread count to 0
+		// Decrement thread count to 0.
 		self.data.thread_count.store(0, Ordering::Relaxed);
 	}
 }

@@ -1,12 +1,10 @@
 use crate::Data;
 use crate::MAX_THREADS;
 use crate::Threadpool;
-use arc_swap::ArcSwap;
-use crossbeam::deque::{Injector, Worker};
-use crossbeam::queue::ArrayQueue;
+use crate::queue::Queue;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 #[derive(Default, Clone)]
 pub struct Builder {
@@ -152,7 +150,7 @@ impl Builder {
 	///     .build();
 	/// ```
 	pub fn build(self) -> Threadpool {
-		// Calculate how many threads to spawn
+		// Calculate how many threads to spawn.
 		let threads = if let Some(num_threads) = self.num_threads {
 			num_threads.clamp(1, MAX_THREADS)
 		} else if self.thread_per_core {
@@ -160,44 +158,26 @@ impl Builder {
 		} else {
 			2
 		};
-		// Create a global injector for tasks
-		let injector = Injector::new();
-		// Create workers and collect their stealers
-		let mut workers = Vec::with_capacity(threads);
-		let mut stealers = Vec::with_capacity(threads);
-		// Create a Worker deque for each thread
-		for _ in 0..threads {
-			let worker = Worker::new_fifo();
-			stealers.push(worker.stealer());
-			workers.push(worker);
-		}
-		// Create the threadpool shared data
+		// Create the threadpool shared data.
 		let data = Arc::new(Data {
 			name: self.thread_name,
 			stack_size: self.thread_stack_size,
 			num_threads: AtomicUsize::new(threads),
 			thread_count: AtomicUsize::new(0),
-			injector,
-			stealers: ArcSwap::from_pointee(stealers.into_boxed_slice()),
-			stealers_lock: Mutex::new(()),
-			shutdown: AtomicBool::new(false),
-			parked_threads: ArrayQueue::new(threads),
-			parked_count: AtomicUsize::new(0),
+			queue: Arc::new(Queue::new(threads)),
 			thread_handles: Mutex::new(Vec::new()),
 		});
-		// Use affinity if spawning thread per core
+		// Spawn the desired number of workers.
 		if self.thread_per_core {
-			// Spawn the desired number of workers
-			for (id, worker) in workers.into_iter().enumerate() {
-				Threadpool::spin_up(Some(id), data.clone(), worker, id);
+			for index in 0..threads {
+				Threadpool::spin_up(Some(index), data.clone(), index);
 			}
 		} else {
-			// Spawn the desired number of workers
-			for (index, worker) in workers.into_iter().enumerate() {
-				Threadpool::spin_up(None, data.clone(), worker, index);
+			for index in 0..threads {
+				Threadpool::spin_up(None, data.clone(), index);
 			}
 		}
-		// Return the new threadpool
+		// Return the new threadpool.
 		Threadpool {
 			data,
 		}

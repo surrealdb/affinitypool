@@ -85,11 +85,25 @@ jobs:
       - name: Check benchmarks compile
         run: cargo bench --no-run
 
+  # The 0.6.0 rewrite shrank the unsafe surface (task allocation and
+  # waker synchronisation moved into `async-task`, which carries its
+  # own miri + loom coverage upstream), but it introduced a new
+  # first-party concurrency protocol — the arm-then-rescan park
+  # handshake in `src/queue.rs`. The remaining first-party `unsafe`
+  # is `Builder::spawn_unchecked` in `Threadpool::spawn_local`, whose
+  # soundness relies on `SpawnFuture::drop` blocking until the
+  # runnable stops. The jobs below cover both:
+  #
+  # * `miri` runs the async-task smoke tests and the crate's unit
+  #   tests under MIRI to catch UB on the `spawn_unchecked` boundary
+  #   and the `Runnable` cross-thread transfer.
+  # * `loom` runs a model of the queue's parking handshake
+  #   (`tests/loom_queue.rs`) that exhaustively explores producer/
+  #   worker interleavings against the protocol described in
+  #   `src/queue.rs`.
   miri:
     name: Miri
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -105,25 +119,23 @@ jobs:
 
       - name: Run Miri
         env:
-          # Crossbeam-deque relies on int-to-ptr provenance internally and is
-          # only sound under Tree Borrows. `-Zmiri-ignore-leaks` silences
-          # leaks owned by crossbeam-epoch's TLS handle on thread exit.
-          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-ignore-leaks"
-        # Run lib unit tests in the `task::` and `job::` modules — these
-        # exercise every unsafe block in the crate without invoking the
-        # work-stealing scheduler. Miri's `std::thread::park` modelling
-        # over-reports deadlocks for the scheduler, so threaded tests live
-        # in `tests/threadpool_tests.rs` (validated on real threads in CI)
-        # and `tests/loom.rs` (validated exhaustively under Loom).
+          # `-Zmiri-disable-isolation` lets thread-local time/CPU
+          # queries used by `async-task` and the test harness succeed
+          # without external syscalls.
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        # Scope: the `async_task_smoke` integration suite exercises
+        # the `spawn_unchecked` lifetime contract and the `Runnable`
+        # send-across-thread path that the new design depends on;
+        # `--lib` picks up the small set of crate-internal unit
+        # tests. The full `threadpool_tests` suite uses a tokio
+        # multi-thread runtime that is impractical under miri.
         run: |
-          cargo miri test --lib task::
-          cargo miri test --lib job::
+          cargo miri test --lib
+          cargo miri test --test async_task_smoke
 
   loom:
     name: Loom
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -138,4 +150,4 @@ jobs:
         env:
           RUSTFLAGS: "--cfg loom"
           LOOM_MAX_PREEMPTIONS: "3"
-        run: cargo test --test loom --release
+        run: cargo test --release --test loom_queue
