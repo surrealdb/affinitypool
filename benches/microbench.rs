@@ -5,22 +5,28 @@
 //! actually targets:
 //!
 //! * **`spawn_overhead`** — empty closure, single worker. Dominated by
-//!   allocator traffic and the spawn/poll state machine.
+//!   `async-task` allocation and the spawn/poll state machine.
 //! * **`steady_state_busy`** — keep all workers busy with many tasks queued,
-//!   so the parking machinery is never exercised. Isolates the SeqCst fences
-//!   and the `parked_threads.pop()` cost on the producer hot path.
+//!   so the parking machinery is never exercised. Isolates the shard push
+//!   cost and the `parked.load(Acquire)` short-circuit on the producer hot
+//!   path.
 //! * **`park_unpark_handshake`** — submit a single task, await, then go
 //!   idle. Forces a park/unpark cycle on each iteration. Stresses the
-//!   handshake the SeqCst fences exist to protect.
+//!   arm-then-rescan handshake that protects against lost wakeups (see
+//!   `src/queue.rs` and `tests/loom_queue.rs`).
 //! * **`multi_producer_contention`** — many concurrent async producers fed
-//!   into one pool. Stresses contention on the global injector and the
-//!   parked-threads queue.
+//!   into one pool. Stresses cross-shard contention and the `parked` atomic
+//!   gate from the producer side.
 //! * **`spawn_local_overhead`** — empty closure via `spawn_local`. The
-//!   `spawn_local` path uses different completion machinery and is not
-//!   covered by the existing benches.
-//! * **`steal_imbalance`** — push every task through the global injector
-//!   with N workers idle. Stresses the work-stealing path that distributes
-//!   work to peer workers.
+//!   `spawn_local` path schedules lazily on first poll and runs the cancel
+//!   path on drop, so it has different completion costs than `spawn` and is
+//!   not covered by the existing benches.
+//! * **`steal_imbalance`** — push every task from a single producer onto
+//!   one shard with N workers idle, so peer workers have to scan empty
+//!   shards before finding the work. Stresses the worker's shard-scan path
+//!   plus the wake-fanout that distributes the queued work across the
+//!   parked workers. (Name preserved for criterion history continuity —
+//!   the current implementation is shard-scanning, not work-stealing.)
 
 use affinitypool::{Builder, Threadpool};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -74,8 +80,8 @@ fn bench_spawn_overhead(c: &mut Criterion) {
 
 /// Keep the pool saturated: queue 8x more tasks than there are workers
 /// before any complete, then await all. Workers should never park, so the
-/// producer hot path (`spawn` → injector push → opportunistic unpark) and
-/// the worker hot path (`find_task` busy loop) are both isolated.
+/// producer hot path (`spawn` → shard push → `parked.load` short-circuit)
+/// and the worker hot path (Phase-1 shard scan loop) are both isolated.
 fn bench_steady_state_busy(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 	let mut group = c.benchmark_group("steady_state_busy");
@@ -96,8 +102,8 @@ fn bench_steady_state_busy(c: &mut Criterion) {
 						let start = Instant::now();
 						let mut handles = Vec::with_capacity(total_tasks);
 						// Submit all tasks before awaiting any: workers
-						// will always find something in the injector
-						// or each other's queues and never park.
+						// will always find something on their own shard
+						// or a peer shard and never park.
 						for i in 0..total_tasks {
 							handles.push(pool.spawn(move || {
 								// Tiny non-trivial work so the
@@ -124,8 +130,9 @@ fn bench_steady_state_busy(c: &mut Criterion) {
 
 /// One task per iteration, awaited before the next is submitted. The pool
 /// goes fully idle between tasks, so each iteration exercises a full
-/// park/unpark cycle. This is what the SeqCst fences in `spawn` and the
-/// worker loop exist to protect.
+/// park/unpark cycle. This is the path the arm-then-rescan handshake in
+/// `src/queue.rs` exists to protect (see also the loom model in
+/// `tests/loom_queue.rs`).
 fn bench_park_unpark_handshake(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 	let mut group = c.benchmark_group("park_unpark_handshake");
@@ -157,8 +164,9 @@ fn bench_park_unpark_handshake(c: &mut Criterion) {
 }
 
 /// N tokio tasks each submit `tasks_per_producer` jobs into the same pool
-/// concurrently. Stresses contention on the global injector and the
-/// bounded `parked_threads` queue from the producer side.
+/// concurrently. Stresses cross-shard contention (each producer routes to
+/// the shard matching its CPU) and the `parked` atomic gate from the
+/// producer side.
 fn bench_multi_producer_contention(c: &mut Criterion) {
 	let rt =
 		tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap();
@@ -209,8 +217,9 @@ fn bench_multi_producer_contention(c: &mut Criterion) {
 	group.finish();
 }
 
-/// Empty closure via `spawn_local`. Isolates the local completion
-/// machinery (Mutex + Condvar + AtomicWaker today) from the spawn path.
+/// Empty closure via `spawn_local`. Isolates the `spawn_local` cost
+/// (lazy-schedule on first poll, drop-blocks-on-cancel) from the eager
+/// `spawn` path.
 fn bench_spawn_local_overhead(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 	let mut group = c.benchmark_group("spawn_local_overhead");
@@ -245,9 +254,10 @@ fn bench_spawn_local_overhead(c: &mut Criterion) {
 }
 
 /// All workers initially idle and parked; a single producer dumps a large
-/// batch into the injector and awaits completion. Stresses the steal path
-/// (work-stealing distribution + opportunistic unparks) more than the
-/// producer path.
+/// batch onto one shard (the producer's CPU-routed shard) and awaits
+/// completion. Stresses the worker shard-scan path that lets peer workers
+/// discover the imbalanced load, plus the wake-fanout from the producer's
+/// `parked > 0` notify path.
 fn bench_steal_imbalance(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 	let mut group = c.benchmark_group("steal_imbalance");
