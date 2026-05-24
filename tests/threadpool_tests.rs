@@ -690,6 +690,43 @@ async fn test_spawn_local_no_nested_deadlock() {
 	assert_eq!(result, "no deadlock");
 }
 
+/// Regression: a 1-worker pool must not deadlock when the only worker
+/// constructs and drops a `SpawnFuture` without polling it.
+///
+/// Eager `runnable.schedule()` in `spawn_local` would put the runnable
+/// on the queue and then `SpawnFuture::drop` would block the worker
+/// waiting for itself to pop the runnable, deadlocking the pool. The
+/// 2-worker variant above hides this because the second worker can
+/// drain the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_spawn_local_single_worker_drop_without_poll() {
+	let pool = Arc::new(Threadpool::new(1));
+	let pool_clone = pool.clone();
+	// Bound the wait so a regression surfaces as a test failure
+	// (timeout) rather than a hung CI run.
+	let outcome = tokio::time::timeout(
+		Duration::from_secs(5),
+		tokio::task::spawn(async move {
+			pool_clone
+				.spawn(move || {
+					// Construct then drop a `SpawnFuture` without
+					// polling it from inside the only worker thread.
+					// With lazy scheduling the runnable is never
+					// queued, so Drop returns immediately.
+					let inner = pool.clone();
+					let _future = inner.spawn_local(|| 42);
+					"ok"
+				})
+				.await
+		}),
+	)
+	.await;
+	assert!(
+		matches!(outcome, Ok(Ok("ok"))),
+		"single-worker drop-without-poll must not deadlock: {outcome:?}"
+	);
+}
+
 // =============================================================================
 // New tests added alongside the perf + unsafe overhaul.
 // =============================================================================

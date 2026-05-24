@@ -24,10 +24,11 @@
 //! profile as the previous implementation; closing it would require an
 //! API change (a scoped spawn like `std::thread::scope`).
 
-use async_task::Task;
+use async_task::{Runnable, Task};
 use std::any::Any;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem;
 use std::panic;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,16 +43,37 @@ use crate::Threadpool;
 /// `Err(payload)` if it panicked.
 type Inner<R> = Task<Result<R, Box<dyn Any + Send + 'static>>>;
 
+/// State machine for the spawn-local future. We defer
+/// [`Runnable::schedule`] to first poll so a 1-worker pool cannot
+/// deadlock when a caller does `drop(pool.spawn_local(…))` from inside
+/// the only worker thread.
+enum State<R> {
+	/// Constructed but not yet polled. Holds the unscheduled
+	/// [`Runnable`] alongside the [`Task`] so first poll can push the
+	/// runnable into the queue, and so an early drop can release the
+	/// runnable without ever touching a worker.
+	Pending {
+		runnable: Runnable,
+		task: Inner<R>,
+	},
+	/// First poll has already pushed the runnable onto the queue. Only
+	/// the awaiter handle remains.
+	Scheduled(Inner<R>),
+	/// Resolved or dropped — no further work.
+	Done,
+}
+
 /// A future returned by [`Threadpool::spawn_local`].
 ///
-/// Resolves to the closure's return value. Dropping the future before
-/// completion cancels the task; if the worker is currently running the
-/// closure, the dropping thread is parked until the worker has
-/// finished. See module docs.
+/// Resolves to the closure's return value. The runnable is scheduled
+/// lazily on first poll — constructing a `SpawnFuture` and dropping it
+/// without polling never touches a worker. Dropping after polling
+/// cancels the task; if the worker is currently running the closure,
+/// the dropping thread is parked until the worker has finished. See
+/// module docs.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SpawnFuture<'pool, R> {
-	/// `Some` until the future has resolved or been dropped.
-	task: Option<Inner<R>>,
+	state: State<R>,
 	/// Phantom borrow of the pool — ties the future's lifetime to the
 	/// [`Threadpool`] reference it was created from, ensuring the pool
 	/// outlives any in-flight tasks.
@@ -60,9 +82,12 @@ pub struct SpawnFuture<'pool, R> {
 
 impl<'pool, R> SpawnFuture<'pool, R> {
 	#[inline]
-	pub(crate) fn new(task: Inner<R>) -> Self {
+	pub(crate) fn new(runnable: Runnable, task: Inner<R>) -> Self {
 		Self {
-			task: Some(task),
+			state: State::Pending {
+				runnable,
+				task,
+			},
 			_pool: PhantomData,
 		}
 	}
@@ -72,14 +97,31 @@ impl<R> Future for SpawnFuture<'_, R> {
 	type Output = R;
 
 	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		// Structural pinning: we never move `self.task` after creation.
+		// Structural pinning: we never move out of `self.state` except
+		// to replace it whole, and the Task inside is moved only when
+		// it has just been constructed by `mem::replace` (i.e. is no
+		// longer pinned through this Self).
 		let this = unsafe { self.as_mut().get_unchecked_mut() };
-		match this.task.as_mut() {
-			Some(task) => match Pin::new(task).poll(cx) {
+		// Schedule on first poll. Transitions `Pending → Scheduled`
+		// and then falls through to poll the Task immediately so a
+		// caller awaiting the future doesn't need a second poll just
+		// to register the waker.
+		if matches!(this.state, State::Pending { .. }) {
+			match mem::replace(&mut this.state, State::Done) {
+				State::Pending {
+					runnable,
+					task,
+				} => {
+					runnable.schedule();
+					this.state = State::Scheduled(task);
+				}
+				_ => unreachable!(),
+			}
+		}
+		match &mut this.state {
+			State::Scheduled(task) => match Pin::new(task).poll(cx) {
 				Poll::Ready(result) => {
-					// Task consumed itself; clear our slot so Drop
-					// becomes a no-op.
-					this.task = None;
+					this.state = State::Done;
 					match result {
 						Ok(value) => Poll::Ready(value),
 						Err(payload) => panic::resume_unwind(payload),
@@ -87,27 +129,41 @@ impl<R> Future for SpawnFuture<'_, R> {
 				}
 				Poll::Pending => Poll::Pending,
 			},
-			None => panic!("SpawnFuture polled after completion"),
+			State::Done => panic!("SpawnFuture polled after completion"),
+			State::Pending {
+				..
+			} => unreachable!("Pending handled above"),
 		}
 	}
 }
 
 impl<R> Drop for SpawnFuture<'_, R> {
 	fn drop(&mut self) {
-		if let Some(task) = self.task.take() {
-			// `Task::cancel()` returns a future that resolves once the
-			// runnable has finished (either by running to completion
-			// or by being dropped without running). Block the current
-			// thread on that — the closure may borrow `'pool` data
-			// that goes out of scope as soon as this returns.
-			block_on_cancel(task);
+		match mem::replace(&mut self.state, State::Done) {
+			State::Pending {
+				runnable,
+				task,
+			} => {
+				// Never scheduled — dropping the runnable cancels the
+				// task synchronously without touching a worker, so no
+				// `block_on_cancel` is needed and a 1-worker pool
+				// cannot deadlock here.
+				drop(runnable);
+				drop(task);
+			}
+			State::Scheduled(task) => {
+				// `Task::cancel()` returns a future that resolves once
+				// the runnable has finished (either by running to
+				// completion or by being dropped without running).
+				// Block the current thread on that — the closure may
+				// borrow `'pool` data that goes out of scope as soon
+				// as this returns.
+				block_on_cancel(task);
+			}
+			State::Done => {}
 		}
 	}
 }
-
-// `SpawnFuture` is `Send` whenever the underlying `Task` is. async-task
-// provides the bound automatically — re-state it here for clarity.
-unsafe impl<R: Send> Send for SpawnFuture<'_, R> {}
 
 /// Parker-based `block_on` for `task.cancel()`. Only used on the drop
 /// path, so this is not a hot path — the contract is correctness, not

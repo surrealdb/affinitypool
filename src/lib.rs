@@ -180,8 +180,14 @@ impl Threadpool {
 				schedule,
 			)
 		};
-		runnable.schedule();
-		SpawnFuture::new(task)
+		// Defer `runnable.schedule()` to first poll. Eager scheduling
+		// here would deadlock a 1-worker pool whenever the only worker
+		// constructs and drops a `SpawnFuture` without polling: the
+		// worker would block in `Drop` waiting for itself to consume
+		// the runnable it just queued. The runnable is handed to
+		// `SpawnFuture`, which schedules it from its `poll` and drops
+		// it cleanly if the caller never polls.
+		SpawnFuture::new(runnable, task)
 	}
 
 	/// Set this threadpool as the global threadpool.
