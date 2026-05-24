@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 — async-task rewrite + sharded queue
+## Unreleased — async-task rewrite + sharded queue
 
 A major internal rewrite that closes the 8-15× performance gap versus
 `tokio::task::spawn_blocking` and ends up beating it on most
@@ -16,7 +16,7 @@ rename.
 Head-to-head with `tokio::task::spawn_blocking` (`--quick` criterion
 run, system idle):
 
-| Bench | 0.5.0 | 0.6.0 | Tokio | 0.6.0 vs Tokio |
+| Bench | 0.5.0 | this PR | Tokio | this PR vs Tokio |
 |---|---|---|---|---|
 | `spawn_overhead/4w/10000` | 48.4 ms | **6.4 ms** | 21.2 ms | **AP wins 3.3×** |
 | `spawn_overhead/4w/100` | 728 µs | **66.7 µs** | 144 µs | **AP wins 2.2×** |
@@ -94,7 +94,7 @@ on 8 workers** (`concurrent_pipeline`).
   used the returned value as a `Future` (the common case) are
   unaffected.
 
-- `spawn_local` keeps the pre-0.6.0 lazy-schedule semantic: the
+- `spawn_local` keeps its pre-rewrite lazy-schedule semantic: the
   runnable is pushed onto the queue on first poll of the returned
   `SpawnFuture`, not at the call site. Constructing and dropping a
   `SpawnFuture` without ever polling it is a no-op and never touches
@@ -127,7 +127,7 @@ let h = pool.spawn(|| compute());
 // ... h is unscheduled until polled.
 // std::mem::drop(h) ran the closure to completion.
 
-// After (0.6.0):
+// After (this PR):
 let h = pool.spawn(|| compute());
 // ... the closure is already running on a worker.
 // std::mem::drop(h) cancels the task.
