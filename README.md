@@ -4,47 +4,6 @@ A threadpool for running blocking jobs on a dedicated thread pool. Blocking task
 
 For optimised workloads, the affinity of each thread can be specified, ensuring that each thread can request to be pinned to a certain CPU core, allowing for more parallelism, and better performance guarantees for blocking workloads.
 
-## Benchmarks
-
-Head-to-head against [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html). Same producer code drives both: a `current_thread` Tokio runtime on the producer side, and either an `affinitypool::Threadpool::new(N)` or `tokio::runtime::Builder::max_blocking_threads(N)` on the worker side. Numbers from `cargo bench --bench vs_tokio -- --quick` on a quiet Linux box.
-
-| Benchmark | affinitypool | `tokio::spawn_blocking` | Result |
-|---|---|---|---|
-| `spawn_overhead/1w/1` | 3.20 µs | 7.14 µs | **AP wins 2.2×** |
-| `spawn_overhead/1w/100` | 13.6 µs | 17.7 µs | **AP wins 1.3×** |
-| `spawn_overhead/1w/1000` | 137 µs | 163 µs | **AP wins 1.2×** |
-| `spawn_overhead/1w/10000` | 1.06 ms | 2.21 ms | **AP wins 2.1×** |
-| `spawn_overhead/4w/1` | 7.05 µs | 2.99 µs | tokio wins 2.4× |
-| `spawn_overhead/4w/100` | 172 µs | 61.7 µs | tokio wins 2.8× |
-| `spawn_overhead/4w/1000` | 1.79 ms | 531 µs | tokio wins 3.4× |
-| `spawn_overhead/4w/10000` | 16.2 ms | 6.99 ms | tokio wins 2.3× |
-| `round_trip/1w` | 6.88 µs | 6.81 µs | parity |
-| `round_trip/4w` | 4.93 µs | 7.14 µs | **AP wins 1.5×** |
-| `round_trip/8w` | 6.00 µs | 5.59 µs | parity |
-| `multi_producer/2p_1w` | 219 µs | 288 µs | **AP wins 1.3×** |
-| `multi_producer/2p_4w` | 570 µs | 876 µs | **AP wins 1.5×** |
-| `multi_producer/4p_1w` | 576 µs | 816 µs | **AP wins 1.4×** |
-| `multi_producer/4p_4w` | 1.74 ms | 1.53 ms | tokio wins 1.1× |
-| `multi_producer/8p_1w` | 3.24 ms | 2.94 ms | tokio wins 1.1× |
-| `multi_producer/8p_4w` | 5.68 ms | 2.89 ms | tokio wins 2.0× |
-
-affinitypool wins outright on 7 of 17 benches and is at parity on 2 more. The remaining losses are concentrated on `4w+` batched-spawn workloads where mutex contention on the shared worker queue dominates. Sustained throughput is roughly **1.9 M tasks/s on 4 workers** and **2.5 M tasks/s on 8 workers**.
-
-Unlike `tokio::spawn_blocking`, affinitypool gives you a dedicated pool sized for blocking work (rather than sharing tokio's general blocking pool) and preserves **CPU affinity** — the feature this library exists for.
-
-To reproduce:
-
-```bash
-cargo bench --bench vs_tokio          # vs tokio::task::spawn_blocking
-cargo bench --bench vs_blocking       # vs blocking::unblock (async-std / smol)
-cargo bench --bench vs_rayon          # vs rayon::ThreadPool::spawn
-cargo bench --bench vs_threadpool     # vs threadpool::ThreadPool::execute
-cargo bench --bench microbench        # internal microbenchmarks
-./run_benchmarks.sh                   # full suite
-```
-
-See [BENCHMARKS.md](BENCHMARKS.md) for the full bench suite and methodology.
-
 ## Examples
 
 ### Basic Usage
@@ -228,6 +187,47 @@ async fn main() {
     println!("All tasks completed!");
 }
 ```
+
+## Benchmarks
+
+Head-to-head against [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html). Same producer code drives both: a `current_thread` Tokio runtime on the producer side, and either an `affinitypool::Threadpool::new(N)` or `tokio::runtime::Builder::max_blocking_threads(N)` on the worker side. Numbers from `cargo bench --bench vs_tokio -- --quick` on a quiet Linux box.
+
+| Benchmark | affinitypool | `tokio::spawn_blocking` | Result |
+|---|---|---|---|
+| `spawn_overhead/1w/1` | 3.20 µs | 7.14 µs | **AP wins 2.2×** |
+| `spawn_overhead/1w/100` | 13.6 µs | 17.7 µs | **AP wins 1.3×** |
+| `spawn_overhead/1w/1000` | 137 µs | 163 µs | **AP wins 1.2×** |
+| `spawn_overhead/1w/10000` | 1.06 ms | 2.21 ms | **AP wins 2.1×** |
+| `spawn_overhead/4w/1` | 7.05 µs | 2.99 µs | tokio wins 2.4× |
+| `spawn_overhead/4w/100` | 172 µs | 61.7 µs | tokio wins 2.8× |
+| `spawn_overhead/4w/1000` | 1.79 ms | 531 µs | tokio wins 3.4× |
+| `spawn_overhead/4w/10000` | 16.2 ms | 6.99 ms | tokio wins 2.3× |
+| `round_trip/1w` | 6.88 µs | 6.81 µs | parity |
+| `round_trip/4w` | 4.93 µs | 7.14 µs | **AP wins 1.5×** |
+| `round_trip/8w` | 6.00 µs | 5.59 µs | parity |
+| `multi_producer/2p_1w` | 219 µs | 288 µs | **AP wins 1.3×** |
+| `multi_producer/2p_4w` | 570 µs | 876 µs | **AP wins 1.5×** |
+| `multi_producer/4p_1w` | 576 µs | 816 µs | **AP wins 1.4×** |
+| `multi_producer/4p_4w` | 1.74 ms | 1.53 ms | tokio wins 1.1× |
+| `multi_producer/8p_1w` | 3.24 ms | 2.94 ms | tokio wins 1.1× |
+| `multi_producer/8p_4w` | 5.68 ms | 2.89 ms | tokio wins 2.0× |
+
+affinitypool wins outright on 7 of 17 benches and is at parity on 2 more. The remaining losses are concentrated on `4w+` batched-spawn workloads where mutex contention on the shared worker queue dominates. Sustained throughput is roughly **1.9 M tasks/s on 4 workers** and **2.5 M tasks/s on 8 workers**.
+
+Unlike `tokio::spawn_blocking`, affinitypool gives you a dedicated pool sized for blocking work (rather than sharing tokio's general blocking pool) and preserves **CPU affinity** — the feature this library exists for.
+
+To reproduce:
+
+```bash
+cargo bench --bench vs_tokio          # vs tokio::task::spawn_blocking
+cargo bench --bench vs_blocking       # vs blocking::unblock (async-std / smol)
+cargo bench --bench vs_rayon          # vs rayon::ThreadPool::spawn
+cargo bench --bench vs_threadpool     # vs threadpool::ThreadPool::execute
+cargo bench --bench microbench        # internal microbenchmarks
+./run_benchmarks.sh                   # full suite
+```
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the full bench suite and methodology.
 
 ## Architecture
 
