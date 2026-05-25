@@ -369,8 +369,9 @@ mod tests {
 		// it. The inner closure runs on the worker (via the local
 		// deque if the fast path engaged), and awaiting yields
 		// its return value.
-		let inner =
-			handle_rx.recv_timeout(Duration::from_secs(5)).expect("worker didn't send inner handle");
+		let inner = handle_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("worker didn't send inner handle");
 		let v = inner.await;
 		assert_eq!(v, 42);
 
