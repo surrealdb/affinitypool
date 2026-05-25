@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Behavioural notes
+
+- **Worker self-spawn fast path.** When a closure running on a
+  worker thread calls `pool.spawn(...)`, the new task is pushed
+  directly into that worker's own local deque instead of routing
+  through the shared injector. The producer (this thread) is also
+  the consumer, so no cross-thread wake is issued — *other workers
+  currently parked stay parked*. This is intentional and almost
+  always what you want (it saves the wake roundtrip), but a
+  workload that fans out **only** via self-spawn cascades, with no
+  external producer to wake parked peers, will serialise on the
+  spawning worker until something else wakes them. The spawning
+  worker's local deque is still a stealer target, so peers that
+  wake on a later foreign push will recover the imbalance.
+
 ## 0.6.0 — 2026-05-24 — async-task rewrite + sharded queue
 
 A major internal rewrite that closes the 8-15× performance gap versus

@@ -23,10 +23,11 @@
 //!   it empties.
 //! * **Stealers.** A `Stealer<Runnable>` for each worker's deque is
 //!   stored centrally so workers can steal from each other as a
-//!   last resort before parking. Wrapped in
-//!   `Mutex<Option<Stealer>>` so the panic-respawn path can replace
-//!   a worker's slot when [`Sentry`] starts a fresh thread — the
-//!   mutex is uncontended outside that rare path.
+//!   last resort before parking. Held in `ArcSwapOption<Stealer>`
+//!   slots: the cross-worker scan path reads lock-free with a
+//!   single atomic load, and the panic-respawn path atomically
+//!   replaces a worker's slot when [`Sentry`] starts a fresh
+//!   thread.
 //!
 //! Pop order: own deque → preferred injector → other injectors,
 //! cyclic → other workers' stealers → park.
@@ -187,6 +188,12 @@ pub(crate) struct Queue {
 	/// Set on threadpool drop. Workers observing this with every
 	/// shard and stealer empty exit their loop.
 	shutdown: AtomicBool,
+	/// Test-only counter, incremented on every push that takes
+	/// the foreign-producer path (i.e. did *not* engage the
+	/// worker self-spawn fast path). Used by integration tests
+	/// to assert the fast path engaged on a given workload.
+	#[cfg(test)]
+	pub(crate) foreign_pushes: AtomicUsize,
 }
 
 /// Per-worker state owned exclusively by one worker OS thread. The
@@ -231,6 +238,8 @@ impl Queue {
 			notify: Condvar::new(),
 			parked: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
+			#[cfg(test)]
+			foreign_pushes: AtomicUsize::new(0),
 		}
 	}
 
@@ -325,7 +334,8 @@ impl Queue {
 
 		// Foreign-producer path: route via the shared Injector
 		// and wake one parked worker if any.
-		//
+		#[cfg(test)]
+		self.foreign_pushes.fetch_add(1, Ordering::Relaxed);
 		// Single-shard fast path: skip the CPU lookup, SPILL
 		// thread-local, and bitmask arithmetic — they're all
 		// dead work when `mask == 0` (which corresponds to a

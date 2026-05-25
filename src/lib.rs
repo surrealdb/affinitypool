@@ -317,3 +317,53 @@ impl Drop for Threadpool {
 		self.data.thread_count.store(0, Ordering::Relaxed);
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::mpsc;
+	use std::time::Duration;
+
+	/// Confirms the worker self-spawn fast path actually engaged
+	/// (not just that the work eventually ran via the fallback).
+	/// Reads the test-only `Queue::foreign_pushes` counter: every
+	/// `Threadpool::spawn` that takes the foreign-producer path
+	/// bumps it. A self-spawn from inside a worker closure should
+	/// NOT bump it.
+	#[tokio::test]
+	async fn self_spawn_does_not_increment_foreign_push_counter() {
+		let pool = Arc::new(Threadpool::new(4));
+
+		// Drain any startup noise from constructing the pool.
+		pool.data.queue.foreign_pushes.store(0, Ordering::Relaxed);
+
+		let pool_clone = pool.clone();
+		let (tx, rx) = mpsc::channel();
+
+		// The outer spawn is a foreign push (we're calling from
+		// the tokio runtime thread, not a worker). It bumps the
+		// counter by 1.
+		pool.spawn(move || {
+			// We're now on a worker thread for `pool`. The
+			// self-spawn fast path should engage: this push goes
+			// directly into the worker's local deque, NOT through
+			// the foreign-producer path.
+			let inner = pool_clone.spawn(move || tx.send(()).unwrap());
+			std::mem::forget(inner);
+		})
+		.await;
+
+		// Wait for the inner closure to run on the worker (via
+		// the local deque, not via cross-worker steal).
+		rx.recv_timeout(Duration::from_secs(5)).expect("inner closure didn't run");
+
+		// Only the outer spawn should have hit the foreign-push
+		// path; the inner self-spawn must have taken the fast
+		// path.
+		let foreign_count = pool.data.queue.foreign_pushes.load(Ordering::Relaxed);
+		assert_eq!(
+			foreign_count, 1,
+			"expected exactly one foreign push (the outer); got {foreign_count} — self-spawn fast path didn't engage"
+		);
+	}
+}

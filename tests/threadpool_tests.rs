@@ -436,6 +436,34 @@ async fn test_spawn_from_worker_routes_to_local_deque() {
 }
 
 #[tokio::test]
+async fn test_spawn_into_other_pool_from_worker() {
+	// A closure running on a worker of pool A calling `pool_b.spawn(...)`
+	// must route through pool B's foreign-producer path — the
+	// thread-local self-spawn handle was set for pool A, so
+	// pool B's `std::ptr::eq` queue-identity check must miss
+	// and fall back to the Injector + wake. Without that pointer-
+	// equality guard, the inner task could be misrouted into
+	// pool A's local deque and silently never run on pool B.
+	use std::sync::mpsc;
+
+	let pool_a = Arc::new(Threadpool::new(2));
+	let pool_b = Arc::new(Threadpool::new(2));
+	let pool_b_clone = pool_b.clone();
+	let (tx, rx) = mpsc::channel();
+
+	pool_a
+		.spawn(move || {
+			// Running on a worker of pool A. Spawn into pool B.
+			let inner = pool_b_clone.spawn(move || tx.send(42u32).unwrap());
+			std::mem::forget(inner);
+		})
+		.await;
+
+	let v = rx.recv_timeout(Duration::from_secs(5)).expect("cross-pool spawn didn't run");
+	assert_eq!(v, 42);
+}
+
+#[tokio::test]
 async fn test_nested_spawns() {
 	let pool = Arc::new(Threadpool::new(4));
 
