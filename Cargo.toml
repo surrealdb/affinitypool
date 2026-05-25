@@ -17,6 +17,8 @@ default = []
 
 [dependencies]
 async-task = "4"
+crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
 thiserror = "2.0.18"

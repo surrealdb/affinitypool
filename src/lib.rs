@@ -265,12 +265,16 @@ impl Threadpool {
 			if let Some(coreid) = coreid {
 				affinity::set_for_current(coreid.into());
 			}
-			// Worker loop: pop a runnable, run it, repeat. The worker
-			// passes its `index` so the queue can route the pop to
-			// its preferred shard, falling back to scanning peers.
-			// Parking is handled by `Queue::pop_blocking` via its
-			// Condvar.
-			while let Some(runnable) = queue.pop_blocking(index) {
+			// Register this worker with the queue: creates a fresh
+			// per-worker deque and installs its `Stealer` in slot
+			// `index`. On panic-respawn, the replacement thread
+			// re-runs this and overwrites the slot.
+			let ctx = queue.register_worker(index);
+			// Worker loop: pop a runnable, run it, repeat. The
+			// worker hands its `ctx` so the queue can drain the
+			// local deque first, then steal a batch from the
+			// preferred injector, then scan peers, then park.
+			while let Some(runnable) = queue.pop_blocking(&ctx) {
 				runnable.run();
 			}
 			// Clean exit — cancel the sentry so its Drop does not
