@@ -105,6 +105,8 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::CachePadded;
 use parking_lot::{Condvar, Mutex};
 use std::cell::Cell;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
@@ -136,7 +138,29 @@ thread_local! {
 	/// producer is interleaved). When `count > SPILL_THRESHOLD`, the
 	/// route rotates by `count - SPILL_THRESHOLD` shards.
 	static SPILL: Cell<(usize, u32)> = const { Cell::new((usize::MAX, 0)) };
+
+	/// When this thread is a worker for some `Queue`, holds raw
+	/// pointers to that queue and the worker's local deque. Set
+	/// by [`Queue::enter_worker_scope`] and cleared when the
+	/// returned [`WorkerScope`] is dropped. [`Queue::push`] reads
+	/// this to fast-path through the worker's own deque when the
+	/// producer is itself a worker for this queue.
+	static CURRENT_WORKER: Cell<Option<WorkerHandle>> = const { Cell::new(None) };
 }
+
+/// Pointer pair stashed in [`CURRENT_WORKER`] for the duration of
+/// a worker thread's scope. Both pointers are valid only while
+/// the corresponding [`WorkerScope`] is alive.
+#[derive(Clone, Copy)]
+struct WorkerHandle {
+	queue: NonNull<Queue>,
+	deque: NonNull<Worker<Runnable>>,
+}
+
+// `WorkerHandle` holds raw pointers and is only ever read on the
+// thread that wrote it (the worker thread itself), so `Send` /
+// `Sync` aren't needed and aren't requested. The thread-local
+// machinery handles per-thread isolation.
 
 /// Shared work queue. `push` notifies one waiter; `pop_blocking`
 /// drains local + steals from shards + steals from peers, then
@@ -172,6 +196,22 @@ pub(crate) struct Queue {
 pub(crate) struct WorkerContext {
 	idx: usize,
 	deque: Worker<Runnable>,
+}
+
+/// RAII guard returned by [`Queue::enter_worker_scope`]. While
+/// alive, the calling thread's [`CURRENT_WORKER`] holds a handle
+/// to the queue + the worker's local deque so [`Queue::push`]
+/// from the same thread can fast-path. On drop, clears the
+/// thread-local so any later `push` from this thread falls back
+/// to the foreign-producer path.
+pub(crate) struct WorkerScope<'a> {
+	_phantom: PhantomData<&'a ()>,
+}
+
+impl Drop for WorkerScope<'_> {
+	fn drop(&mut self) {
+		CURRENT_WORKER.with(|w| w.set(None));
+	}
 }
 
 impl Queue {
@@ -212,11 +252,80 @@ impl Queue {
 		}
 	}
 
+	/// Register the calling thread as the active worker for this
+	/// queue with the given context. Subsequent [`Queue::push`]
+	/// calls from this thread that target this queue will route
+	/// directly into the context's local deque, skipping the
+	/// shared injector and the cross-thread wake-up handshake.
+	/// The returned [`WorkerScope`] clears the thread-local
+	/// registration on drop.
+	///
+	/// Must be called from the worker thread *after*
+	/// [`Self::register_worker`], with the context held on the
+	/// same stack frame for the scope's lifetime. The
+	/// `'a` borrow on both `&self` and `ctx` makes it impossible
+	/// for the scope to outlive either.
+	pub(crate) fn enter_worker_scope<'a>(&'a self, ctx: &'a WorkerContext) -> WorkerScope<'a> {
+		// `ctx.deque` is held on the worker thread's stack until
+		// after the scope is dropped, so its address is stable
+		// for the scope's lifetime.
+		CURRENT_WORKER.with(|w| {
+			w.set(Some(WorkerHandle {
+				queue: NonNull::from(self),
+				deque: NonNull::from(&ctx.deque),
+			}))
+		});
+		WorkerScope {
+			_phantom: PhantomData,
+		}
+	}
+
 	/// Push a runnable. Routes to a shard by the producer's
 	/// thread-local CPU cache, with spill after
 	/// [`SPILL_THRESHOLD`] consecutive pushes to the same shard.
 	#[inline]
 	pub(crate) fn push(&self, runnable: Runnable) {
+		// Self-spawn fast path: if the calling thread is itself
+		// a worker for THIS queue (set via `enter_worker_scope`
+		// during worker startup), push directly into that
+		// worker's local deque and skip the Injector + fence +
+		// parked check entirely.
+		//
+		// Producer and consumer are the same thread, so no
+		// cross-thread synchronisation is needed for visibility:
+		// the worker's next `pop_blocking` is sequenced-after
+		// this `push` in program order and will see the new
+		// runnable via `ctx.deque.pop()`.
+		//
+		// Side effect: any *other* workers currently parked stay
+		// parked. They'll wake on the next foreign push via the
+		// slow path below. For self-spawn cascades the work
+		// stays biased toward the spawning worker, but is still
+		// visible to peer stealers (the local deque is also a
+		// stealer target).
+		if let Some(handle) = CURRENT_WORKER.with(|w| w.get())
+			&& std::ptr::eq(handle.queue.as_ptr().cast_const(), self as *const Queue)
+		{
+			// SAFETY: `handle.deque` was installed by this same
+			// thread's `enter_worker_scope`. The scope keeps the
+			// `WorkerContext` (and the `Worker<Runnable>` it
+			// owns) alive on this thread's stack for the
+			// duration of the registration; on scope drop the
+			// thread-local is cleared *before* `WorkerContext`
+			// is dropped. So any non-`None` handle observed here
+			// points to a live `Worker<Runnable>` owned by this
+			// same thread. `Worker` is `!Sync` but used only
+			// from its owner thread, so the `&self` `push` call
+			// is sound.
+			unsafe {
+				handle.deque.as_ref().push(runnable);
+			}
+			return;
+		}
+
+		// Foreign-producer path: route via the shared Injector
+		// and wake one parked worker if any.
+		//
 		// Single-shard fast path: skip the CPU lookup, SPILL
 		// thread-local, and bitmask arithmetic — they're all
 		// dead work when `mask == 0` (which corresponds to a

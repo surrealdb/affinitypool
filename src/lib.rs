@@ -270,6 +270,13 @@ impl Threadpool {
 			// `index`. On panic-respawn, the replacement thread
 			// re-runs this and overwrites the slot.
 			let ctx = queue.register_worker(index);
+			// Mark this thread as a worker for `queue` so that
+			// `pool.spawn(...)` calls from inside `runnable.run()`
+			// route directly into the local deque, skipping the
+			// shared injector. Dropped at the end of this scope,
+			// clearing the thread-local registration before the
+			// `WorkerContext` itself goes out of scope.
+			let _worker_scope = queue.enter_worker_scope(&ctx);
 			// Worker loop: pop a runnable, run it, repeat. The
 			// worker hands its `ctx` so the queue can drain the
 			// local deque first, then steal a batch from the

@@ -401,6 +401,41 @@ async fn test_large_return_values() {
 }
 
 #[tokio::test]
+async fn test_spawn_from_worker_routes_to_local_deque() {
+	// When a closure running on a worker thread calls
+	// `pool.spawn(...)`, the new task should be picked up and
+	// executed by the same pool (potentially via the self-spawn
+	// fast path, which routes into the producing worker's own
+	// deque). We forget the inner JoinHandle to keep the task
+	// scheduled (Drop would cancel it) and use a channel for
+	// completion signalling because a worker thread is sync —
+	// it can't `.await`.
+	use std::sync::mpsc;
+
+	let pool = Arc::new(Threadpool::new(4));
+	let pool_clone = pool.clone();
+	let (tx, rx) = mpsc::channel();
+
+	pool.spawn(move || {
+		// Running on a worker thread for `pool` now. The
+		// self-spawn fast path is in effect.
+		let inner = pool_clone.spawn(move || {
+			tx.send(42u32).unwrap();
+		});
+		std::mem::forget(inner);
+	})
+	.await;
+
+	// After the outer closure returns, the worker re-enters its
+	// pop loop and finds the inner runnable in its local deque
+	// (assuming the fast path engaged) or via the cross-worker
+	// stealer scan (fallback). Either way, the inner closure
+	// must run.
+	let v = rx.recv_timeout(Duration::from_secs(5)).expect("inner closure didn't run");
+	assert_eq!(v, 42);
+}
+
+#[tokio::test]
 async fn test_nested_spawns() {
 	let pool = Arc::new(Threadpool::new(4));
 
