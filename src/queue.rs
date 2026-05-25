@@ -212,27 +212,38 @@ impl Queue {
 	/// Push a runnable. Routes to a shard by the producer's
 	/// thread-local CPU cache, with spill after
 	/// [`SPILL_THRESHOLD`] consecutive pushes to the same shard.
+	#[inline]
 	pub(crate) fn push(&self, runnable: Runnable) {
-		let preferred = cpu::current_cpu() & self.mask;
-		let target = SPILL.with(|s| {
-			let (last, count) = s.get();
-			let new_count = if last == preferred {
-				count.saturating_add(1)
-			} else {
-				1
-			};
-			s.set((preferred, new_count));
-			if new_count <= SPILL_THRESHOLD {
-				preferred
-			} else {
-				// Rotate by (count - threshold) shards once we've
-				// tripped. As `count` grows, subsequent pushes
-				// cycle through all shards, draining the
-				// otherwise-pinned single producer evenly.
-				(preferred + (new_count - SPILL_THRESHOLD) as usize) & self.mask
-			}
-		});
-		self.injectors[target].push(runnable);
+		// Single-shard fast path: skip the CPU lookup, SPILL
+		// thread-local, and bitmask arithmetic — they're all
+		// dead work when `mask == 0` (which corresponds to a
+		// 1-worker pool). The fence + park-check below still
+		// run; producer↔worker synchronisation is independent of
+		// shard count.
+		if self.mask == 0 {
+			self.injectors[0].push(runnable);
+		} else {
+			let preferred = cpu::current_cpu() & self.mask;
+			let target = SPILL.with(|s| {
+				let (last, count) = s.get();
+				let new_count = if last == preferred {
+					count.saturating_add(1)
+				} else {
+					1
+				};
+				s.set((preferred, new_count));
+				if new_count <= SPILL_THRESHOLD {
+					preferred
+				} else {
+					// Rotate by (count - threshold) shards once
+					// we've tripped. As `count` grows, subsequent
+					// pushes cycle through all shards, draining
+					// the otherwise-pinned single producer evenly.
+					(preferred + (new_count - SPILL_THRESHOLD) as usize) & self.mask
+				}
+			});
+			self.injectors[target].push(runnable);
+		}
 		// SeqCst fence pairs with the worker's SeqCst fence
 		// between `parked.fetch_add` and its re-scan; the pair
 		// forms the Dekker invariant that prevents a lost wakeup
@@ -259,6 +270,7 @@ impl Queue {
 	/// injectors in cyclic order, then stealing from other
 	/// workers. Parks when nothing is found; returns `None` only
 	/// when shutdown has been signalled and everything is empty.
+	#[inline]
 	pub(crate) fn pop_blocking(&self, ctx: &WorkerContext) -> Option<Runnable> {
 		loop {
 			// Phase 1: lock-free scan. No park lock held, so
