@@ -271,6 +271,10 @@ Shard count rules of thumb:
 | 2–3 | 2–4 |
 | ≥ 5 | 8 (capped) |
 
+### Behaviour notes
+
+**Worker self-spawn fast path.** When a closure running on a worker thread calls `pool.spawn(...)`, the new task is pushed directly into that worker's own local deque instead of routing through the shared sharded queue. The producer (this thread) is also the consumer, so no cross-thread wake is issued — *other workers currently parked stay parked*. This is intentional and saves a wake roundtrip, but a workload that fans out **only** via self-spawn cascades with no external producer to wake parked peers will serialise on the spawning worker until something else wakes them. The spawning worker's local deque is still a stealer target, so peers that wake on a later foreign push will recover the imbalance.
+
 #### Original
 
 This code is heavily inspired by [threadpool](https://crates.io/crates/threadpool), with the CPU-based affinity code forked originally from [core-affinity](https://crates.io/crates/core_affinity). Both are licensed under the Apache License 2.0 and MIT licenses.

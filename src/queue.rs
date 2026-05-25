@@ -23,10 +23,11 @@
 //!   it empties.
 //! * **Stealers.** A `Stealer<Runnable>` for each worker's deque is
 //!   stored centrally so workers can steal from each other as a
-//!   last resort before parking. Wrapped in
-//!   `Mutex<Option<Stealer>>` so the panic-respawn path can replace
-//!   a worker's slot when [`Sentry`] starts a fresh thread — the
-//!   mutex is uncontended outside that rare path.
+//!   last resort before parking. Held in `ArcSwapOption<Stealer>`
+//!   slots: the cross-worker scan path reads lock-free with a
+//!   single atomic load, and the panic-respawn path atomically
+//!   replaces a worker's slot when [`Sentry`] starts a fresh
+//!   thread.
 //!
 //! Pop order: own deque → preferred injector → other injectors,
 //! cyclic → other workers' stealers → park.
@@ -99,20 +100,25 @@
 //!
 //! [`Sentry`]: crate::sentry::Sentry
 
+use arc_swap::ArcSwapOption;
 use async_task::Runnable;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::CachePadded;
 use parking_lot::{Condvar, Mutex};
 use std::cell::Cell;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 use crate::cpu;
 
-/// Per-worker stealer slot. `Option` so the panic-respawn path can
-/// replace a worker's slot when a fresh thread takes over;
-/// `CachePadded` to keep slots on separate cache lines and avoid
-/// false sharing during the cross-worker scan.
-type StealerSlot = CachePadded<Mutex<Option<Stealer<Runnable>>>>;
+/// Per-worker stealer slot. `ArcSwapOption` so the steal-scan path
+/// can read with a single atomic load (no mutex acquire), while
+/// the panic-respawn path can still atomically replace a worker's
+/// slot when a fresh thread takes over. `CachePadded` to keep slots
+/// on separate cache lines and avoid false sharing during scans.
+type StealerSlot = CachePadded<ArcSwapOption<Stealer<Runnable>>>;
 
 /// Hard cap on the shard count. Picked empirically: 8 saturates
 /// producer-side distribution on common topologies (≤8-core boxes
@@ -133,7 +139,29 @@ thread_local! {
 	/// producer is interleaved). When `count > SPILL_THRESHOLD`, the
 	/// route rotates by `count - SPILL_THRESHOLD` shards.
 	static SPILL: Cell<(usize, u32)> = const { Cell::new((usize::MAX, 0)) };
+
+	/// When this thread is a worker for some `Queue`, holds raw
+	/// pointers to that queue and the worker's local deque. Set
+	/// by [`Queue::enter_worker_scope`] and cleared when the
+	/// returned [`WorkerScope`] is dropped. [`Queue::push`] reads
+	/// this to fast-path through the worker's own deque when the
+	/// producer is itself a worker for this queue.
+	static CURRENT_WORKER: Cell<Option<WorkerHandle>> = const { Cell::new(None) };
 }
+
+/// Pointer pair stashed in [`CURRENT_WORKER`] for the duration of
+/// a worker thread's scope. Both pointers are valid only while
+/// the corresponding [`WorkerScope`] is alive.
+#[derive(Clone, Copy)]
+struct WorkerHandle {
+	queue: NonNull<Queue>,
+	deque: NonNull<Worker<Runnable>>,
+}
+
+// `WorkerHandle` holds raw pointers and is only ever read on the
+// thread that wrote it (the worker thread itself), so `Send` /
+// `Sync` aren't needed and aren't requested. The thread-local
+// machinery handles per-thread isolation.
 
 /// Shared work queue. `push` notifies one waiter; `pop_blocking`
 /// drains local + steals from shards + steals from peers, then
@@ -160,6 +188,12 @@ pub(crate) struct Queue {
 	/// Set on threadpool drop. Workers observing this with every
 	/// shard and stealer empty exit their loop.
 	shutdown: AtomicBool,
+	/// Test-only counter, incremented on every push that takes
+	/// the foreign-producer path (i.e. did *not* engage the
+	/// worker self-spawn fast path). Used by integration tests
+	/// to assert the fast path engaged on a given workload.
+	#[cfg(test)]
+	pub(crate) foreign_pushes: AtomicUsize,
 }
 
 /// Per-worker state owned exclusively by one worker OS thread. The
@@ -171,6 +205,22 @@ pub(crate) struct WorkerContext {
 	deque: Worker<Runnable>,
 }
 
+/// RAII guard returned by [`Queue::enter_worker_scope`]. While
+/// alive, the calling thread's [`CURRENT_WORKER`] holds a handle
+/// to the queue + the worker's local deque so [`Queue::push`]
+/// from the same thread can fast-path. On drop, clears the
+/// thread-local so any later `push` from this thread falls back
+/// to the foreign-producer path.
+pub(crate) struct WorkerScope<'a> {
+	_phantom: PhantomData<&'a ()>,
+}
+
+impl Drop for WorkerScope<'_> {
+	fn drop(&mut self) {
+		CURRENT_WORKER.with(|w| w.set(None));
+	}
+}
+
 impl Queue {
 	pub(crate) fn new(num_workers: usize) -> Self {
 		// `MAX_THREADS = 512` clamps the caller side, so
@@ -179,7 +229,7 @@ impl Queue {
 		let injectors: Vec<CachePadded<Injector<Runnable>>> =
 			(0..num_shards).map(|_| CachePadded::new(Injector::new())).collect();
 		let stealers: Vec<StealerSlot> =
-			(0..num_workers).map(|_| CachePadded::new(Mutex::new(None))).collect();
+			(0..num_workers).map(|_| CachePadded::new(ArcSwapOption::empty())).collect();
 		Self {
 			injectors: injectors.into_boxed_slice(),
 			stealers: stealers.into_boxed_slice(),
@@ -188,6 +238,8 @@ impl Queue {
 			notify: Condvar::new(),
 			parked: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
+			#[cfg(test)]
+			foreign_pushes: AtomicUsize::new(0),
 		}
 	}
 
@@ -202,37 +254,118 @@ impl Queue {
 	pub(crate) fn register_worker(&self, idx: usize) -> WorkerContext {
 		let deque = Worker::new_fifo();
 		let stealer = deque.stealer();
-		*self.stealers[idx].lock() = Some(stealer);
+		self.stealers[idx].store(Some(Arc::new(stealer)));
 		WorkerContext {
 			idx,
 			deque,
 		}
 	}
 
+	/// Register the calling thread as the active worker for this
+	/// queue with the given context. Subsequent [`Queue::push`]
+	/// calls from this thread that target this queue will route
+	/// directly into the context's local deque, skipping the
+	/// shared injector and the cross-thread wake-up handshake.
+	/// The returned [`WorkerScope`] clears the thread-local
+	/// registration on drop.
+	///
+	/// Must be called from the worker thread *after*
+	/// [`Self::register_worker`], with the context held on the
+	/// same stack frame for the scope's lifetime. The
+	/// `'a` borrow on both `&self` and `ctx` makes it impossible
+	/// for the scope to outlive either.
+	pub(crate) fn enter_worker_scope<'a>(&'a self, ctx: &'a WorkerContext) -> WorkerScope<'a> {
+		// `ctx.deque` is held on the worker thread's stack until
+		// after the scope is dropped, so its address is stable
+		// for the scope's lifetime.
+		CURRENT_WORKER.with(|w| {
+			w.set(Some(WorkerHandle {
+				queue: NonNull::from(self),
+				deque: NonNull::from(&ctx.deque),
+			}))
+		});
+		WorkerScope {
+			_phantom: PhantomData,
+		}
+	}
+
 	/// Push a runnable. Routes to a shard by the producer's
 	/// thread-local CPU cache, with spill after
 	/// [`SPILL_THRESHOLD`] consecutive pushes to the same shard.
+	#[inline]
 	pub(crate) fn push(&self, runnable: Runnable) {
-		let preferred = cpu::current_cpu() & self.mask;
-		let target = SPILL.with(|s| {
-			let (last, count) = s.get();
-			let new_count = if last == preferred {
-				count.saturating_add(1)
-			} else {
-				1
-			};
-			s.set((preferred, new_count));
-			if new_count <= SPILL_THRESHOLD {
-				preferred
-			} else {
-				// Rotate by (count - threshold) shards once we've
-				// tripped. As `count` grows, subsequent pushes
-				// cycle through all shards, draining the
-				// otherwise-pinned single producer evenly.
-				(preferred + (new_count - SPILL_THRESHOLD) as usize) & self.mask
+		// Self-spawn fast path: if the calling thread is itself
+		// a worker for THIS queue (set via `enter_worker_scope`
+		// during worker startup), push directly into that
+		// worker's local deque and skip the Injector + fence +
+		// parked check entirely.
+		//
+		// Producer and consumer are the same thread, so no
+		// cross-thread synchronisation is needed for visibility:
+		// the worker's next `pop_blocking` is sequenced-after
+		// this `push` in program order and will see the new
+		// runnable via `ctx.deque.pop()`.
+		//
+		// Side effect: any *other* workers currently parked stay
+		// parked. They'll wake on the next foreign push via the
+		// slow path below. For self-spawn cascades the work
+		// stays biased toward the spawning worker, but is still
+		// visible to peer stealers (the local deque is also a
+		// stealer target).
+		if let Some(handle) = CURRENT_WORKER.with(|w| w.get())
+			&& std::ptr::eq(handle.queue.as_ptr().cast_const(), self as *const Queue)
+		{
+			// SAFETY: `handle.deque` was installed by this same
+			// thread's `enter_worker_scope`. The scope keeps the
+			// `WorkerContext` (and the `Worker<Runnable>` it
+			// owns) alive on this thread's stack for the
+			// duration of the registration; on scope drop the
+			// thread-local is cleared *before* `WorkerContext`
+			// is dropped. So any non-`None` handle observed here
+			// points to a live `Worker<Runnable>` owned by this
+			// same thread. `Worker` is `!Sync` but used only
+			// from its owner thread, so the `&self` `push` call
+			// is sound.
+			unsafe {
+				handle.deque.as_ref().push(runnable);
 			}
-		});
-		self.injectors[target].push(runnable);
+			return;
+		}
+
+		// Foreign-producer path: route via the shared Injector
+		// and wake one parked worker if any.
+		#[cfg(test)]
+		self.foreign_pushes.fetch_add(1, Ordering::Relaxed);
+		// Single-shard fast path: skip the CPU lookup, SPILL
+		// thread-local, and bitmask arithmetic — they're all
+		// dead work when `mask == 0` (which corresponds to a
+		// 1-worker pool). The fence + park-check below still
+		// run; producer↔worker synchronisation is independent of
+		// shard count.
+		if self.mask == 0 {
+			self.injectors[0].push(runnable);
+		} else {
+			let preferred = cpu::current_cpu() & self.mask;
+			let target = SPILL.with(|s| {
+				let (last, count) = s.get();
+				let new_count = if last == preferred {
+					count.saturating_add(1)
+				} else {
+					1
+				};
+				s.set((preferred, new_count));
+				if new_count <= SPILL_THRESHOLD {
+					preferred
+				} else {
+					// Rotate by (count - threshold) shards once
+					// we've tripped. As `count` grows, subsequent
+					// pushes cycle through all shards, draining
+					// the otherwise-pinned single producer evenly.
+					(preferred + (new_count - SPILL_THRESHOLD) as usize) & self.mask
+				}
+			});
+			self.injectors[target].push(runnable);
+		}
 		// SeqCst fence pairs with the worker's SeqCst fence
 		// between `parked.fetch_add` and its re-scan; the pair
 		// forms the Dekker invariant that prevents a lost wakeup
@@ -259,6 +392,7 @@ impl Queue {
 	/// injectors in cyclic order, then stealing from other
 	/// workers. Parks when nothing is found; returns `None` only
 	/// when shutdown has been signalled and everything is empty.
+	#[inline]
 	pub(crate) fn pop_blocking(&self, ctx: &WorkerContext) -> Option<Runnable> {
 		loop {
 			// Phase 1: lock-free scan. No park lock held, so
@@ -329,14 +463,13 @@ impl Queue {
 			}
 		}
 
-		// 4. Other workers' deques, last resort. Cheap lock to
-		//    clone the `Stealer` (just clones an inner `Arc`)
-		//    so we don't hold the slot mutex across the steal.
+		// 4. Other workers' deques, last resort. Lock-free
+		//    `ArcSwapOption::load` returns an `Arc<Stealer>` we
+		//    can steal through without any per-slot mutex.
 		let num_workers = self.stealers.len();
 		for offset in 1..num_workers {
 			let victim = (ctx.idx + offset) % num_workers;
-			let stealer = self.stealers[victim].lock().clone();
-			if let Some(stealer) = stealer
+			if let Some(stealer) = self.stealers[victim].load_full()
 				&& let Some(r) = retry_steal(|| stealer.steal_batch_and_pop(&ctx.deque))
 			{
 				return Some(r);

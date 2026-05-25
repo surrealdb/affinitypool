@@ -16,6 +16,7 @@ resolver = "2"
 default = []
 
 [dependencies]
+arc-swap = "1.7"
 async-task = "4"
 crossbeam-deque = "0.8"
 crossbeam-utils = "0.8"

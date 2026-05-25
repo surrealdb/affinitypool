@@ -270,6 +270,13 @@ impl Threadpool {
 			// `index`. On panic-respawn, the replacement thread
 			// re-runs this and overwrites the slot.
 			let ctx = queue.register_worker(index);
+			// Mark this thread as a worker for `queue` so that
+			// `pool.spawn(...)` calls from inside `runnable.run()`
+			// route directly into the local deque, skipping the
+			// shared injector. Dropped at the end of this scope,
+			// clearing the thread-local registration before the
+			// `WorkerContext` itself goes out of scope.
+			let _worker_scope = queue.enter_worker_scope(&ctx);
 			// Worker loop: pop a runnable, run it, repeat. The
 			// worker hands its `ctx` so the queue can drain the
 			// local deque first, then steal a batch from the
@@ -308,5 +315,73 @@ impl Drop for Threadpool {
 		}
 		// Decrement thread count to 0.
 		self.data.thread_count.store(0, Ordering::Relaxed);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::pin::Pin;
+	use std::sync::mpsc;
+	use std::time::Duration;
+
+	/// Confirms the worker self-spawn fast path actually engaged
+	/// (not just that the work eventually ran via the fallback).
+	/// Reads the test-only `Queue::foreign_pushes` counter: every
+	/// `Threadpool::spawn` that takes the foreign-producer path
+	/// bumps it. A self-spawn from inside a worker closure should
+	/// NOT bump it.
+	///
+	/// Uses a 1-worker pool so the foreign-push branch hits the
+	/// `mask == 0` fast path and never calls `cpu::current_cpu()`
+	/// (`sched_getcpu` isn't supported under miri).
+	///
+	/// The inner `JoinHandle` is sent to the test thread via an
+	/// mpsc channel and awaited there, instead of `mem::forget`-ed
+	/// — keeps the test leak-free under miri while still letting
+	/// the inner closure run to completion on the worker.
+	#[tokio::test]
+	async fn self_spawn_does_not_increment_foreign_push_counter() {
+		type InnerFuture = Pin<Box<dyn Future<Output = u32> + Send + 'static>>;
+
+		let pool = Arc::new(Threadpool::new(1));
+
+		// Drain any startup noise from constructing the pool.
+		pool.data.queue.foreign_pushes.store(0, Ordering::Relaxed);
+
+		let pool_clone = pool.clone();
+		let (handle_tx, handle_rx) = mpsc::channel::<InnerFuture>();
+
+		// The outer spawn is a foreign push (we're calling from
+		// the tokio runtime thread, not a worker). It bumps the
+		// counter by 1.
+		pool.spawn(move || {
+			// We're now on a worker thread for `pool`. The
+			// self-spawn fast path should engage: this push goes
+			// directly into the worker's local deque, NOT through
+			// the foreign-producer path.
+			let inner: InnerFuture = Box::pin(pool_clone.spawn(|| 42u32));
+			handle_tx.send(inner).unwrap();
+		})
+		.await;
+
+		// Receive the inner future on the test thread and await
+		// it. The inner closure runs on the worker (via the local
+		// deque if the fast path engaged), and awaiting yields
+		// its return value.
+		let inner = handle_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("worker didn't send inner handle");
+		let v = inner.await;
+		assert_eq!(v, 42);
+
+		// Only the outer spawn should have hit the foreign-push
+		// path; the inner self-spawn must have taken the fast
+		// path.
+		let foreign_count = pool.data.queue.foreign_pushes.load(Ordering::Relaxed);
+		assert_eq!(
+			foreign_count, 1,
+			"expected exactly one foreign push (the outer); got {foreign_count} — self-spawn fast path didn't engage"
+		);
 	}
 }
