@@ -99,20 +99,23 @@
 //!
 //! [`Sentry`]: crate::sentry::Sentry
 
+use arc_swap::ArcSwapOption;
 use async_task::Runnable;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::CachePadded;
 use parking_lot::{Condvar, Mutex};
 use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 use crate::cpu;
 
-/// Per-worker stealer slot. `Option` so the panic-respawn path can
-/// replace a worker's slot when a fresh thread takes over;
-/// `CachePadded` to keep slots on separate cache lines and avoid
-/// false sharing during the cross-worker scan.
-type StealerSlot = CachePadded<Mutex<Option<Stealer<Runnable>>>>;
+/// Per-worker stealer slot. `ArcSwapOption` so the steal-scan path
+/// can read with a single atomic load (no mutex acquire), while
+/// the panic-respawn path can still atomically replace a worker's
+/// slot when a fresh thread takes over. `CachePadded` to keep slots
+/// on separate cache lines and avoid false sharing during scans.
+type StealerSlot = CachePadded<ArcSwapOption<Stealer<Runnable>>>;
 
 /// Hard cap on the shard count. Picked empirically: 8 saturates
 /// producer-side distribution on common topologies (≤8-core boxes
@@ -179,7 +182,7 @@ impl Queue {
 		let injectors: Vec<CachePadded<Injector<Runnable>>> =
 			(0..num_shards).map(|_| CachePadded::new(Injector::new())).collect();
 		let stealers: Vec<StealerSlot> =
-			(0..num_workers).map(|_| CachePadded::new(Mutex::new(None))).collect();
+			(0..num_workers).map(|_| CachePadded::new(ArcSwapOption::empty())).collect();
 		Self {
 			injectors: injectors.into_boxed_slice(),
 			stealers: stealers.into_boxed_slice(),
@@ -202,7 +205,7 @@ impl Queue {
 	pub(crate) fn register_worker(&self, idx: usize) -> WorkerContext {
 		let deque = Worker::new_fifo();
 		let stealer = deque.stealer();
-		*self.stealers[idx].lock() = Some(stealer);
+		self.stealers[idx].store(Some(Arc::new(stealer)));
 		WorkerContext {
 			idx,
 			deque,
@@ -341,14 +344,13 @@ impl Queue {
 			}
 		}
 
-		// 4. Other workers' deques, last resort. Cheap lock to
-		//    clone the `Stealer` (just clones an inner `Arc`)
-		//    so we don't hold the slot mutex across the steal.
+		// 4. Other workers' deques, last resort. Lock-free
+		//    `ArcSwapOption::load` returns an `Arc<Stealer>` we
+		//    can steal through without any per-slot mutex.
 		let num_workers = self.stealers.len();
 		for offset in 1..num_workers {
 			let victim = (ctx.idx + offset) % num_workers;
-			let stealer = self.stealers[victim].lock().clone();
-			if let Some(stealer) = stealer
+			if let Some(stealer) = self.stealers[victim].load_full()
 				&& let Some(r) = retry_steal(|| stealer.steal_batch_and_pop(&ctx.deque))
 			{
 				return Some(r);
