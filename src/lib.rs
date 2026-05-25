@@ -321,6 +321,7 @@ impl Drop for Threadpool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::pin::Pin;
 	use std::sync::mpsc;
 	use std::time::Duration;
 
@@ -330,15 +331,26 @@ mod tests {
 	/// `Threadpool::spawn` that takes the foreign-producer path
 	/// bumps it. A self-spawn from inside a worker closure should
 	/// NOT bump it.
+	///
+	/// Uses a 1-worker pool so the foreign-push branch hits the
+	/// `mask == 0` fast path and never calls `cpu::current_cpu()`
+	/// (`sched_getcpu` isn't supported under miri).
+	///
+	/// The inner `JoinHandle` is sent to the test thread via an
+	/// mpsc channel and awaited there, instead of `mem::forget`-ed
+	/// — keeps the test leak-free under miri while still letting
+	/// the inner closure run to completion on the worker.
 	#[tokio::test]
 	async fn self_spawn_does_not_increment_foreign_push_counter() {
-		let pool = Arc::new(Threadpool::new(4));
+		type InnerFuture = Pin<Box<dyn Future<Output = u32> + Send + 'static>>;
+
+		let pool = Arc::new(Threadpool::new(1));
 
 		// Drain any startup noise from constructing the pool.
 		pool.data.queue.foreign_pushes.store(0, Ordering::Relaxed);
 
 		let pool_clone = pool.clone();
-		let (tx, rx) = mpsc::channel();
+		let (handle_tx, handle_rx) = mpsc::channel::<InnerFuture>();
 
 		// The outer spawn is a foreign push (we're calling from
 		// the tokio runtime thread, not a worker). It bumps the
@@ -348,14 +360,19 @@ mod tests {
 			// self-spawn fast path should engage: this push goes
 			// directly into the worker's local deque, NOT through
 			// the foreign-producer path.
-			let inner = pool_clone.spawn(move || tx.send(()).unwrap());
-			std::mem::forget(inner);
+			let inner: InnerFuture = Box::pin(pool_clone.spawn(|| 42u32));
+			handle_tx.send(inner).unwrap();
 		})
 		.await;
 
-		// Wait for the inner closure to run on the worker (via
-		// the local deque, not via cross-worker steal).
-		rx.recv_timeout(Duration::from_secs(5)).expect("inner closure didn't run");
+		// Receive the inner future on the test thread and await
+		// it. The inner closure runs on the worker (via the local
+		// deque if the fast path engaged), and awaiting yields
+		// its return value.
+		let inner =
+			handle_rx.recv_timeout(Duration::from_secs(5)).expect("worker didn't send inner handle");
+		let v = inner.await;
+		assert_eq!(v, 42);
 
 		// Only the outer spawn should have hit the foreign-push
 		// path; the inner self-spawn must have taken the fast
