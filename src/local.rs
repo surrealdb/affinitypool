@@ -97,7 +97,6 @@ impl<R> Future for SpawnFuture<'_, R> {
 	type Output = R;
 
 	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		dbg!("called 3");
 		// Structural pinning: we never move out of `self.state` except
 		// to replace it whole, and the Task inside is moved only when
 		// it has just been constructed by `mem::replace` (i.e. is no
@@ -108,7 +107,6 @@ impl<R> Future for SpawnFuture<'_, R> {
 		// caller awaiting the future doesn't need a second poll just
 		// to register the waker.
 		if matches!(this.state, State::Pending { .. }) {
-			dbg!("called 4");
 			match mem::replace(&mut this.state, State::Done) {
 				State::Pending {
 					runnable,

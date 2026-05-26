@@ -10,11 +10,8 @@ impl<T: Future<Output = ()>> Future for PollAndLeak<T> {
 	type Output = ();
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		dbg!("CALLED");
 		let mut future = self.get_mut().0.take().unwrap();
-		dbg!("CALLED 2");
-		let res = dbg!(future.as_mut().poll(cx));
-		dbg!("CALLED 3");
+		let res = future.as_mut().poll(cx);
 		match res {
 			Poll::Ready(_) => Poll::Ready(()),
 			Poll::Pending => {

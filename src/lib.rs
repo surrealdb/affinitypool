@@ -55,7 +55,6 @@ where
 	F: Send + 'pool,
 	R: Send + 'pool,
 {
-	dbg!("called 7");
 	if let Some(threadpool) = THREADPOOL.get() {
 		threadpool.spawn_local(func).await
 	} else {
@@ -188,7 +187,6 @@ impl Threadpool {
 		F: Send + 'pool,
 		R: Send + 'pool,
 	{
-		dbg!("called 6");
 		let queue = self.data.queue.clone();
 		let schedule = move |runnable: Runnable| queue.push(runnable);
 		// Same `catch_unwind` wrapper rationale as `spawn` — keep
