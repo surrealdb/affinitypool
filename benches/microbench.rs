@@ -28,13 +28,29 @@
 //!   parked workers. (Name preserved for criterion history continuity —
 //!   the current implementation is shard-scanning, not work-stealing.)
 
-use affinitypool::{Builder, Threadpool};
+use affinitypool::Threadpool;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
+
+/// Build a one-worker-per-core pool. Pinned when the `pinning` feature is
+/// enabled; otherwise an equivalent worker-per-core pool without pinning,
+/// so this bench compiles and runs either way (use `--features pinning`
+/// to measure the actual pinned config).
+fn per_core_pool() -> Threadpool {
+	#[cfg(feature = "pinning")]
+	{
+		affinitypool::Builder::new().with_affinity_pinning(true).build()
+	}
+	#[cfg(not(feature = "pinning"))]
+	{
+		let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+		Threadpool::new(cores)
+	}
+}
 
 /// Submit `count` empty closures and await each. The closure does no work,
 /// so the timing is dominated by spawn/poll overhead.
@@ -303,9 +319,10 @@ fn bench_steal_imbalance(c: &mut Criterion) {
 	group.finish();
 }
 
-/// `thread_per_core` configuration, steady-state busy. Matches the
+/// One-worker-per-core configuration, steady-state busy. Matches the
 /// production deployment in `surrealdb` and gives us a fixed reference
-/// point that sweeps across the changes.
+/// point that sweeps across the changes. Pinned when built with
+/// `--features pinning` (see `per_core_pool`).
 fn bench_per_core_steady_state(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 	let mut group = c.benchmark_group("per_core_steady_state");
@@ -316,7 +333,7 @@ fn bench_per_core_steady_state(c: &mut Criterion) {
 	group.bench_function("per_core", |b| {
 		b.iter_custom(|iters| {
 			rt.block_on(async move {
-				let pool = Builder::new().thread_per_core(true).build();
+				let pool = per_core_pool();
 				let _ = pool.spawn(|| 0u32).await;
 				let mut total = Duration::ZERO;
 				let counter = Arc::new(AtomicUsize::new(0));

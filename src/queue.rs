@@ -345,7 +345,7 @@ impl Queue {
 		if self.mask == 0 {
 			self.injectors[0].push(runnable);
 		} else {
-			let preferred = cpu::current_cpu() & self.mask;
+			let preferred = cpu::current_shard_hint() & self.mask;
 			let target = SPILL.with(|s| {
 				let (last, count) = s.get();
 				let new_count = if last == preferred {

@@ -1,3 +1,4 @@
+#[cfg(feature = "pinning")]
 pub mod affinity;
 mod builder;
 mod cpu;
@@ -261,7 +262,10 @@ impl Threadpool {
 		let data_clone = data.clone();
 		// Spawn a new worker thread.
 		let handle = builder.spawn(move || {
-			// Assign this thread to a core.
+			// Assign this thread to a core (only when the `pinning`
+			// feature is enabled; otherwise `coreid` is always `None`
+			// and pinning is compiled out entirely).
+			#[cfg(feature = "pinning")]
 			if let Some(coreid) = coreid {
 				affinity::set_for_current(coreid.into());
 			}

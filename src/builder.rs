@@ -11,7 +11,10 @@ pub struct Builder {
 	num_threads: Option<usize>,
 	thread_name: Option<String>,
 	thread_stack_size: Option<usize>,
-	thread_per_core: bool,
+	/// One worker per core, each pinned to its core. Only settable via
+	/// [`Builder::with_affinity_pinning`] (the `pinning` feature); stays
+	/// `false` otherwise, so the default build never pins.
+	affinity_pinning: bool,
 }
 
 impl Builder {
@@ -27,7 +30,7 @@ impl Builder {
 			num_threads: None,
 			thread_name: None,
 			thread_stack_size: None,
-			thread_per_core: false,
+			affinity_pinning: false,
 		}
 	}
 
@@ -115,7 +118,15 @@ impl Builder {
 		self
 	}
 
-	/// Set whether a thread should be spawned per core.
+	/// Spawn one worker thread per CPU core and pin each worker to its
+	/// core. Requires the `pinning` crate feature.
+	///
+	/// Pinning is a best-effort hint: on platforms or hardware that do
+	/// not support thread affinity (e.g. Apple Silicon) the workers are
+	/// still spawned one-per-core but the pin is a no-op. Pinning helps
+	/// on bare-metal NUMA / latency-sensitive deployments; it is rarely
+	/// beneficial (and sometimes harmful) under containers or VMs where
+	/// "cores" are virtualised.
 	///
 	/// # Examples
 	///
@@ -123,7 +134,7 @@ impl Builder {
 	///
 	/// ```
 	/// let pool = affinitypool::Builder::new()
-	///     .thread_per_core(true)
+	///     .with_affinity_pinning(true)
 	///     .build();
 	///
 	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -134,8 +145,9 @@ impl Builder {
 	///     }
 	/// # });
 	/// ```
-	pub fn thread_per_core(mut self, enabled: bool) -> Builder {
-		self.thread_per_core = enabled;
+	#[cfg(feature = "pinning")]
+	pub fn with_affinity_pinning(mut self, enabled: bool) -> Builder {
+		self.affinity_pinning = enabled;
 		self
 	}
 
@@ -153,7 +165,7 @@ impl Builder {
 		// Calculate how many threads to spawn.
 		let threads = if let Some(num_threads) = self.num_threads {
 			num_threads.clamp(1, MAX_THREADS)
-		} else if self.thread_per_core {
+		} else if self.affinity_pinning {
 			num_cpus::get().clamp(1, MAX_THREADS)
 		} else {
 			2
@@ -168,7 +180,7 @@ impl Builder {
 			thread_handles: Mutex::new(Vec::new()),
 		});
 		// Spawn the desired number of workers.
-		if self.thread_per_core {
+		if self.affinity_pinning {
 			for index in 0..threads {
 				Threadpool::spin_up(Some(index), data.clone(), index);
 			}

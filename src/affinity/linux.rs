@@ -28,6 +28,13 @@ pub fn get_core_ids() -> Option<Vec<CoreId>> {
 }
 
 pub fn set_for_current(core_id: CoreId) -> bool {
+	// `CPU_SET` indexes `cpu_set_t::__bits[core_id.id / NBITS]`; an id at
+	// or beyond `CPU_SETSIZE` writes past the bitset (UB). Reject it up
+	// front rather than corrupt memory.
+	if core_id.id >= CPU_SETSIZE as usize {
+		return false;
+	}
+
 	// Turn `core_id` into a `libc::cpu_set_t` with only
 	// one core active.
 	let mut set = new_cpu_set();

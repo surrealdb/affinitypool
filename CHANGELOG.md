@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Added
+
+- **`pinning` cargo feature (opt-in CPU-core affinity).** All CPU
+  pinning code — the `affinity` module and the `libc`/`winapi`
+  platform FFI — now lives behind the `pinning` feature, which is off
+  by default. The default build carries no pinning `unsafe` code.
+
+### Changed
+
+- **`Builder::thread_per_core(bool)` → `Builder::with_affinity_pinning(bool)`**,
+  gated behind the `pinning` feature. (Breaking; pre-1.0.)
+- **Shard routing no longer queries the CPU.** Producers now pick a
+  shard from a cached hash of the thread ID instead of
+  `sched_getcpu()` / `GetCurrentProcessorNumber()`. This drops a
+  per-push syscall/vDSO call and removes `libc`/`winapi` from the
+  default (non-`pinning`) build, with no change to routing behaviour
+  (each producer still sticks to one shard). Also fixes routing under
+  miri, which does not support `sched_getcpu`.
+
+### Fixed
+
+- **Linux `affinity::set_for_current`** no longer calls `CPU_SET` with
+  an out-of-range core id (`>= CPU_SETSIZE`), which was undefined
+  behaviour; such ids are now rejected.
+- **macOS affinity** passed a `pthread_t` straight to
+  `thread_policy_set` (which wants a mach thread port), silently
+  failing on Intel, and matched a mislabeled `KERN_NOT_SUPPORTED`
+  constant (`0x10000003`, actually `MACH_SEND_INVALID_DEST` — the
+  symptom of that bogus port). Now routes through
+  `pthread_mach_thread_np` and matches the correct `KERN_NOT_SUPPORTED`
+  (46).
+
 ### Behavioural notes
 
 - **Worker self-spawn fast path.** When a closure running on a

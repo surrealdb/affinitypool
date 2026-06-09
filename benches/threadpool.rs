@@ -18,6 +18,22 @@ fn cpu_task(iterations: usize) -> usize {
 	sum
 }
 
+/// Build a one-worker-per-core pool. Pinned when the `pinning` feature is
+/// enabled; otherwise an equivalent worker-per-core pool without pinning,
+/// so these benches compile and run either way (use `--features pinning`
+/// to measure the actual pinned config).
+fn per_core_pool() -> Threadpool {
+	#[cfg(feature = "pinning")]
+	{
+		Builder::new().with_affinity_pinning(true).build()
+	}
+	#[cfg(not(feature = "pinning"))]
+	{
+		let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+		Threadpool::new(cores)
+	}
+}
+
 /// Benchmark basic threadpool operations with different worker counts
 fn bench_basic_operations(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
@@ -184,7 +200,7 @@ fn bench_per_core_contention(c: &mut Criterion) {
 						let mut total_duration = Duration::from_nanos(0);
 
 						for _iter in 0..iters {
-							let pool = Builder::new().thread_per_core(true).build();
+							let pool = per_core_pool();
 							let counter = Arc::new(AtomicUsize::new(0));
 							let start = Instant::now();
 
@@ -288,7 +304,7 @@ fn bench_throughput_comparison(c: &mut Criterion) {
 				let mut total_duration = Duration::from_nanos(0);
 
 				for _iter in 0..iters {
-					let pool = Builder::new().thread_per_core(true).build();
+					let pool = per_core_pool();
 					let start = Instant::now();
 
 					let mut handles = Vec::with_capacity(THROUGHPUT_TASKS);
@@ -349,7 +365,7 @@ fn bench_task_latency(c: &mut Criterion) {
 	let configs = vec![
 		("single_worker", 1, false),
 		("four_workers", 4, false),
-		("per_core_affinity", 0, true), // 0 will be ignored when thread_per_core is true
+		("per_core_affinity", 0, true), // worker count ignored; per_core_pool() decides
 	];
 
 	for (name, workers, per_core) in configs {
@@ -360,7 +376,7 @@ fn bench_task_latency(c: &mut Criterion) {
 
 					for _iter in 0..iters {
 						let pool = if per_core {
-							Builder::new().thread_per_core(true).build()
+							per_core_pool()
 						} else {
 							Threadpool::new(workers)
 						};

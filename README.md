@@ -66,7 +66,18 @@ async fn main() {
 
 ### CPU Affinity
 
-Pin each worker thread to a specific CPU core for optimal performance:
+Pin each worker thread to a specific CPU core. This requires the
+opt-in `pinning` feature (off by default, so the standard build pulls
+in no platform affinity FFI):
+
+```toml
+[dependencies]
+affinitypool = { version = "0.7", features = ["pinning"] }
+```
+
+Pinning helps on bare-metal NUMA / latency-sensitive deployments; it is
+rarely beneficial (and sometimes harmful) under containers or VMs where
+"cores" are virtualised.
 
 ```rust
 use affinitypool::Builder;
@@ -75,7 +86,7 @@ use affinitypool::Builder;
 async fn main() {
     // Create a pool with one thread per CPU core, each pinned to its respective core
     let pool = Builder::new()
-        .thread_per_core(true)
+        .with_affinity_pinning(true)
         .build();
     
     // Tasks will be distributed across CPU cores

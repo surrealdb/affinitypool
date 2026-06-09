@@ -2,7 +2,7 @@
 
 use std::mem;
 
-use libc::{c_int, c_uint, pthread_self};
+use libc::{c_int, c_uint, pthread_mach_thread_np, pthread_self};
 
 use super::CoreId;
 
@@ -22,7 +22,13 @@ type thread_policy_t = *mut thread_affinity_policy_data_t;
 
 const THREAD_AFFINITY_POLICY: thread_policy_flavor_t = 4;
 const KERN_SUCCESS: kern_return_t = 0;
-const KERN_NOT_SUPPORTED: kern_return_t = 268435459;
+// `KERN_NOT_SUPPORTED` from `mach/kern_return.h`. Apple Silicon returns
+// this for `THREAD_AFFINITY_POLICY` (no hardware affinity support). The
+// previous value (268435459 = 0x10000003) was actually
+// `MACH_SEND_INVALID_DEST` — the symptom of passing a bogus thread port
+// (`pthread_self()` cast straight to `thread_t`), now fixed by routing
+// through `pthread_mach_thread_np`.
+const KERN_NOT_SUPPORTED: kern_return_t = 46;
 
 unsafe extern "C" {
 	fn thread_policy_set(
@@ -52,9 +58,13 @@ pub fn set_for_current(core_id: CoreId) -> bool {
 		affinity_tag: core_id.id as integer_t,
 	};
 
+	// `thread_policy_set` expects a mach thread port, NOT a `pthread_t`.
+	// Convert via `pthread_mach_thread_np`; casting `pthread_self()`
+	// (an opaque pointer) straight to `thread_t` yields a bogus port and
+	// silently fails on Intel.
 	let res = unsafe {
 		thread_policy_set(
-			pthread_self() as thread_t,
+			pthread_mach_thread_np(pthread_self()) as thread_t,
 			THREAD_AFFINITY_POLICY,
 			&mut info as thread_policy_t,
 			thread_affinity_policy_count,

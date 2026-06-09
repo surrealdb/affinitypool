@@ -33,7 +33,10 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      - name: Run tests
+      - name: Run tests (default features)
+        run: cargo test --verbose
+
+      - name: Run tests (all features)
         run: cargo test --all-features --verbose
 
   format:
@@ -66,7 +69,10 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Run clippy
+      - name: Run clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   bench:
@@ -83,7 +89,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Check benchmarks compile
-        run: cargo bench --no-run
+        run: cargo bench --no-run --all-features
 
   # The 0.6.0 rewrite shrank the unsafe surface (task allocation and
   # waker synchronisation moved into `async-task`, which carries its
