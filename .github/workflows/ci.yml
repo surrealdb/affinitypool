@@ -151,3 +151,29 @@ jobs:
           RUSTFLAGS: "--cfg loom"
           LOOM_MAX_PREEMPTIONS: "3"
         run: cargo test --release --test loom_queue
+
+  # `tests/unsound.rs` is an executable demonstration of the
+  # `spawn_local` leak-unsoundness (see its module docs). It exercises
+  # undefined behaviour on purpose, so its result is not guaranteed:
+  # it usually "passes" because the freed stack slot still reads back as
+  # a valid integer, but it could fault on some toolchain/platform. We
+  # therefore RUN it (so the demonstration cannot silently rot or stop
+  # compiling) but mark the whole job `continue-on-error` so a failure
+  # never blocks CI. The test is `#[ignore]`d, so the normal `test` jobs
+  # skip it; this job runs it explicitly with `--ignored`.
+  unsound:
+    name: Unsoundness demo (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run the unsoundness demonstration (non-blocking)
+        run: cargo test --test unsound -- --ignored --nocapture

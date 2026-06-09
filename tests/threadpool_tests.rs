@@ -112,7 +112,9 @@ async fn test_spawn_local() {
 
 	// Test that spawn_local works with local borrowing
 	let data = [1, 2, 3, 4, 5];
-	let result = pool.spawn_local(|| data.iter().sum::<i32>()).await;
+	// SAFETY: the future is awaited immediately and never leaked, so the
+	// borrow of `data` cannot outlive it.
+	let result = unsafe { pool.spawn_local(|| data.iter().sum::<i32>()) }.await;
 
 	assert_eq!(result, 15);
 	// Verify we can still use data after spawn_local
@@ -680,13 +682,15 @@ async fn test_spawn_local_lifetime_safety() {
 	{
 		let local_data = [1, 2, 3, 4, 5];
 
-		let result = pool
-			.spawn_local(move || {
+		// SAFETY: awaited immediately; the future is never leaked.
+		let result = unsafe {
+			pool.spawn_local(move || {
 				// Access the local data - this is safe because spawn_local
 				// ensures the task completes before the future is dropped
 				local_data.iter().sum::<i32>()
 			})
-			.await;
+		}
+		.await;
 
 		assert_eq!(result, 15);
 	}
@@ -695,11 +699,14 @@ async fn test_spawn_local_lifetime_safety() {
 	let mut results = Vec::new();
 	for i in 0..5 {
 		let data = [i; 5];
+		// SAFETY: awaited immediately; the future is never leaked.
 		results.push(
-			pool.spawn_local(move || {
-				// Each closure captures different data
-				data.iter().sum::<i32>()
-			})
+			unsafe {
+				pool.spawn_local(move || {
+					// Each closure captures different data
+					data.iter().sum::<i32>()
+				})
+			}
 			.await,
 		);
 	}
@@ -711,16 +718,19 @@ async fn test_spawn_local_lifetime_safety() {
 		let vec_data = vec![1, 2, 3];
 		let tuple_data = (42, "test");
 
-		let result = pool
-			.spawn_local(move || format!("{} - {:?} - {:?}", string_data, vec_data, tuple_data))
-			.await;
+		// SAFETY: awaited immediately; the future is never leaked.
+		let result = unsafe {
+			pool.spawn_local(move || format!("{} - {:?} - {:?}", string_data, vec_data, tuple_data))
+		}
+		.await;
 
 		assert_eq!(result, "Hello, World! - [1, 2, 3] - (42, \"test\")");
 	}
 
 	// Test 4: Verify spawn_local can safely reference pool lifetime
 	let value = 100;
-	let result = pool.spawn_local(|| value * 2).await;
+	// SAFETY: awaited immediately; the future is never leaked.
+	let result = unsafe { pool.spawn_local(|| value * 2) }.await;
 	assert_eq!(result, 200);
 }
 
@@ -741,7 +751,9 @@ async fn test_spawn_local_no_nested_deadlock() {
 			// Create a SpawnFuture and immediately drop it
 			// This should NOT deadlock thanks to our detection
 			{
-				let _future = pool.spawn_local(|| 42);
+				// SAFETY: dropped at the end of this block, never leaked;
+				// the closure captures nothing borrowed in any case.
+				let _future = unsafe { pool.spawn_local(|| 42) };
 				// Future dropped here without awaiting
 			}
 
@@ -777,7 +789,8 @@ async fn test_spawn_local_single_worker_drop_without_poll() {
 					// With lazy scheduling the runnable is never
 					// queued, so Drop returns immediately.
 					let inner = pool.clone();
-					let _future = inner.spawn_local(|| 42);
+					// SAFETY: dropped without polling and never leaked.
+					let _future = unsafe { inner.spawn_local(|| 42) };
 					"ok"
 				})
 				.await
@@ -960,9 +973,15 @@ async fn test_forget_spawn_local_future_does_not_dangle() {
 	let pool = Threadpool::new(2);
 	let drops = Arc::new(AtomicUsize::new(0));
 	let tracker = DropTracker(drops.clone());
-	let mut fut = Box::pin(pool.spawn_local(move || {
-		let _t = tracker;
-	}));
+	// SAFETY: the closure captures `tracker` by move (owned, no borrow of
+	// non-`'static` data). Although this future is deliberately
+	// `mem::forget`-ed below, there are no borrows that could dangle —
+	// this exercises the leak-safety of the memory path, not a borrow.
+	let mut fut = Box::pin(unsafe {
+		pool.spawn_local(move || {
+			let _t = tracker;
+		})
+	});
 	// Poll once with a noop waker so the future transitions Init -> Running
 	// and pushes the task to the injector. After this point the worker owns
 	// an Arc to the shared data and will free the captured tracker when it
@@ -1018,6 +1037,7 @@ fn _spawn_send_bound_compile_check() {
 fn _spawn_local_send_bound_compile_check() {
 	fn assert_send<T: Send>(_: T) {}
 	let pool = Threadpool::new(1);
-	let fut = pool.spawn_local(|| 42u64);
+	// SAFETY: never leaked; the closure captures nothing. Compile-time check.
+	let fut = unsafe { pool.spawn_local(|| 42u64) };
 	assert_send(fut);
 }

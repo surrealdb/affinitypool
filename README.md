@@ -126,7 +126,9 @@ async fn process_data() {
 
 ### Local Spawning
 
-Use `spawn_local` when you need to borrow data without the 'static lifetime requirement:
+Use `spawn_local` when you need to borrow data without the `'static` lifetime requirement.
+
+`spawn_local` is **`unsafe`**: the closure may borrow non-`'static` data, and that borrow stays sound only as long as the returned future is *not leaked* (`mem::forget`, `Box::leak`, an `Rc`/`Arc` cycle, …) before the borrow ends. Awaiting it — or simply letting it drop — upholds the contract; leaking it while it borrows local data is a use-after-free. This cannot be enforced statically in async Rust, which is why the API is `unsafe` rather than safe; if your closure only captures `'static` data, prefer the safe `spawn`.
 
 ```rust
 use affinitypool::Threadpool;
@@ -138,12 +140,16 @@ async fn main() {
     let data = vec![1, 2, 3, 4, 5];
     let multiplier = 10;
     
-    // spawn_local allows borrowing local data
-    let result = pool.spawn_local(|| {
-        data.iter()
-            .map(|x| x * multiplier)
-            .collect::<Vec<_>>()
-    }).await;
+    // spawn_local allows borrowing local data.
+    // SAFETY: the future is awaited immediately and never leaked, so the
+    // borrows of `data`/`multiplier` cannot outlive it.
+    let result = unsafe {
+        pool.spawn_local(|| {
+            data.iter()
+                .map(|x| x * multiplier)
+                .collect::<Vec<_>>()
+        })
+    }.await;
     
     println!("Result: {result:?}");  // [10, 20, 30, 40, 50]
     

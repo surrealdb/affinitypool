@@ -232,7 +232,8 @@ fn bench_spawn_local_overhead(c: &mut Criterion) {
 				rt.block_on(async move {
 					let pool = Threadpool::new(4);
 					// Warm up.
-					pool.spawn_local(|| ()).await;
+					// SAFETY: awaited immediately; the future is never leaked.
+					unsafe { pool.spawn_local(|| ()) }.await;
 					let mut total = Duration::ZERO;
 					for _ in 0..iters {
 						let start = Instant::now();
@@ -241,7 +242,8 @@ fn bench_spawn_local_overhead(c: &mut Criterion) {
 						// collecting handles (the borrow would prevent
 						// stacking them in a Vec without boxing).
 						for _ in 0..count {
-							pool.spawn_local(|| black_box(())).await;
+							// SAFETY: awaited immediately; the future is never leaked.
+							unsafe { pool.spawn_local(|| black_box(())) }.await;
 						}
 						total += start.elapsed();
 					}

@@ -78,7 +78,8 @@ fn main() {
 		// lazy allocations should not be charged to the per-spawn delta.
 		for _ in 0..16 {
 			pool.spawn(|| ()).await;
-			pool.spawn_local(|| ()).await;
+			// SAFETY: awaited immediately; the future is never leaked.
+			unsafe { pool.spawn_local(|| ()) }.await;
 		}
 
 		report_spawn(&pool, "spawn(empty closure)", 1_000).await;
@@ -106,7 +107,8 @@ async fn report_spawn(pool: &Threadpool, label: &str, n: usize) {
 async fn report_spawn_local(pool: &Threadpool, label: &str, n: usize) {
 	let before = Snapshot::take();
 	for _ in 0..n {
-		let v = pool.spawn_local(|| black_box(0u32)).await;
+		// SAFETY: awaited immediately; the future is never leaked.
+		let v = unsafe { pool.spawn_local(|| black_box(0u32)) }.await;
 		black_box(v);
 	}
 	let after = Snapshot::take();

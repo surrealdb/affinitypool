@@ -49,14 +49,34 @@ where
 /// If no global threadpool has been created, then this function
 /// runs the provided closure immediately, without passing it to
 /// a blocking threadpool.
-pub async fn spawn_local<'pool, F, R>(func: F) -> R
+///
+/// # Safety
+///
+/// `func` may borrow non-`'static` data. Soundness relies on the future
+/// returned by this `async fn` being dropped (or driven to completion)
+/// before those borrows expire — its destructor blocks until the worker
+/// has stopped touching them. The caller must therefore **not leak that
+/// future** (via [`mem::forget`](std::mem::forget), `Box::leak`, an
+/// `Rc`/`Arc` cycle, or by embedding it in another future that is then
+/// leaked) while it still borrows non-`'static` data. Leaking it lets a
+/// worker read data after it has gone out of scope — a data race and a
+/// use-after-free.
+///
+/// This hazard cannot be designed away in async Rust; see
+/// [`Threadpool::spawn_local`] for the full rationale. If `func`
+/// captures only `'static` data, use the safe [`spawn`] instead.
+pub async unsafe fn spawn_local<'pool, F, R>(func: F) -> R
 where
 	F: FnOnce() -> R,
 	F: Send + 'pool,
 	R: Send + 'pool,
 {
 	if let Some(threadpool) = THREADPOOL.get() {
-		threadpool.spawn_local(func).await
+		// SAFETY: the no-leak obligation is forwarded to our own caller
+		// via this fn's `# Safety` contract — the future they must not
+		// leak is the one this `async fn` returns, which owns the inner
+		// `SpawnFuture` across the `.await`.
+		unsafe { threadpool.spawn_local(func) }.await
 	} else {
 		func()
 	}
@@ -158,8 +178,10 @@ impl Threadpool {
 	/// runnable to a worker, so the drop returns immediately. Once
 	/// polled, dropping the future cancels the task; if the worker is
 	/// currently running the closure, the dropping thread is parked
-	/// until the worker has finished, so closure borrows of `'pool`
-	/// data cannot dangle.
+	/// until the worker has finished, so that — *provided the future is
+	/// not leaked* — closure borrows of `'pool` data cannot dangle. See
+	/// [Safety](#safety) for the obligation that "provided" places on
+	/// the caller.
 	///
 	/// # Drop-blocking caveats
 	///
@@ -181,7 +203,30 @@ impl Threadpool {
 	///    `let _ = pool.spawn_local(|| …);` from inside its own
 	///    worker. Polling once and *then* dropping still queues and
 	///    cancels normally.
-	pub fn spawn_local<'pool, F, R>(&'pool self, func: F) -> SpawnFuture<'pool, R>
+	///
+	/// # Safety
+	///
+	/// The returned [`SpawnFuture`] may borrow non-`'static` data through
+	/// `func`. Its `Drop` impl is the *only* thing that guarantees the
+	/// worker has stopped touching those borrows before they expire — it
+	/// blocks on cancellation. The caller must therefore ensure that
+	/// destructor actually runs before the borrowed data goes out of
+	/// scope: the future must be dropped (or driven to completion) and
+	/// **must not be leaked** — not via [`mem::forget`](std::mem::forget),
+	/// `Box::leak`, `ManuallyDrop`, an `Rc`/`Arc` cycle, nor by being
+	/// embedded in another future that is itself leaked.
+	///
+	/// Leaking the future while it still borrows non-`'static` data lets
+	/// a worker read those borrows after they are gone — a data race and
+	/// a use-after-free. This obligation cannot be enforced statically in
+	/// async Rust (a future is a value that safe code may always leak),
+	/// which is why the function is `unsafe` rather than relying on the
+	/// destructor alone; `tests/unsound.rs` demonstrates the break. The
+	/// only fully safe alternative is a *synchronous* scoped API
+	/// (`std::thread::scope` / `rayon::scope`), which has no `.await`-able
+	/// equivalent. If every captured borrow is `'static`, prefer
+	/// [`spawn`](Self::spawn), which is safe.
+	pub unsafe fn spawn_local<'pool, F, R>(&'pool self, func: F) -> SpawnFuture<'pool, R>
 	where
 		F: FnOnce() -> R,
 		F: Send + 'pool,
@@ -192,14 +237,19 @@ impl Threadpool {
 		// Same `catch_unwind` wrapper rationale as `spawn` — keep
 		// panics off the worker thread, surface them on the awaiter.
 		// SAFETY: `async_task::Builder::spawn_unchecked` lifts the
-		// `'static` bound on the future. Soundness is preserved by:
+		// `'static` bound on the future. The erased lifetime is sound
+		// given:
 		//   1. `SpawnFuture<'pool, R>` carries the `'pool` borrow, so
 		//      the future cannot outlive the pool.
 		//   2. `SpawnFuture::drop` blocks (via `Task::cancel().await`)
-		//      until the runnable has stopped, so the closure's
-		//      `'pool` borrows are not accessed after they expire.
-		//   3. The same `mem::forget` caveat as the previous
-		//      implementation applies — see `local.rs` module docs.
+		//      until the runnable has stopped, so the closure's `'pool`
+		//      borrows are not accessed after they expire — *as long as
+		//      that destructor runs*.
+		//   3. A destructor is not guaranteed to run, so (2) cannot be
+		//      discharged here. That remaining obligation — do not leak
+		//      the future while it borrows non-`'static` data — is the
+		//      caller's, via this fn's `unsafe` contract (see `# Safety`
+		//      and the `local.rs` module docs).
 		let (runnable, task) = unsafe {
 			TaskBuilder::new().spawn_unchecked(
 				move |()| async move { std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) },
