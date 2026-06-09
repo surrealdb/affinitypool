@@ -14,15 +14,30 @@
 //! semantic of `Task::cancel().await`; we run it on a parker-based
 //! `block_on` because `Drop` is synchronous.
 //!
-//! # Leak amplification
+//! # Leak amplification and the `unsafe` contract
 //!
-//! `mem::forget`-ing a `SpawnFuture` keeps the underlying `Task` alive
-//! (its memory is leaked), but the runnable may still be in the pool
-//! queue. The current implementation does not statically prevent the
-//! borrow checker from accepting code that runs the closure after the
-//! borrowed data has gone out of scope. This is the same soundness
-//! profile as the previous implementation; closing it would require an
-//! API change (a scoped spawn like `std::thread::scope`).
+//! The drop-blocking contract above is only load-bearing if the
+//! destructor actually runs, and Rust never guarantees that. Safe code
+//! can `mem::forget` a `SpawnFuture` (or leak it via `Box::leak`, a
+//! `ManuallyDrop`, an `Rc`/`Arc` cycle, or a leaked enclosing future):
+//! its `Task` stays alive but the runnable may still be queued or
+//! running, and the closure can then read borrowed producer-stack data
+//! after it has gone out of scope. That is a use-after-free reachable
+//! from entirely safe code.
+//!
+//! This cannot be closed by an implementation change. A future is a
+//! value, leaking a value is always safe, so a destructor can never be
+//! a sound safety barrier in async code. The only leak-proof design is
+//! a *synchronous* scoped API (`std::thread::scope` / `rayon::scope`),
+//! where the join happens as the scope call returns — a barrier safe
+//! code cannot skip. There is no `.await`-able equivalent.
+//!
+//! Because the hazard is intrinsic, [`Threadpool::spawn_local`] and the
+//! free [`crate::spawn_local`] are `unsafe`: their `# Safety` contract
+//! requires the caller never to leak the returned future while it
+//! borrows non-`'static` data. Normal use (`.await`, or a plain drop)
+//! upholds it automatically; `tests/unsound.rs` is the one documented
+//! way it breaks.
 
 use async_task::{Runnable, Task};
 use std::any::Any;
@@ -71,6 +86,10 @@ enum State<R> {
 /// cancels the task; if the worker is currently running the closure,
 /// the dropping thread is parked until the worker has finished. See
 /// module docs.
+///
+/// Must **not** be leaked (e.g. via `mem::forget`) while it borrows
+/// non-`'static` data — that is the safety obligation of
+/// [`Threadpool::spawn_local`], the `unsafe` fn that produces it.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SpawnFuture<'pool, R> {
 	state: State<R>,

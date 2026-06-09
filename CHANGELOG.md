@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **`spawn_local` is now `unsafe`.** Both `Threadpool::spawn_local` and
+  the free `affinitypool::spawn_local` are marked `unsafe fn`. They
+  accept closures that borrow non-`'static` data, and their soundness
+  depends on the returned future's destructor running (it blocks until
+  the worker stops touching the borrows). Because safe code can skip a
+  destructor by leaking the future (`mem::forget`, `Box::leak`, an
+  `Rc`/`Arc` cycle, a leaked enclosing future), that obligation cannot
+  be guaranteed by the type system and is now the caller's
+  responsibility via an `# Safety` contract: **do not leak the returned
+  future while it borrows non-`'static` data.** This is the classic
+  leak-based unsoundness (the pre-1.0 `std::thread::scoped` hole); there
+  is no sound, fully safe `spawn_local` in async Rust — the only
+  leak-proof design is a synchronous scoped API, which has no
+  `.await`-able equivalent. Migration: wrap existing calls in `unsafe`;
+  the common `pool.spawn_local(..).await` (or dropping the future
+  normally) already upholds the contract. Closures that capture only
+  `'static` data should move to the safe `spawn`. See `tests/unsound.rs`
+  for a demonstration of the hazard.
+
 ### Behavioural notes
 
 - **Worker self-spawn fast path.** When a closure running on a
