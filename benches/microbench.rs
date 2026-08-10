@@ -138,7 +138,13 @@ fn bench_park_unpark_handshake(c: &mut Criterion) {
 	let mut group = c.benchmark_group("park_unpark_handshake");
 	group.measurement_time(Duration::from_secs(10));
 
-	for &workers in &[1usize, 4, 8] {
+	// Worker counts deliberately reach well past a typical machine's core
+	// count, up towards `MAX_THREADS`. One task per iteration makes this
+	// the cheapest probe of the *pre-park* path, whose cost per pass is
+	// linear in the worker count (a worker scans every peer's deque
+	// before it parks). Without a case up here, that scaling would be
+	// entirely untested — the rest of the suite stops at 8.
+	for &workers in &[1usize, 4, 8, 64, 256, 512] {
 		group.bench_with_input(BenchmarkId::new("workers", workers), &workers, |b, &workers| {
 			b.iter_custom(|iters| {
 				rt.block_on(async move {

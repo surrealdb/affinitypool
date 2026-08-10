@@ -2,6 +2,106 @@
 
 ## Unreleased
 
+### Performance
+
+- **Idle workers no longer thrash the queue.** An idle multi-worker
+  pool used to burn itself on the steal path: every worker walked
+  victims in the same order, hammered a contended
+  `steal_batch_and_pop` CAS, and spun in place on `Steal::Retry`.
+  Three changes — a per-worker random start offset for the
+  cross-shard and peer-steal walks, an `is_empty()` probe before each
+  steal on the unarmed scans (a shared load instead of a failed CAS),
+  and moving on to the next victim on `Retry` instead of spinning on
+  the contended one — turn that storm back into useful work. Adding
+  workers no longer makes the pool slower.
+- **Bounded spin before parking.** A worker now re-scans a few times
+  with `spin_loop` backoff and then a few more with `yield_now`
+  before it arms and parks, so a runnable already on its way is
+  picked up without a futex round-trip. The `yield_now` rounds matter
+  for oversubscribed pools, where a purely spinning worker starves
+  the producer it is waiting for.
+- **The pre-park scan no longer walks the whole pool.** A worker's
+  unarmed scans now inspect at most `CHEAP_SCAN_VICTIMS` injectors and
+  peers per pass, and read each peer's stealer slot with
+  `ArcSwapOption::load` rather than `load_full` — the latter clones the
+  `Arc`, and that refcount is a cache line every idle worker was
+  touching on every pass. The scan a worker performs immediately before
+  it parks is still exhaustive, because that sweep is what the
+  lost-wakeup proof rests on. Measured on the 64-thread box with each
+  side run twice (both stable to 2%): a submit-and-await round trip
+  costs 1.77x less at 64 workers, 1.58x at 256 and 1.43x at 512, and is
+  unchanged at or below 8 workers. Pools of that size were previously
+  untested — the suite stopped at 8 workers, so
+  `park_unpark_handshake` now runs up to `MAX_THREADS` to keep this
+  honest. Note the remaining growth with pool size (~50x from 8 to 512
+  workers) is that final exhaustive sweep and cannot be bounded without
+  giving up the proof.
+- **Faster producer spill.** `SPILL_THRESHOLD` drops from 32 to 8, so
+  a single producer fanning out spreads across shards sooner instead
+  of piling onto one while the other workers idle.
+
+Measured on an idle AMD Ryzen Threadripper 9970X (32 cores / 64 threads,
+one NUMA node), Ubuntu 24.04, kernel 6.8, full criterion sampling, all
+revisions benchmarked back-to-back at load average 0.00.
+
+**Read the multipliers as approximate.** A repeat run of identical code
+on that machine moved 8 of 30 workloads by more than 20%, and
+`per_core_steady_state` by 1.6x. Criterion's confidence intervals only
+describe sampling variance *within* one run; they say nothing about
+run-to-run reproducibility, and the two are far apart for anything
+involving several workers racing to steal. The effects below are 3-7x, an
+order of magnitude larger than that drift, so their direction and rough
+size are solid — their third significant figure is not.
+
+**24 of 27 microbenchmarks faster, 3 slower.**
+
+| workload | 0.7.0 + prior fixes | this release | approx |
+|---|---|---|---|
+| `steal_imbalance/8_workers` | 25 ms | 3.6 ms | ~7x |
+| `steady_state_busy/8_workers` | 98 ms | 18 ms | ~5x |
+| `spawn_overhead/4_workers/1` | 6.1 us | 1.1 us | ~5x |
+| `park_unpark_handshake/4_workers` | 5.8 us | 1.1 us | ~5x |
+| `spawn_overhead/1_worker/1` | 5.4 us | 1.2 us | ~4x |
+| `spawn_local_overhead/4_workers/1000` | 4.9 ms | 1.1 ms | ~4x |
+| `steady_state_busy/4_workers` | 18 ms | 4.5 ms | ~4x |
+| `steal_imbalance/2_workers` | 9.3 ms | 2.5 ms | ~4x |
+| `steal_imbalance/4_workers` | 11 ms | 3.3 ms | ~3x |
+| `multi_producer_contention/2p_4w` | 2.7 ms | 0.88 ms | ~3x |
+| `per_core_steady_state` (64 workers) | 203 ms | 74-142 ms | ~1.5-2.7x |
+| `multi_producer_contention/4p_1w` | 802 us | 999 us | ~0.8x |
+| `multi_producer_contention/2p_1w` | 436 us | 511 us | ~0.85x |
+| `multi_producer_contention/8p_1w` | 1.9 ms | 2.2 ms | ~0.85x |
+
+`per_core_steady_state` is given as a range because it is the least
+reproducible workload in the suite; the three regressions all share one
+shape, a single worker fed by several producers, where the worker is
+saturated and the pre-park backoff is delay before a park it was always
+going to take.
+
+Against `rayon::ThreadPool::spawn` on the same machine, affinitypool is
+ahead on 14 of 17 head-to-head workloads. The notable change is
+single-task latency: earlier releases lost to rayon by 4-6x on this
+platform (`round_trip/1` 4.4 us vs 0.94 us), and the pre-park backoff
+closes that to a statistical tie (1.07 us vs 0.94 us), with
+`spawn_overhead/1w/1` slightly ahead at 0.98 us vs 1.00 us. Those
+single-task rows are among the *most* reproducible in the suite, drifting
+under 7% between runs.
+
+One caveat worth stating: these gains assume spare CPU. On a
+CPU-contended host a spinning worker competes with the producer it is
+waiting for, and an earlier revision of this work measured the opposite
+sign on a loaded laptop. The backoff yields as well as spins to limit
+that, but a heavily oversubscribed deployment should measure rather than
+assume.
+
+### Added
+
+- **`Builder::shards(n)`** to override how many queue shards producers
+  distribute work across (default: one per worker, capped at 8). More
+  shards means less contention between concurrent producers but more
+  empty queues for an idle worker to scan. Rounded up to a power of
+  two and clamped to at most one shard per worker.
+
 ### Breaking changes
 
 - **`spawn_local` is now `unsafe`.** Both `Threadpool::spawn_local` and

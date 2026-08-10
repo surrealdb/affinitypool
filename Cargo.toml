@@ -1,6 +1,9 @@
 [package]
 name = "affinitypool"
 edition = "2024"
+# `let` chains in `Queue::push` / `Queue::scan` need 1.88 on edition
+# 2024; verified that 1.87 fails and 1.88 builds.
+rust-version = "1.88"
 version = "0.7.0"
 license = "MIT/Apache-2.0"
 readme = "README.md"
