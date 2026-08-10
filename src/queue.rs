@@ -161,6 +161,19 @@ const MAX_SHARDS: usize = 8;
 /// across shards before the other workers give up and park.
 const SPILL_THRESHOLD: u32 = 8;
 
+/// Victims a *cheap* scan pass inspects before giving up, per step.
+///
+/// The armed re-scan still visits every injector and every peer — that
+/// sweep is load-bearing for the lost-wakeup proof — but the unarmed and
+/// pre-park passes stop here, because their cost is paid on every wake
+/// and it grows with the pool. Unbounded, a single submit-and-await round
+/// trip on a 512-worker pool costs ~69 µs against ~2 µs at 8 workers,
+/// almost all of it spent walking idle peers. The per-worker random start
+/// rotates which victims each pass inspects, so a few passes still cover
+/// a wide spread, and anything missed is caught by the exhaustive scan
+/// the worker performs before it actually parks.
+const CHEAP_SCAN_VICTIMS: usize = 8;
+
 /// Re-scans performed with `spin_loop` backoff before a worker gives
 /// up its CPU. The point is to catch a runnable already on its way, not
 /// to poll — spinning is the cheapest way to win a submit-and-await
@@ -654,7 +667,7 @@ impl Queue {
 			if n > 1 {
 				let span = n - 1;
 				let start = next_rand(&ctx.rng) as usize % span;
-				for k in 0..span {
+				for k in 0..self.probe_limit(span, probe) {
 					let idx = (my_shard + 1 + (start + k) % span) & self.mask;
 					match self.steal_injector(idx, ctx, probe) {
 						Steal::Success(r) => return Some(r),
@@ -664,16 +677,25 @@ impl Queue {
 				}
 			}
 
-			// 4. Other workers' deques, last resort. Lock-free
-			//    `ArcSwapOption::load` returns an `Arc<Stealer>` we
-			//    can steal through without any per-slot mutex.
+			// 4. Other workers' deques, last resort. Lock-free: no
+			//    per-slot mutex.
+			//
+			//    `load()`, not `load_full()`. `load_full` clones the
+			//    `Arc`, and that refcount is a line every idle worker
+			//    would touch on every pass — the same convoy the
+			//    `is_empty` probe above exists to avoid, one level up.
+			//    `load()` hands back a guard instead and leaves the
+			//    refcount alone. The guard is held only across the
+			//    probe and one steal attempt, which is the short-lived
+			//    use `arc_swap` asks for.
 			let num_workers = self.stealers.len();
 			if num_workers > 1 {
 				let span = num_workers - 1;
 				let start = next_rand(&ctx.rng) as usize % span;
-				for k in 0..span {
+				for k in 0..self.probe_limit(span, probe) {
 					let victim = (ctx.idx + 1 + (start + k) % span) % num_workers;
-					let Some(stealer) = self.stealers[victim].load_full() else {
+					let slot = self.stealers[victim].load();
+					let Some(stealer) = slot.as_ref() else {
 						continue;
 					};
 					if matches!(probe, Probe::Cheap) && stealer.is_empty() {
@@ -690,6 +712,20 @@ impl Queue {
 			if !contended {
 				return None;
 			}
+		}
+	}
+
+	/// How many victims one scan step should walk out of `span`
+	/// available. `Probe::Strict` always walks all of them — the armed
+	/// re-scan has to observe every injector for the lost-wakeup proof
+	/// to hold. `Probe::Cheap` caps it at [`CHEAP_SCAN_VICTIMS`], since
+	/// those passes run on every wake and are pure overhead once the
+	/// pool is large.
+	#[inline]
+	fn probe_limit(&self, span: usize, probe: Probe) -> usize {
+		match probe {
+			Probe::Cheap => span.min(CHEAP_SCAN_VICTIMS),
+			Probe::Strict => span,
 		}
 	}
 
