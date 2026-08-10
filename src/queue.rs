@@ -297,21 +297,29 @@ impl Queue {
 		// Self-spawn fast path: if the calling thread is itself
 		// a worker for THIS queue (set via `enter_worker_scope`
 		// during worker startup), push directly into that
-		// worker's local deque and skip the Injector + fence +
-		// parked check entirely.
+		// worker's local deque, skipping the Injector and the
+		// shard routing.
 		//
-		// Producer and consumer are the same thread, so no
-		// cross-thread synchronisation is needed for visibility:
-		// the worker's next `pop_blocking` is sequenced-after
-		// this `push` in program order and will see the new
-		// runnable via `ctx.deque.pop()`.
+		// The spawning worker is *usually* also the consumer — it
+		// returns to `pop_blocking` and pops its own deque, which
+		// needs no cross-thread synchronisation. But it is not
+		// guaranteed to get there: a worker that polls a
+		// `SpawnFuture` and then drops it runs
+		// `SpawnFuture::drop` -> `block_on_cancel` ->
+		// `thread::park()`, which blocks until that very runnable
+		// has run or been dropped. The runnable is sitting in this
+		// worker's own deque, so the worker can no longer reach it
+		// and only a *peer steal* can make progress. If every peer
+		// is parked and we skip the wake, nothing ever wakes them:
+		// the pool deadlocks for as long as the blocked worker
+		// waits, which is forever.
 		//
-		// Side effect: any *other* workers currently parked stay
-		// parked. They'll wake on the next foreign push via the
-		// slow path below. For self-spawn cascades the work
-		// stays biased toward the spawning worker, but is still
-		// visible to peer stealers (the local deque is also a
-		// stealer target).
+		// So the local deque is published with the same fenced
+		// handshake the foreign path uses. The Dekker argument is
+		// unchanged in shape — it only needs the producer's queue
+		// access and the worker's steal to touch the same object —
+		// with `Worker::push` and `Stealer::steal_batch_and_pop`
+		// on this deque taking the place of the injector pair.
 		if let Some(handle) = CURRENT_WORKER.with(|w| w.get())
 			&& std::ptr::eq(handle.queue.as_ptr().cast_const(), self as *const Queue)
 		{
@@ -328,6 +336,22 @@ impl Queue {
 			// is sound.
 			unsafe {
 				handle.deque.as_ref().push(runnable);
+			}
+			// Same fence + parked check as the foreign path below.
+			// A `Relaxed` peek at `parked` would not do: without the
+			// fence, x86-TSO alone permits this store-then-load pair
+			// to be observed out of order, so we could read
+			// `parked == 0` while a peer that is about to sleep has
+			// already missed our push.
+			//
+			// A 1-worker pool has no peer to wake, so a worker that
+			// blocks on its own self-spawned runnable there still
+			// deadlocks; that is inherent, and documented on
+			// `Threadpool::spawn_local`.
+			fence(Ordering::SeqCst);
+			if self.parked.load(Ordering::Acquire) > 0 {
+				let _g = self.park.lock();
+				self.notify.notify_one();
 			}
 			return;
 		}

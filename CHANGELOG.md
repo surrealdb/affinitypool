@@ -44,20 +44,35 @@
   platform dependency, and it works under miri; per-producer shard
   stickiness is unchanged.
 
+### Fixed
+
+- **Deadlock when a worker blocked on its own self-spawned runnable.**
+  The self-spawn fast path (a `pool.spawn(..)` from inside a worker
+  closure, which pushes into that worker's own deque) issued no wake to
+  parked peers, on the reasoning that the spawning worker is also the
+  consumer. That reasoning does not hold: a worker that polls a
+  `SpawnFuture` and then drops it runs `block_on_cancel` ->
+  `thread::park()`, blocking until the runnable it just queued has
+  stopped. That runnable is in the blocked worker's own deque, so only
+  a peer steal can complete it — and with every peer parked and no
+  wake issued, nothing ever woke them. The pool hung indefinitely.
+  The self-spawn path now performs the same fenced wake handshake as a
+  foreign push (`fence(SeqCst)` then the `parked` check — a `Relaxed`
+  peek would be unsound, since x86-TSO alone lets the store-then-load
+  pair be observed out of order). A one-worker pool has no peer to
+  wake and still self-deadlocks on that pattern; that is inherent and
+  is now documented on `Threadpool::spawn_local`.
+
 ### Behavioural notes
 
 - **Worker self-spawn fast path.** When a closure running on a
   worker thread calls `pool.spawn(...)`, the new task is pushed
   directly into that worker's own local deque instead of routing
-  through the shared injector. The producer (this thread) is also
-  the consumer, so no cross-thread wake is issued — *other workers
-  currently parked stay parked*. This is intentional and almost
-  always what you want (it saves the wake roundtrip), but a
-  workload that fans out **only** via self-spawn cascades, with no
-  external producer to wake parked peers, will serialise on the
-  spawning worker until something else wakes them. The spawning
-  worker's local deque is still a stealer target, so peers that
-  wake on a later foreign push will recover the imbalance.
+  through the shared injector, so work stays biased toward the
+  spawning worker (good for locality) while remaining visible to peer
+  stealers. Unlike earlier releases it now also wakes a parked peer;
+  see the fix above for why that is required rather than merely
+  desirable.
 
 ## 0.6.0 — 2026-05-24 — async-task rewrite + sharded queue
 
