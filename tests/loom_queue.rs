@@ -199,6 +199,79 @@ fn push_to_remote_shard() {
 	});
 }
 
+/// Two workers, one item, then shutdown. Exactly one worker may take
+/// the item; the other must exit rather than hang.
+///
+/// The single-worker models above cannot catch a wake delivered to the
+/// wrong worker, because there is only one. Asserting *exactly one*
+/// winner here catches a lost item (nobody gets it) and a double-take
+/// (both do) in the same assertion, and loom fails the model outright
+/// if either worker cannot finish.
+#[test]
+fn one_push_two_workers_exactly_one_wins() {
+	loom::model(|| {
+		let q = Arc::new(Queue::new(2));
+		let producer = {
+			let q = q.clone();
+			thread::spawn(move || {
+				q.push(0);
+				// Let the loser exit instead of sleeping forever.
+				q.shutdown();
+			})
+		};
+		let w0 = {
+			let q = q.clone();
+			thread::spawn(move || q.pop_blocking(0))
+		};
+		let w1 = {
+			let q = q.clone();
+			thread::spawn(move || q.pop_blocking(1))
+		};
+		producer.join().unwrap();
+		let a = w0.join().unwrap();
+		let b = w1.join().unwrap();
+		assert_eq!(
+			a.iter().count() + b.iter().count(),
+			1,
+			"exactly one worker must take the single item"
+		);
+	});
+}
+
+/// Two items, two workers, and deliberately **no shutdown**: both
+/// workers must come back with an item.
+///
+/// Every worker that parks here has work waiting for it, so a wakeup
+/// that goes missing strands a worker with an item still queued and
+/// nothing left to wake it — loom's deadlock detection fires on the
+/// blocked thread. The absence of `shutdown()` is the point: a shutdown
+/// would rescue the stranded worker and hide exactly the class of bug
+/// this model exists to catch.
+#[test]
+fn two_pushes_two_workers_neither_is_stranded() {
+	loom::model(|| {
+		let q = Arc::new(Queue::new(2));
+		let producer = {
+			let q = q.clone();
+			thread::spawn(move || {
+				q.push(0);
+				q.push(1);
+			})
+		};
+		let w0 = {
+			let q = q.clone();
+			thread::spawn(move || q.pop_blocking(0))
+		};
+		let w1 = {
+			let q = q.clone();
+			thread::spawn(move || q.pop_blocking(1))
+		};
+		producer.join().unwrap();
+		assert_eq!(w0.join().unwrap(), Some(()));
+		assert_eq!(w1.join().unwrap(), Some(()));
+	});
+}
+
 /// `shutdown()` must wake a worker that is already parked (or
 /// about to park) on an empty queue. Without the `park.lock()` in
 /// `shutdown`, the broadcast can race a worker mid-arm and the
