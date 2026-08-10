@@ -12,6 +12,7 @@ pub struct Builder {
 	thread_name: Option<String>,
 	thread_stack_size: Option<usize>,
 	thread_per_core: bool,
+	shards: Option<usize>,
 }
 
 impl Builder {
@@ -28,6 +29,7 @@ impl Builder {
 			thread_name: None,
 			thread_stack_size: None,
 			thread_per_core: false,
+			shards: None,
 		}
 	}
 
@@ -142,6 +144,30 @@ impl Builder {
 		self
 	}
 
+	/// Set how many queue shards producers distribute work across.
+	///
+	/// Each producer thread sticks to one shard, so more shards means
+	/// less contention between concurrent producers but more empty
+	/// queues for an idle worker to scan. The default is one shard per
+	/// worker capped at 8, which suits most pools; raise it for a pool
+	/// fed by many concurrent producers on a high-core machine.
+	///
+	/// The value is rounded up to a power of two and clamped to at
+	/// most one shard per worker.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// let pool = affinitypool::Builder::new()
+	///     .worker_threads(32)
+	///     .shards(16)
+	///     .build();
+	/// ```
+	pub fn shards(mut self, shards: usize) -> Builder {
+		self.shards = Some(shards);
+		self
+	}
+
 	/// Finalize the [`Builder`] and build the [`Threadpool`].
 	///
 	/// # Examples
@@ -167,7 +193,7 @@ impl Builder {
 			stack_size: self.thread_stack_size,
 			num_threads: AtomicUsize::new(threads),
 			thread_count: AtomicUsize::new(0),
-			queue: Arc::new(Queue::new(threads)),
+			queue: Arc::new(Queue::new(threads, self.shards)),
 			thread_handles: Mutex::new(Vec::new()),
 		});
 		// Spawn the desired number of workers.

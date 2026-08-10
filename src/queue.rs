@@ -29,8 +29,22 @@
 //!   replaces a worker's slot when [`Sentry`] starts a fresh
 //!   thread.
 //!
-//! Pop order: own deque → preferred injector → other injectors,
-//! cyclic → other workers' stealers → park.
+//! Pop order: own deque → preferred injector → other injectors →
+//! other workers' stealers → bounded spin → park.
+//!
+//! The two cross-worker steps visit every victim exactly once but
+//! start at a per-worker random rotation, so idle workers don't
+//! convoy onto the same injector in lockstep. On the unarmed scans
+//! each victim is `is_empty()`-probed before the steal is attempted,
+//! turning an idle pool's repeated scanning into shared loads rather
+//! than a storm of contended CAS. A `Steal::Retry` moves on to the
+//! next victim instead of spinning on the contended one.
+//!
+//! Before parking, a worker re-scans a few times with `spin_loop`
+//! backoff ([`SPIN_ROUNDS`]) so a runnable already on its way is
+//! caught without a futex round-trip, then a few more with
+//! `yield_now` ([`YIELD_ROUNDS`]) so an oversubscribed pool hands the
+//! CPU back to the producer instead of spinning against it.
 //!
 //! ## Producer spill
 //!
@@ -103,7 +117,7 @@
 use arc_swap::ArcSwapOption;
 use async_task::Runnable;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use crossbeam_utils::CachePadded;
+use crossbeam_utils::{Backoff, CachePadded};
 use parking_lot::{Condvar, Mutex};
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -127,11 +141,26 @@ type StealerSlot = CachePadded<ArcSwapOption<Stealer<Runnable>>>;
 const MAX_SHARDS: usize = 8;
 
 /// Consecutive pushes to the same preferred shard before producer-
-/// side spill kicks in. Picked empirically: large enough that
-/// genuinely-affine producers (multi-producer benches) never trip
-/// it, small enough that a single-producer fan-out distributes
-/// across workers before they have time to park.
-const SPILL_THRESHOLD: u32 = 32;
+/// side spill kicks in. Multi-producer workloads rarely reach it
+/// (their pushes interleave, resetting the counter), while a
+/// single-producer fan-out trips it quickly so the work spreads
+/// across shards before the other workers give up and park.
+const SPILL_THRESHOLD: u32 = 8;
+
+/// Re-scans performed with `spin_loop` backoff before a worker gives
+/// up its CPU. Kept small: the point is to catch a runnable already
+/// on its way, not to poll. Pure spinning is the cheapest way to win
+/// a submit-and-await round trip, but it burns a core, so this phase
+/// stays sub-microsecond.
+const SPIN_ROUNDS: u32 = 3;
+
+/// Re-scans performed with `yield_now` between them, after
+/// [`SPIN_ROUNDS`] and before parking. These exist for the
+/// *oversubscribed* case: when workers outnumber free cores, an idle
+/// worker that only spins starves the very producer it is waiting
+/// for, so handing the CPU back beats both spinning and an immediate
+/// park. Kept small too — each yield is a syscall.
+const YIELD_ROUNDS: u32 = 4;
 
 thread_local! {
 	/// `(last_preferred_shard, consecutive_count)`. Reset when the
@@ -203,6 +232,38 @@ pub(crate) struct Queue {
 pub(crate) struct WorkerContext {
 	idx: usize,
 	deque: Worker<Runnable>,
+	/// xorshift32 state for randomising the *start offset* of the
+	/// cross-shard and peer-steal scans. Without it every idle worker
+	/// walks victims in the same order and they convoy onto the same
+	/// injector, turning an idle pool into a CAS storm on one cache
+	/// line. Seeded from `idx` (never zero — xorshift is absorbing at
+	/// zero) so a respawned worker re-derives the same stream, which
+	/// keeps runs reproducible. `Cell` is sound here because
+	/// `WorkerContext` is owned by, and only ever touched from, its
+	/// own worker thread — same justification as the `!Sync` deque.
+	rng: Cell<u32>,
+}
+
+/// How hard a [`Queue::scan`] pass should work to notice a runnable.
+/// See [`Queue::scan`] for why the armed re-scan must stay strict.
+#[derive(Clone, Copy)]
+enum Probe {
+	/// Skip a victim whose `is_empty()` says empty.
+	Cheap,
+	/// Always attempt the steal.
+	Strict,
+}
+
+/// Advance an xorshift32 and return the new state. Cheap enough
+/// (3 shifts, 3 xors) to run on every scan pass.
+#[inline]
+fn next_rand(rng: &Cell<u32>) -> u32 {
+	let mut x = rng.get();
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	rng.set(x);
+	x
 }
 
 /// RAII guard returned by [`Queue::enter_worker_scope`]. While
@@ -222,10 +283,18 @@ impl Drop for WorkerScope<'_> {
 }
 
 impl Queue {
-	pub(crate) fn new(num_workers: usize) -> Self {
+	/// Build a queue for `num_workers` workers. `shard_override`
+	/// replaces the default shard count (see [`MAX_SHARDS`]); it is
+	/// rounded up to a power of two — the routing is a bitmask — and
+	/// clamped to at least one and at most one shard per worker,
+	/// since shards beyond the worker count only add empty-scan cost.
+	pub(crate) fn new(num_workers: usize, shard_override: Option<usize>) -> Self {
 		// `MAX_THREADS = 512` clamps the caller side, so
 		// `next_power_of_two` cannot overflow here.
-		let num_shards = num_workers.next_power_of_two().clamp(1, MAX_SHARDS);
+		let num_shards = match shard_override {
+			Some(n) => n.max(1).next_power_of_two().clamp(1, num_workers.next_power_of_two()),
+			None => num_workers.next_power_of_two().clamp(1, MAX_SHARDS),
+		};
 		let injectors: Vec<CachePadded<Injector<Runnable>>> =
 			(0..num_shards).map(|_| CachePadded::new(Injector::new())).collect();
 		let stealers: Vec<StealerSlot> =
@@ -258,6 +327,9 @@ impl Queue {
 		WorkerContext {
 			idx,
 			deque,
+			// Mix the index so adjacent workers get unrelated streams,
+			// and force the low bit so the state is never zero.
+			rng: Cell::new((idx as u32).wrapping_mul(0x9E37_79B9) | 1),
 		}
 	}
 
@@ -422,7 +494,46 @@ impl Queue {
 			// Phase 1: lock-free scan. No park lock held, so
 			// producers can push concurrently without blocking
 			// on us.
-			if let Some(r) = self.scan(ctx) {
+			if let Some(r) = self.scan(ctx, Probe::Cheap) {
+				return Some(r);
+			}
+
+			// Phase 1b: bounded spin before committing to a park.
+			// Parking costs a futex round-trip on both sides, which
+			// dominates a submit-and-await round trip when the next
+			// runnable is only a moment away. A few cheap re-scans
+			// first let a worker that is about to be handed work skip
+			// the syscall entirely.
+			//
+			// Two sub-phases, because the right thing to do with an
+			// idle worker depends on whether the machine has a spare
+			// core for it:
+			//
+			// * [`SPIN_ROUNDS`] of `spin_loop` — cheapest way to catch
+			//   an imminent runnable when a core is free.
+			// * [`YIELD_ROUNDS`] of `yield_now` — when workers
+			//   outnumber cores, a spinning worker starves the
+			//   producer it is waiting for, so give the CPU back
+			//   before parking.
+			//
+			// Both are bounded and a worker that still finds nothing
+			// falls through to arm and park, so an idle pool still
+			// goes to sleep. Scans here are `Cheap` because they
+			// repeat.
+			let backoff = Backoff::new();
+			let mut spun = None;
+			for round in 0..SPIN_ROUNDS + YIELD_ROUNDS {
+				if round < SPIN_ROUNDS {
+					backoff.spin();
+				} else {
+					std::thread::yield_now();
+				}
+				if let Some(r) = self.scan(ctx, Probe::Cheap) {
+					spun = Some(r);
+					break;
+				}
+			}
+			if let Some(r) = spun {
 				return Some(r);
 			}
 
@@ -440,8 +551,10 @@ impl Queue {
 			// notify path. See module-level proof.
 			fence(Ordering::SeqCst);
 
-			// Re-scan under the arm.
-			if let Some(r) = self.scan(ctx) {
+			// Re-scan under the arm. `Strict`: this read is the
+			// worker's half of the Dekker pair, so it must be the
+			// same injector access the proof is written against.
+			if let Some(r) = self.scan(ctx, Probe::Strict) {
 				self.parked.fetch_sub(1, Ordering::Release);
 				return Some(r);
 			}
@@ -460,47 +573,108 @@ impl Queue {
 	/// One lock-free scan pass: own deque → preferred injector →
 	/// other injectors → other workers' stealers. Returns the
 	/// first runnable found, or `None` if everything is empty.
+	///
+	/// Victim order for the two cross-worker steps is rotated by a
+	/// per-worker RNG so concurrent idle workers don't convoy onto
+	/// the same injector. Every victim is still visited exactly once
+	/// per pass, so a non-empty queue cannot be skipped.
+	///
+	/// `probe` trades a strong guarantee for cheapness:
+	///
+	/// * `Probe::Cheap` tests `is_empty()` before each steal. An
+	///   empty victim then costs a shared load instead of a failed
+	///   CAS, which is what keeps an idle multi-worker pool from
+	///   melting a cache line. Used on the unarmed scans, where a
+	///   missed just-pushed runnable is harmless — the worker either
+	///   loops and scans again or proceeds to arm, and the armed
+	///   re-scan is strict.
+	/// * `Probe::Strict` always attempts the steal. Used for the
+	///   armed re-scan, where the read of each injector is
+	///   load-bearing for the lost-wakeup proof (see module docs):
+	///   the proof needs the worker's access to the injector to be
+	///   ordered against the producer's push, so we keep the same
+	///   operation the original proof was written against rather
+	///   than reason about `is_empty`'s weaker read.
 	#[inline]
-	fn scan(&self, ctx: &WorkerContext) -> Option<Runnable> {
-		// 1. Own deque — owner-only, lock-free, zero contention.
-		if let Some(r) = ctx.deque.pop() {
-			return Some(r);
-		}
-
-		let n = self.mask + 1;
-		let my_shard = ctx.idx & self.mask;
-
-		// 2. Preferred injector. `steal_batch_and_pop` migrates
-		//    a batch into our deque and returns one runnable;
-		//    subsequent pops in step 1 hit the local deque
-		//    without any cross-shard traffic.
-		if let Some(r) = retry_steal(|| self.injectors[my_shard].steal_batch_and_pop(&ctx.deque)) {
-			return Some(r);
-		}
-
-		// 3. Other injectors in cyclic order, starting from the
-		//    shard adjacent to our preferred one.
-		for offset in 1..n {
-			let idx = (my_shard + offset) & self.mask;
-			if let Some(r) = retry_steal(|| self.injectors[idx].steal_batch_and_pop(&ctx.deque)) {
+	fn scan(&self, ctx: &WorkerContext, probe: Probe) -> Option<Runnable> {
+		// A `Steal::Retry` means someone else's CAS beat ours, not
+		// that the victim is empty. Spinning on that victim just
+		// burns the contended cache line, so a retry moves on to the
+		// next victim and we re-walk only if the whole pass found
+		// nothing while at least one victim was contended. `Retry`
+		// implies concurrent activity, so this terminates.
+		loop {
+			// 1. Own deque — owner-only, lock-free, zero contention.
+			if let Some(r) = ctx.deque.pop() {
 				return Some(r);
 			}
-		}
 
-		// 4. Other workers' deques, last resort. Lock-free
-		//    `ArcSwapOption::load` returns an `Arc<Stealer>` we
-		//    can steal through without any per-slot mutex.
-		let num_workers = self.stealers.len();
-		for offset in 1..num_workers {
-			let victim = (ctx.idx + offset) % num_workers;
-			if let Some(stealer) = self.stealers[victim].load_full()
-				&& let Some(r) = retry_steal(|| stealer.steal_batch_and_pop(&ctx.deque))
-			{
-				return Some(r);
+			let mut contended = false;
+			let n = self.mask + 1;
+			let my_shard = ctx.idx & self.mask;
+
+			// 2. Preferred injector. `steal_batch_and_pop` migrates
+			//    a batch into our deque and returns one runnable;
+			//    subsequent pops in step 1 hit the local deque
+			//    without any cross-shard traffic.
+			match self.steal_injector(my_shard, ctx, probe) {
+				Steal::Success(r) => return Some(r),
+				Steal::Retry => contended = true,
+				Steal::Empty => {}
+			}
+
+			// 3. Other injectors, every one visited once, starting at
+			//    a random rotation.
+			if n > 1 {
+				let span = n - 1;
+				let start = next_rand(&ctx.rng) as usize % span;
+				for k in 0..span {
+					let idx = (my_shard + 1 + (start + k) % span) & self.mask;
+					match self.steal_injector(idx, ctx, probe) {
+						Steal::Success(r) => return Some(r),
+						Steal::Retry => contended = true,
+						Steal::Empty => {}
+					}
+				}
+			}
+
+			// 4. Other workers' deques, last resort. Lock-free
+			//    `ArcSwapOption::load` returns an `Arc<Stealer>` we
+			//    can steal through without any per-slot mutex.
+			let num_workers = self.stealers.len();
+			if num_workers > 1 {
+				let span = num_workers - 1;
+				let start = next_rand(&ctx.rng) as usize % span;
+				for k in 0..span {
+					let victim = (ctx.idx + 1 + (start + k) % span) % num_workers;
+					let Some(stealer) = self.stealers[victim].load_full() else {
+						continue;
+					};
+					if matches!(probe, Probe::Cheap) && stealer.is_empty() {
+						continue;
+					}
+					match stealer.steal_batch_and_pop(&ctx.deque) {
+						Steal::Success(r) => return Some(r),
+						Steal::Retry => contended = true,
+						Steal::Empty => {}
+					}
+				}
+			}
+
+			if !contended {
+				return None;
 			}
 		}
+	}
 
-		None
+	/// One steal attempt against injector `idx`, skipped entirely on
+	/// an apparently-empty injector when `probe` allows it.
+	#[inline]
+	fn steal_injector(&self, idx: usize, ctx: &WorkerContext, probe: Probe) -> Steal<Runnable> {
+		if matches!(probe, Probe::Cheap) && self.injectors[idx].is_empty() {
+			return Steal::Empty;
+		}
+		self.injectors[idx].steal_batch_and_pop(&ctx.deque)
 	}
 
 	/// Signal shutdown and wake every worker. Workers see the
@@ -512,18 +686,5 @@ impl Queue {
 		// wakeup to a worker mid-arm.
 		let _g = self.park.lock();
 		self.notify.notify_all();
-	}
-}
-
-/// `crossbeam_deque::Steal` returns `Retry` on transient CAS
-/// failure. Spin until `Success` or `Empty`.
-#[inline]
-fn retry_steal(mut f: impl FnMut() -> Steal<Runnable>) -> Option<Runnable> {
-	loop {
-		match f() {
-			Steal::Success(r) => return Some(r),
-			Steal::Empty => return None,
-			Steal::Retry => continue,
-		}
 	}
 }

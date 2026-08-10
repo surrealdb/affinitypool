@@ -102,7 +102,7 @@ impl Threadpool {
 			stack_size: None,
 			num_threads: AtomicUsize::new(workers),
 			thread_count: AtomicUsize::new(0),
-			queue: Arc::new(Queue::new(workers)),
+			queue: Arc::new(Queue::new(workers, None)),
 			thread_handles: Mutex::new(Vec::new()),
 		});
 		// Spawn the desired number of workers.

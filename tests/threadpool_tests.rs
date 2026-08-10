@@ -160,6 +160,47 @@ async fn test_builder_configuration() {
 	assert_eq!(result, 42);
 }
 
+/// `Builder::shards` is a routing hint, not a correctness knob: every
+/// task must still run exactly once whatever the shard count, including
+/// the degenerate single-shard case and an override larger than the
+/// worker count (which the builder clamps).
+#[tokio::test]
+async fn test_builder_shard_override() {
+	for (workers, shards) in [(4usize, 1usize), (4, 2), (4, 4), (2, 64), (1, 8), (8, 3)] {
+		let pool = Builder::new().worker_threads(workers).shards(shards).build();
+		let counter = Arc::new(AtomicUsize::new(0));
+
+		let mut handles = Vec::new();
+		for i in 0..200 {
+			let counter = counter.clone();
+			handles.push(pool.spawn(move || {
+				counter.fetch_add(1, Ordering::SeqCst);
+				i
+			}));
+		}
+		let mut results = Vec::new();
+		for h in handles {
+			results.push(h.await);
+		}
+
+		assert_eq!(
+			counter.load(Ordering::SeqCst),
+			200,
+			"workers={workers} shards={shards}: not every task ran exactly once"
+		);
+		results.sort();
+		assert_eq!(results, (0..200).collect::<Vec<_>>(), "workers={workers} shards={shards}");
+	}
+}
+
+/// A zero shard override must not panic or divide by zero; it clamps to
+/// a single shard.
+#[tokio::test]
+async fn test_builder_zero_shards_clamped() {
+	let pool = Builder::new().worker_threads(4).shards(0).build();
+	assert_eq!(pool.spawn(|| 7).await, 7);
+}
+
 #[tokio::test]
 async fn test_thread_naming() {
 	let pool = Builder::new().worker_threads(2).thread_name("test-worker").build();

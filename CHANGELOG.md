@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Performance
+
+- **Idle workers no longer thrash the queue.** An idle multi-worker
+  pool used to burn itself on the steal path: every worker walked
+  victims in the same order, hammered a contended
+  `steal_batch_and_pop` CAS, and spun in place on `Steal::Retry`.
+  Three changes — a per-worker random start offset for the
+  cross-shard and peer-steal walks, an `is_empty()` probe before each
+  steal on the unarmed scans (a shared load instead of a failed CAS),
+  and moving on to the next victim on `Retry` instead of spinning on
+  the contended one — turn that storm back into useful work. Measured
+  on an M2 Max (12 cores, `--quick`): `steal_imbalance/8_workers`
+  41.3 ms → 5.5 ms (7.4×), `steady_state_busy/8_workers`
+  114.9 ms → 17.4 ms (6.6×), `per_core_steady_state` 91.2 ms →
+  19.6 ms (4.7×). Adding workers no longer makes the pool slower.
+- **Bounded spin before parking.** A worker now re-scans a few times
+  with `spin_loop` backoff and then a few more with `yield_now`
+  before it arms and parks, so a runnable already on its way is
+  picked up without a futex round-trip. The `yield_now` rounds matter
+  for oversubscribed pools, where a purely spinning worker starves
+  the producer it is waiting for. Single-task latency:
+  `park_unpark_handshake/1_worker` 7.2 µs → 5.1 µs,
+  `spawn_overhead/4_workers/1` 8.1 µs → 5.5 µs.
+- **Faster producer spill.** `SPILL_THRESHOLD` drops from 32 to 8, so
+  a single producer fanning out spreads across shards sooner instead
+  of piling onto one while the other workers idle.
+- Net effect versus 0.7.0 on the microbenchmark suite: faster on 17 of
+  18 workloads, the exception being `steal_imbalance/2_workers`
+  (1.31 ms → 1.70 ms), where the pre-park backoff costs more than it
+  recovers. Numbers are from one machine and one OS; treat them as
+  directional.
+
+### Added
+
+- **`Builder::shards(n)`** to override how many queue shards producers
+  distribute work across (default: one per worker, capped at 8). More
+  shards means less contention between concurrent producers but more
+  empty queues for an idle worker to scan. Rounded up to a power of
+  two and clamped to at most one shard per worker.
+
 ### Breaking changes
 
 - **`spawn_local` is now `unsafe`.** Both `Threadpool::spawn_local` and
