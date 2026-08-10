@@ -115,11 +115,14 @@ impl Builder {
 		self
 	}
 
-	/// Set whether a thread should be spawned per core.
+	/// Spawn one worker thread per CPU core.
+	///
+	/// This sets the worker count to the number of available cores. It
+	/// does **not** pin threads to cores — worker placement is left to
+	/// the OS scheduler. (Earlier versions also pinned each worker via
+	/// platform affinity APIs; that was removed — see the changelog.)
 	///
 	/// # Examples
-	///
-	/// Each thread spawned will be linked to a separate core:
 	///
 	/// ```
 	/// let pool = affinitypool::Builder::new()
@@ -129,7 +132,7 @@ impl Builder {
 	/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 	///     for _ in 0..10 {
 	///         pool.spawn(|| {
-	///             println!("This is executed on individual cores!");
+	///             println!("Running on a one-worker-per-core pool!");
 	///         }).await;
 	///     }
 	/// # });
@@ -168,14 +171,8 @@ impl Builder {
 			thread_handles: Mutex::new(Vec::new()),
 		});
 		// Spawn the desired number of workers.
-		if self.thread_per_core {
-			for index in 0..threads {
-				Threadpool::spin_up(Some(index), data.clone(), index);
-			}
-		} else {
-			for index in 0..threads {
-				Threadpool::spin_up(None, data.clone(), index);
-			}
+		for index in 0..threads {
+			Threadpool::spin_up(data.clone(), index);
 		}
 		// Return the new threadpool.
 		Threadpool {

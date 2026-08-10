@@ -12,17 +12,15 @@ use std::sync::Weak;
 /// dead.
 pub(crate) struct Sentry {
 	active: bool,
-	coreid: Option<usize>,
 	index: usize,
 	data: Weak<Data>,
 }
 
 impl Sentry {
 	/// Create a new sentry tracker.
-	pub fn new(coreid: Option<usize>, index: usize, data: Weak<Data>) -> Sentry {
+	pub fn new(index: usize, data: Weak<Data>) -> Sentry {
 		Sentry {
 			data,
-			coreid,
 			index,
 			active: true,
 		}
@@ -44,7 +42,7 @@ impl Drop for Sentry {
 		// If this sentry was still active, the worker panicked without
 		// properly cancelling the sentry, so we start a replacement.
 		if self.active {
-			Threadpool::spin_up(self.coreid, data, self.index);
+			Threadpool::spin_up(data, self.index);
 		}
 	}
 }

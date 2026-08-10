@@ -2,7 +2,7 @@
 
 A threadpool for running blocking jobs on a dedicated thread pool. Blocking tasks can be sent asynchronously to the pool, where the task will be queued until a worker thread is free to process the task. Tasks are processed in a FIFO order.
 
-For optimised workloads, the affinity of each thread can be specified, ensuring that each thread can request to be pinned to a certain CPU core, allowing for more parallelism, and better performance guarantees for blocking workloads.
+Tasks are delivered through a sharded, lock-free queue. Each producer thread routes consistently to its own shard, so concurrent producers' traffic stays isolated and contention stays low, while idle workers steal across shards to stay busy.
 
 ## Examples
 
@@ -64,25 +64,24 @@ async fn main() {
 }
 ```
 
-### CPU Affinity
+### Thread per core
 
-Pin each worker thread to a specific CPU core for optimal performance:
+Spawn one worker thread per CPU core. This sets the worker count to the number of available cores; thread placement is left to the OS scheduler (workers are not pinned):
 
 ```rust
 use affinitypool::Builder;
 
 #[tokio::main]
 async fn main() {
-    // Create a pool with one thread per CPU core, each pinned to its respective core
+    // Create a pool with one worker thread per CPU core
     let pool = Builder::new()
         .thread_per_core(true)
         .build();
-    
-    // Tasks will be distributed across CPU cores
+
+    // Tasks are distributed across the worker threads
     for i in 0..100 {
         pool.spawn(move || {
-            println!("Task {i} running on dedicated CPU core");
-            // Perform CPU-intensive work with better cache locality
+            println!("Task {i} running on a per-core worker pool");
         }).await;
     }
 }
@@ -234,13 +233,13 @@ Three workloads run against each pool: `spawn_overhead` (submit N closures, awai
 * **vs `rayon::ThreadPool::spawn`** — Rayon's lock-free deques win single-task latency (3–6×) and most `4w` batched workloads. affinitypool wins on `multi_producer/8p_4w` and ties or wins most `1w` workloads. Rayon is built for work-stealing CPU parallelism, not async producer / worker handoff.
 * **vs `threadpool::ThreadPool::execute`** — the original. Parity on `1w` workloads, threadpool wins big (4–5×) on `4w` batched spawn (no sharding overhead), affinitypool wins on `multi_producer/8p_4w` and `2p_1w`.
 
-The pattern: affinitypool loses to the single-queue and work-stealing alternatives on `4w/N` batched-spawn workloads where one producer fans out fast and pays for crossing shards. It wins where shard locality pays back — `1w` (no scan cost), and multi-producer workloads where each producer naturally lands on a different shard via the CPU cache.
+The pattern: affinitypool loses to the single-queue and work-stealing alternatives on `4w/N` batched-spawn workloads where one producer fans out fast and pays for crossing shards. It wins where shard locality pays back — `1w` (no scan cost), and multi-producer workloads where each producer lands on its own shard via its thread-ID hash.
 
-Unlike any of these alternatives, affinitypool gives you a dedicated pool sized for blocking work and preserves **CPU affinity** — the feature this library exists for.
+Unlike a single shared queue, affinitypool gives you a dedicated pool sized for blocking work with **per-producer shard affinity** — concurrent producers stay isolated on their own shards, which is where it wins.
 
 ## Architecture
 
-Tasks are delivered from producers to workers through a sharded MPMC queue. Each producer routes to a shard via a thread-local cache of its current CPU (`sched_getcpu()` on Linux, `GetCurrentProcessorNumber()` on Windows), so a producer running on core *N* consistently lands on shard `N & mask`. Each worker has a preferred shard (`worker_idx & mask`) and falls back to scanning the remaining shards in cyclic order before parking — there are no private deques and no work-stealing handshake.
+Tasks are delivered from producers to workers through a sharded MPMC queue. Each producer routes to a shard via a cached hash of its thread ID, so a given producer consistently lands on the same shard (`hash & mask`). Each worker has a preferred shard (`worker_idx & mask`) and falls back to scanning the remaining shards in cyclic order before parking.
 
 ```text
 Producers (any async task)
@@ -258,7 +257,7 @@ Sharded queue  (num_workers.next_power_of_two().min(8))
    +----------------+   +----------------+   +----------------+
            |                    |                    |
            v                    v                    v
-Worker threads (optionally pinned)
+Worker threads
    +----------------+   +----------------+   +----------------+
    |    worker 0    |   |    worker 1    |   |    worker k    |
    |  pref: shard 0 |   |  pref: shard 1 |   |  pref: shard k |
@@ -283,4 +282,4 @@ Shard count rules of thumb:
 
 #### Original
 
-This code is heavily inspired by [threadpool](https://crates.io/crates/threadpool), with the CPU-based affinity code forked originally from [core-affinity](https://crates.io/crates/core_affinity). Both are licensed under the Apache License 2.0 and MIT licenses.
+This code is heavily inspired by [threadpool](https://crates.io/crates/threadpool), licensed under the Apache License 2.0 and MIT licenses. Earlier versions also included CPU-core-pinning code forked from [core-affinity](https://crates.io/crates/core_affinity); that code has since been removed.
