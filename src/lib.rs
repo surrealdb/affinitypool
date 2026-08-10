@@ -202,6 +202,15 @@ impl Threadpool {
 	///    `let _ = pool.spawn_local(|| …);` from inside its own
 	///    worker. Polling once and *then* dropping still queues and
 	///    cancels normally.
+	/// 3. **A one-worker pool cannot cancel its own work.** Polling a
+	///    `SpawnFuture` and then dropping it *from inside the pool's
+	///    only worker* deadlocks that worker: the poll queues the
+	///    runnable onto the worker's own deque, and the drop then
+	///    blocks waiting for that runnable to stop, which only this
+	///    worker (or a peer, of which there are none) could make
+	///    happen. On a pool with two or more workers the queued
+	///    runnable is stolen by a peer — the self-spawn path wakes one
+	///    — and the drop completes.
 	///
 	/// # Safety
 	///

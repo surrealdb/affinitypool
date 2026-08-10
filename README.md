@@ -278,7 +278,9 @@ Shard count rules of thumb:
 
 ### Behaviour notes
 
-**Worker self-spawn fast path.** When a closure running on a worker thread calls `pool.spawn(...)`, the new task is pushed directly into that worker's own local deque instead of routing through the shared sharded queue. The producer (this thread) is also the consumer, so no cross-thread wake is issued — *other workers currently parked stay parked*. This is intentional and saves a wake roundtrip, but a workload that fans out **only** via self-spawn cascades with no external producer to wake parked peers will serialise on the spawning worker until something else wakes them. The spawning worker's local deque is still a stealer target, so peers that wake on a later foreign push will recover the imbalance.
+**Worker self-spawn fast path.** When a closure running on a worker thread calls `pool.spawn(...)`, the new task is pushed directly into that worker's own local deque instead of routing through the shared sharded queue, skipping the shard routing. The spawning worker is usually also the consumer — it returns to its pop loop and drains its own deque — so the work stays biased toward that worker, which is what you want for cache locality.
+
+It still issues the same wake handshake a foreign push does, because the spawning worker is *not guaranteed* to reach its pop loop: a worker that polls a `SpawnFuture` and then drops it blocks in the drop, waiting for the very runnable it just queued. That runnable is in the blocked worker's own deque, so only a peer steal can complete it — the spawning worker's deque is a stealer target. Skipping the wake there let the pool hang until the blocked worker gave up, which is forever. On a one-worker pool there is no peer to wake, so that pattern self-deadlocks regardless; see the `Threadpool::spawn_local` docs.
 
 #### Original
 
