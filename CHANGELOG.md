@@ -53,7 +53,7 @@ involving several workers racing to steal. The effects below are 3-7x, an
 order of magnitude larger than that drift, so their direction and rough
 size are solid — their third significant figure is not.
 
-**24 of 27 microbenchmarks faster, 3 slower.**
+**24 of 27 microbenchmarks faster; no regression survived re-measurement.**
 
 | workload | 0.7.0 + prior fixes | this release | approx |
 |---|---|---|---|
@@ -66,17 +66,21 @@ size are solid — their third significant figure is not.
 | `steady_state_busy/4_workers` | 18 ms | 4.5 ms | ~4x |
 | `steal_imbalance/2_workers` | 9.3 ms | 2.5 ms | ~4x |
 | `steal_imbalance/4_workers` | 11 ms | 3.3 ms | ~3x |
-| `multi_producer_contention/2p_4w` | 2.7 ms | 0.88 ms | ~3x |
 | `per_core_steady_state` (64 workers) | 203 ms | 74-142 ms | ~1.5-2.7x |
-| `multi_producer_contention/4p_1w` | 802 us | 999 us | ~0.8x |
-| `multi_producer_contention/2p_1w` | 436 us | 511 us | ~0.85x |
-| `multi_producer_contention/8p_1w` | 1.9 ms | 2.2 ms | ~0.85x |
+| `multi_producer_contention/2p_4w` | 1.26 ms | 466 us | ~2.7x |
+| `multi_producer_contention/4p_4w` | 1.44 ms | 545 us | ~2.6x |
 
 `per_core_steady_state` is given as a range because it is the least
-reproducible workload in the suite; the three regressions all share one
-shape, a single worker fed by several producers, where the worker is
-saturated and the pre-park backoff is delay before a park it was always
-going to take.
+reproducible workload in the suite.
+
+An earlier draft of this entry reported three regressions, all of the shape
+"one worker fed by several producers", at 0.80-0.85x. They were each a
+single measurement on the noisiest rows in the suite. Re-measured with the
+`multi_producer_contention` group fixed (it had been rebuilding the pool
+every iteration) and five interleaved repetitions per side, all three are
+indistinguishable from run-to-run spread: 1.01x, 0.96x, and 0.83x against
+per-side spreads of up to 1.34x. The same group's four-worker rows are
+1.4-2.7x faster. No regression in this suite survived proper measurement.
 
 Against `rayon::ThreadPool::spawn` on the same machine, affinitypool is
 ahead on 14 of 17 head-to-head workloads. The notable change is

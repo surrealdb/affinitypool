@@ -191,9 +191,18 @@ fn bench_multi_producer_contention(c: &mut Criterion) {
 					b.iter_custom(|iters| {
 						let rt = &rt;
 						rt.block_on(async move {
+							// Build and warm the pool ONCE, outside the loop,
+							// as every other bench here does. Creating a fresh
+							// pool per iteration spawned `workers` threads each
+							// time and left them cold, so each timed region
+							// included their start-up and first park. That made
+							// this the noisiest group in the suite — identical
+							// code drifted up to 1.4x between runs, which is
+							// wider than most of the effects being measured.
+							let pool = Arc::new(Threadpool::new(workers));
+							let _ = pool.spawn(|| 0u32).await;
 							let mut total_dur = Duration::ZERO;
 							for _ in 0..iters {
-								let pool = Arc::new(Threadpool::new(workers));
 								let start = Instant::now();
 								let mut producer_handles = Vec::with_capacity(producers);
 								for _ in 0..producers {
