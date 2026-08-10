@@ -24,45 +24,18 @@
   a single producer fanning out spreads across shards sooner instead
   of piling onto one while the other workers idle.
 
-Measured against 0.7.0 on one M2 Max (8P+4E), macOS, criterion
-`--quick`, both revisions benchmarked back-to-back in one session.
-**Read these with the noise floor in mind:** rayon's numbers are
-included in the same runs as an unchanged control, and they varied by a
-median of 14.5% (max 32.6%) between runs, so a delta under ~15% here is
-not a signal.
-
-| workload | 0.7.0 | now | |
-|---|---|---|---|
-| `steady_state_busy/8_workers` | 105.8 ms | 16.0 ms | 6.6× |
-| `steal_imbalance/8_workers` | 31.9 ms | 5.0 ms | 6.3× |
-| `per_core_steady_state` | 78.8 ms | 18.6 ms | 4.25× |
-| `multi_producer_contention/4p_4w` | 1.56 ms | 0.89 ms | 1.75× |
-| `multi_producer_contention/2p_4w` | 1.01 ms | 0.58 ms | 1.75× |
-| `steal_imbalance/4_workers` | 5.81 ms | 3.54 ms | 1.64× |
-| `spawn_overhead/4_workers/10000` | 5.29 ms | 3.64 ms | 1.45× |
-| `spawn_overhead/4_workers/100` | 47.2 µs | 32.8 µs | 1.44× |
-| `multi_producer_contention/8p_4w` | 2.26 ms | 1.57 ms | 1.44× |
-| `spawn_overhead/4_workers/1000` | 462 µs | 322 µs | 1.43× |
-| `steady_state_busy/4_workers` | 8.05 ms | 5.88 ms | 1.37× |
-| `steal_imbalance/2_workers` | 894 µs | 1.49 ms | **0.60×** |
-| `park_unpark_handshake/8_workers` | 5.17 µs | 6.27 µs | **0.82×** |
-
-Every gain is at four workers or more; the single- and two-worker
-workloads land inside the noise band or slightly worse. So this is a
-**multi-worker scaling fix, not a single-task latency improvement** —
-`park_unpark_handshake` and the 1-worker `spawn_overhead` rows are flat
-within noise. The two real regressions are `steal_imbalance/2_workers`
-(67% slower) and `park_unpark_handshake/8_workers` (21% slower), where
-the pre-park backoff costs more than it recovers.
-
-Against rayon on the same machine and runs, affinitypool is now ahead on
-15 of 17 head-to-head workloads (`round_trip/8` 5.6 µs vs 13.8 µs;
-`round_trip/4` 5.2 µs vs 8.5 µs). rayon still leads the two
-single-task/one-worker cases (`round_trip/1` 5.05 µs vs 4.08 µs;
-`spawn_overhead/1w/1` 4.91 µs vs 3.54 µs). Note the "rayon wins
-single-task latency by 3–6×" table in the README was produced on Linux
-and does not reproduce here — treat all of this as directional for
-another OS.
+**No performance figures are quoted here yet.** The changes above are
+motivated by a real, reproducible pathology — before them, a pool got
+*slower* when given more workers for identical work — but every
+measurement taken so far came from a developer laptop that was not
+quiet (load average ~7.6 on 12 cores, a browser holding ~1.5 of them).
+These benchmarks are unusually sensitive to exactly that: the mechanism
+being changed *is* the competition between idle workers and the producer
+for CPU, so background load moves the multi-worker rows by up to 7x
+between runs of identical code. Numbers taken under those conditions
+would be misleading whichever direction they pointed, so they have been
+left out until the suite can be run on an idle machine — ideally the
+Linux target this pool is deployed on.
 
 ### Added
 

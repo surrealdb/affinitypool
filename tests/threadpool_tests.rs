@@ -193,12 +193,17 @@ async fn test_builder_shard_override() {
 	}
 }
 
-/// A zero shard override must not panic or divide by zero; it clamps to
-/// a single shard.
+/// The shard override is arbitrary caller input, so both ends of the
+/// range must be clamped rather than trusted. Zero must not divide by
+/// zero, and a huge value must not overflow the power-of-two rounding —
+/// `usize::MAX.next_power_of_two()` panics on a debug build, so the
+/// clamp has to happen first.
 #[tokio::test]
-async fn test_builder_zero_shards_clamped() {
-	let pool = Builder::new().worker_threads(4).shards(0).build();
-	assert_eq!(pool.spawn(|| 7).await, 7);
+async fn test_builder_extreme_shards_clamped() {
+	for shards in [0usize, 1, usize::MAX, usize::MAX - 1, 1 << 63, (1 << 63) + 1] {
+		let pool = Builder::new().worker_threads(4).shards(shards).build();
+		assert_eq!(pool.spawn(|| 7).await, 7, "shards={shards}");
+	}
 }
 
 #[tokio::test]

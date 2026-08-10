@@ -10,10 +10,11 @@
 //! * **Sharded injectors.** Up to [`MAX_SHARDS`] lock-free MPMC
 //!   `Injector<Runnable>`s. Producers pick a shard via a cached hash
 //!   of their thread ID (see [`crate::cpu`]) — a given producer
-//!   consistently lands on the same shard. Number of
-//!   shards is `num_workers.next_power_of_two().min(MAX_SHARDS)` so
-//!   the routing is a bitmask and a single-worker pool degenerates to
-//!   one shard with no scan cost.
+//!   consistently lands on the same shard. The count defaults to
+//!   `num_workers.next_power_of_two().min(MAX_SHARDS)` and can be
+//!   overridden per pool by [`crate::Builder::shards`]; it is always a
+//!   power of two so the routing is a bitmask, and a single-worker pool
+//!   degenerates to one shard with no scan cost.
 //! * **Per-worker deques.** Each worker owns one
 //!   `crossbeam_deque::Worker<Runnable>`. The owner thread is the
 //!   only producer to its own deque; pop/push from the owner is
@@ -44,7 +45,17 @@
 //! backoff ([`SPIN_ROUNDS`]) so a runnable already on its way is
 //! caught without a futex round-trip, then a few more with
 //! `yield_now` ([`YIELD_ROUNDS`]) so an oversubscribed pool hands the
-//! CPU back to the producer instead of spinning against it.
+//! CPU back to the producer instead of spinning against it. It is
+//! skipped entirely below [`MIN_WORKERS_FOR_PREPARK`] workers, where
+//! there is no contention to amortise and delaying the park is pure
+//! latency.
+//!
+//! How much this phase contributes relative to the scan-path changes
+//! above is **not yet established**: the only measurements available
+//! were taken on a machine with heavy background load, which moves
+//! these particular workloads by several-fold between runs of identical
+//! code. Do not re-tune the constants below against numbers from a busy
+//! machine.
 //!
 //! ## Producer spill
 //!
@@ -134,10 +145,11 @@ use crate::cpu;
 /// on separate cache lines and avoid false sharing during scans.
 type StealerSlot = CachePadded<ArcSwapOption<Stealer<Runnable>>>;
 
-/// Hard cap on the shard count. Picked empirically: 8 saturates
+/// Default cap on the shard count, overridable per pool via
+/// [`crate::Builder::shards`]. Picked empirically: 8 saturates
 /// producer-side distribution on common topologies (≤8-core boxes
 /// map one shard per core, 32-core boxes share 4 cores per shard)
-/// while keeping the worst-case empty scan at 8 cheap CAS attempts.
+/// while keeping the worst-case empty scan at 8 cheap loads.
 const MAX_SHARDS: usize = 8;
 
 /// Consecutive pushes to the same preferred shard before producer-
@@ -147,12 +159,29 @@ const MAX_SHARDS: usize = 8;
 /// across shards before the other workers give up and park.
 const SPILL_THRESHOLD: u32 = 8;
 
+/// Pools with fewer than this many workers skip the pre-park backoff
+/// entirely and park as soon as a scan comes up empty.
+///
+/// The backoff earns its cost by avoiding futex round-trips and by
+/// handing the CPU back to a producer that other workers are competing
+/// with — both of which scale with the number of workers. On a one- or
+/// two-worker pool there is almost no such contention to amortise, so
+/// the delay before parking is close to pure added latency, which is
+/// why those pools opt out.
+const MIN_WORKERS_FOR_PREPARK: usize = 3;
+
 /// Re-scans performed with `spin_loop` backoff before a worker gives
-/// up its CPU. Kept small: the point is to catch a runnable already
-/// on its way, not to poll. Pure spinning is the cheapest way to win
-/// a submit-and-await round trip, but it burns a core, so this phase
-/// stays sub-microsecond.
-const SPIN_ROUNDS: u32 = 3;
+/// up its CPU. The point is to catch a runnable already on its way, not
+/// to poll — spinning is the cheapest way to win a submit-and-await
+/// round trip, but it burns a core.
+///
+/// Six matches `crossbeam_utils::Backoff`'s own spin/yield boundary
+/// (`SPIN_LIMIT`), i.e. exactly the point at which that crate stops
+/// spinning and starts yielding, so the two halves of this phase line up
+/// with the backoff primitive driving them. That is a principled anchor
+/// rather than a measured optimum — see the caveat in the module docs
+/// about tuning these against a busy machine.
+const SPIN_ROUNDS: u32 = 6;
 
 /// Re-scans performed with `yield_now` between them, after
 /// [`SPIN_ROUNDS`] and before parking. These exist for the
@@ -284,15 +313,18 @@ impl Drop for WorkerScope<'_> {
 
 impl Queue {
 	/// Build a queue for `num_workers` workers. `shard_override`
-	/// replaces the default shard count (see [`MAX_SHARDS`]); it is
-	/// rounded up to a power of two — the routing is a bitmask — and
-	/// clamped to at least one and at most one shard per worker,
-	/// since shards beyond the worker count only add empty-scan cost.
+	/// replaces the default shard count (see [`MAX_SHARDS`]): it is
+	/// clamped to `1..=num_workers` — shards beyond the worker count
+	/// only add empty-scan cost — and then rounded up to a power of
+	/// two, because the routing is a bitmask.
 	pub(crate) fn new(num_workers: usize, shard_override: Option<usize>) -> Self {
-		// `MAX_THREADS = 512` clamps the caller side, so
-		// `next_power_of_two` cannot overflow here.
+		// Clamp *before* `next_power_of_two`, not after: the override is
+		// arbitrary caller input, and `next_power_of_two` overflows (and
+		// panics on a debug build) for anything above `1 << 63`.
+		// `num_workers` is already clamped to `MAX_THREADS` by the
+		// caller, so rounding it up cannot overflow.
 		let num_shards = match shard_override {
-			Some(n) => n.max(1).next_power_of_two().clamp(1, num_workers.next_power_of_two()),
+			Some(n) => n.clamp(1, num_workers).next_power_of_two(),
 			None => num_workers.next_power_of_two().clamp(1, MAX_SHARDS),
 		};
 		let injectors: Vec<CachePadded<Injector<Runnable>>> =
@@ -520,10 +552,15 @@ impl Queue {
 			// falls through to arm and park, so an idle pool still
 			// goes to sleep. Scans here are `Cheap` because they
 			// repeat.
+			let (spin_rounds, yield_rounds) = if self.stealers.len() >= MIN_WORKERS_FOR_PREPARK {
+				(SPIN_ROUNDS, YIELD_ROUNDS)
+			} else {
+				(0, 0)
+			};
 			let backoff = Backoff::new();
 			let mut spun = None;
-			for round in 0..SPIN_ROUNDS + YIELD_ROUNDS {
-				if round < SPIN_ROUNDS {
+			for round in 0..spin_rounds + yield_rounds {
+				if round < spin_rounds {
 					backoff.spin();
 				} else {
 					std::thread::yield_now();
@@ -551,9 +588,12 @@ impl Queue {
 			// notify path. See module-level proof.
 			fence(Ordering::SeqCst);
 
-			// Re-scan under the arm. `Strict`: this read is the
-			// worker's half of the Dekker pair, so it must be the
-			// same injector access the proof is written against.
+			// Re-scan under the arm. `Strict` is REQUIRED here, not a
+			// preference: this read is the worker's half of the Dekker
+			// pair, so it must be the same injector access the proof is
+			// written against. Switching it to `Probe::Cheap` would
+			// substitute `is_empty`'s weaker read for that access and
+			// invalidate the lost-wakeup argument in the module docs.
 			if let Some(r) = self.scan(ctx, Probe::Strict) {
 				self.parked.fetch_sub(1, Ordering::Release);
 				return Some(r);

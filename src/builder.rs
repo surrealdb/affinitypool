@@ -152,8 +152,10 @@ impl Builder {
 	/// worker capped at 8, which suits most pools; raise it for a pool
 	/// fed by many concurrent producers on a high-core machine.
 	///
-	/// The value is rounded up to a power of two and clamped to at
-	/// most one shard per worker.
+	/// The value is clamped to `1..=worker_threads` and then rounded up
+	/// to a power of two, so the effective count can exceed the worker
+	/// count when that count is not itself a power of two (8 workers
+	/// with `shards(5)` gives 8 shards; 3 workers gives at most 4).
 	///
 	/// # Examples
 	///
