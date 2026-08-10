@@ -206,6 +206,59 @@ async fn test_builder_extreme_shards_clamped() {
 	}
 }
 
+/// Work in a shard that no worker calls its own must still drain.
+///
+/// A worker always checks its *preferred* injector (`idx & mask`)
+/// unconditionally, so when the shard count is at most the worker count
+/// every shard has a dedicated checker. This covers the case the clamp
+/// still permits: 9 workers asking for 9 shards get **16**, because the
+/// count is rounded up to a power of two, so shards 9-15 have no worker
+/// that prefers them and must be reached by the cross-shard walk — which
+/// the unarmed passes bound.
+///
+/// Nothing else in the suite builds a pool with more shards than workers,
+/// so this is the only cover for that arithmetic. Note it is a smoke test,
+/// not a proof: work here is reachable several ways over (bounded random
+/// rotation across repeated passes, nine concurrent scanners, and the
+/// exhaustive pre-park sweep), so it passes even with the bound applied
+/// far more aggressively than shipped. It would catch an outright
+/// indexing or coverage blunder in the walk, not a subtle one.
+#[tokio::test]
+async fn test_unowned_shards_still_drain() {
+	const WORKERS: usize = 9;
+	const TASKS: usize = 3_000;
+
+	let pool = Builder::new().worker_threads(WORKERS).shards(WORKERS).build();
+	// Settle into a park so delivery depends on the wake + scan path.
+	tokio::time::sleep(Duration::from_millis(50)).await;
+
+	let counter = Arc::new(AtomicUsize::new(0));
+	let mut handles = Vec::with_capacity(TASKS);
+	for i in 0..TASKS {
+		let counter = counter.clone();
+		handles.push(pool.spawn(move || {
+			counter.fetch_add(1, Ordering::SeqCst);
+			i
+		}));
+	}
+
+	// Bound the wait: stranded work should fail the test, not hang CI.
+	let collected = tokio::time::timeout(Duration::from_secs(30), async {
+		let mut out = Vec::with_capacity(TASKS);
+		for h in handles {
+			out.push(h.await);
+		}
+		out
+	})
+	.await
+	.expect("tasks did not all complete: work stranded in a shard no worker prefers?");
+
+	assert_eq!(counter.load(Ordering::SeqCst), TASKS, "some task ran more or less than once");
+	let mut sorted = collected;
+	sorted.sort_unstable();
+	assert_eq!(sorted, (0..TASKS).collect::<Vec<_>>(), "task results do not match one-to-one");
+}
+
 #[tokio::test]
 async fn test_thread_naming() {
 	let pool = Builder::new().worker_threads(2).thread_name("test-worker").build();

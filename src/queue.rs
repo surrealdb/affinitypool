@@ -170,8 +170,19 @@ const SPILL_THRESHOLD: u32 = 8;
 /// trip on a 512-worker pool costs ~69 µs against ~2 µs at 8 workers,
 /// almost all of it spent walking idle peers. The per-worker random start
 /// rotates which victims each pass inspects, so a few passes still cover
-/// a wide spread, and anything missed is caught by the exhaustive scan
-/// the worker performs before it actually parks.
+/// a wide spread.
+///
+/// Bounding this cannot strand work, for three independent reasons, which
+/// is why the cap can be this aggressive: a worker always checks its
+/// preferred injector unbounded, so every shard has a dedicated checker
+/// whenever the shard count is at most the worker count; where it is not
+/// (the count is rounded up to a power of two), reaching more than eight
+/// others requires at least nine workers, all scanning with independent
+/// random rotations; and the sweep a worker performs immediately before
+/// parking is exhaustive regardless. That last one is what the
+/// lost-wakeup proof actually rests on — it is a visibility-ordering
+/// requirement, not a coverage one, which is why it must stay unbounded
+/// even though liveness would survive without it.
 const CHEAP_SCAN_VICTIMS: usize = 8;
 
 /// Re-scans performed with `spin_loop` backoff before a worker gives
