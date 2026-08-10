@@ -1002,19 +1002,6 @@ async fn test_forget_spawn_local_future_does_not_dangle() {
 	);
 }
 
-/// Windows affinity with an out-of-range core id must not be UB; the
-/// platform shim should refuse and return false. The test simulates the
-/// out-of-range case on every OS via the public `affinity::CoreId` type.
-#[cfg(target_os = "windows")]
-#[test]
-fn test_windows_affinity_high_coreid_safe() {
-	use affinitypool::affinity::{self, CoreId};
-	let res = affinity::set_for_current(CoreId {
-		id: 999,
-	});
-	assert!(!res, "out-of-range core id must not be applied");
-}
-
 /// Static assertion that the new `spawn` future does not require its
 /// closure return type to be `Send` beyond what we declare — i.e. the
 /// `R: Send + 'static` bound on `Threadpool::spawn` is the one being

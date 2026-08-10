@@ -8,9 +8,9 @@
 //! Three pools of storage:
 //!
 //! * **Sharded injectors.** Up to [`MAX_SHARDS`] lock-free MPMC
-//!   `Injector<Runnable>`s. Producers pick a shard via the
-//!   thread-local CPU cache (see [`crate::cpu`]) — a producer running
-//!   on core *N* consistently lands on shard `N & mask`. Number of
+//!   `Injector<Runnable>`s. Producers pick a shard via a cached hash
+//!   of their thread ID (see [`crate::cpu`]) — a given producer
+//!   consistently lands on the same shard. Number of
 //!   shards is `num_workers.next_power_of_two().min(MAX_SHARDS)` so
 //!   the routing is a bitmask and a single-worker pool degenerates to
 //!   one shard with no scan cost.
@@ -34,16 +34,16 @@
 //!
 //! ## Producer spill
 //!
-//! Pure CPU-affinity routing is a win when multiple producers
-//! naturally span cores (the `multi_producer` benches). For a
-//! single-producer `current_thread` runtime, every push pins to one
-//! shard and the other N-1 workers idle-scan. To defeat that,
-//! producers track a thread-local `(last_shard, count)`: after
-//! [`SPILL_THRESHOLD`] consecutive pushes to the same preferred
-//! shard, subsequent pushes rotate to neighbouring shards. Multi-
-//! producer workloads never trip the threshold (their preferred
-//! shard oscillates as the OS schedules them) and stay fully
-//! affine.
+//! Per-producer shard routing is a win when multiple producers are
+//! active (the `multi_producer` benches): each producer hashes to its
+//! own shard, so their traffic stays isolated. For a single-producer
+//! `current_thread` runtime, every push hashes to the *same* shard and
+//! the other N-1 workers idle-scan. To defeat that, producers track a
+//! thread-local `(last_shard, count)`: after [`SPILL_THRESHOLD`]
+//! consecutive pushes to the same preferred shard, subsequent pushes
+//! rotate to neighbouring shards. Multi-producer workloads rarely trip
+//! the threshold (their pushes interleave across distinct shards) and
+//! stay fully affine.
 //!
 //! ## Lock-ordering and the parked-handshake
 //!
@@ -135,9 +135,9 @@ const SPILL_THRESHOLD: u32 = 32;
 
 thread_local! {
 	/// `(last_preferred_shard, consecutive_count)`. Reset when the
-	/// preferred shard changes (producer moved CPUs or another
-	/// producer is interleaved). When `count > SPILL_THRESHOLD`, the
-	/// route rotates by `count - SPILL_THRESHOLD` shards.
+	/// preferred shard changes (a different producer thread is
+	/// interleaved). When `count > SPILL_THRESHOLD`, the route rotates
+	/// by `count - SPILL_THRESHOLD` shards.
 	static SPILL: Cell<(usize, u32)> = const { Cell::new((usize::MAX, 0)) };
 
 	/// When this thread is a worker for some `Queue`, holds raw
@@ -289,9 +289,9 @@ impl Queue {
 		}
 	}
 
-	/// Push a runnable. Routes to a shard by the producer's
-	/// thread-local CPU cache, with spill after
-	/// [`SPILL_THRESHOLD`] consecutive pushes to the same shard.
+	/// Push a runnable. Routes to a shard by a hash of the producer's
+	/// thread ID, with spill after [`SPILL_THRESHOLD`] consecutive
+	/// pushes to the same shard.
 	#[inline]
 	pub(crate) fn push(&self, runnable: Runnable) {
 		// Self-spawn fast path: if the calling thread is itself
@@ -336,7 +336,7 @@ impl Queue {
 		// and wake one parked worker if any.
 		#[cfg(test)]
 		self.foreign_pushes.fetch_add(1, Ordering::Relaxed);
-		// Single-shard fast path: skip the CPU lookup, SPILL
+		// Single-shard fast path: skip the shard-hint lookup, SPILL
 		// thread-local, and bitmask arithmetic — they're all
 		// dead work when `mask == 0` (which corresponds to a
 		// 1-worker pool). The fence + park-check below still
@@ -345,7 +345,7 @@ impl Queue {
 		if self.mask == 0 {
 			self.injectors[0].push(runnable);
 		} else {
-			let preferred = cpu::current_cpu() & self.mask;
+			let preferred = cpu::current_shard_hint() & self.mask;
 			let target = SPILL.with(|s| {
 				let (last, count) = s.get();
 				let new_count = if last == preferred {

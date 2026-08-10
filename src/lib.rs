@@ -1,4 +1,3 @@
-pub mod affinity;
 mod builder;
 mod cpu;
 mod data;
@@ -108,7 +107,7 @@ impl Threadpool {
 		});
 		// Spawn the desired number of workers.
 		for index in 0..workers {
-			Self::spin_up(None, data.clone(), index);
+			Self::spin_up(data.clone(), index);
 		}
 		// Return the new threadpool.
 		Threadpool {
@@ -290,7 +289,7 @@ impl Threadpool {
 
 	/// Spin up a new worker thread in this pool.
 	#[cfg(not(target_family = "wasm"))]
-	pub(crate) fn spin_up(coreid: Option<usize>, data: Arc<Data>, index: usize) {
+	pub(crate) fn spin_up(data: Arc<Data>, index: usize) {
 		// Create a new thread builder.
 		let mut builder = std::thread::Builder::new();
 		// Assign a name to the thread if specified.
@@ -304,17 +303,13 @@ impl Threadpool {
 		// Increase the thread count counter.
 		data.thread_count.fetch_add(1, Ordering::Relaxed);
 		// Create a new sentry watcher.
-		let sentry = Sentry::new(coreid, index, Arc::downgrade(&data));
+		let sentry = Sentry::new(index, Arc::downgrade(&data));
 		// Clone the queue handle for the worker loop.
 		let queue = data.queue.clone();
 		// Clone data for handle storage.
 		let data_clone = data.clone();
 		// Spawn a new worker thread.
 		let handle = builder.spawn(move || {
-			// Assign this thread to a core.
-			if let Some(coreid) = coreid {
-				affinity::set_for_current(coreid.into());
-			}
 			// Register this worker with the queue: creates a fresh
 			// per-worker deque and installs its `Stealer` in slot
 			// `index`. On panic-respawn, the replacement thread
@@ -344,9 +339,9 @@ impl Threadpool {
 		}
 	}
 
-	/// WASM stub — affinity and worker threads are not supported.
+	/// WASM stub — worker threads are not supported.
 	#[cfg(target_family = "wasm")]
-	pub(crate) fn spin_up(_coreid: Option<usize>, _data: Arc<Data>, _index: usize) {
+	pub(crate) fn spin_up(_data: Arc<Data>, _index: usize) {
 		// Do nothing in WASM.
 	}
 }
@@ -383,8 +378,7 @@ mod tests {
 	/// NOT bump it.
 	///
 	/// Uses a 1-worker pool so the foreign-push branch hits the
-	/// `mask == 0` fast path and never calls `cpu::current_cpu()`
-	/// (`sched_getcpu` isn't supported under miri).
+	/// `mask == 0` fast path and skips shard-hint routing entirely.
 	///
 	/// The inner `JoinHandle` is sent to the test thread via an
 	/// mpsc channel and awaited there, instead of `mem::forget`-ed

@@ -1,75 +1,49 @@
-//! Thread-local cached "current CPU" lookup for shard routing.
+//! Thread-local cached shard hint for producer→shard routing.
 //!
-//! Producers call [`current_cpu`] to pick a shard. The value is cached
-//! in thread-local state and only refreshed every [`REFRESH_EVERY`]
-//! calls — [`libc::sched_getcpu`] is a vDSO entry on modern Linux
-//! (≈5 ns) and `GetCurrentProcessorNumber` on Windows is similar, but
-//! the cached lookup is still a few cycles faster and avoids any
-//! syscall on platforms without a direct API.
+//! Producers call [`current_shard_hint`] to pick an injector shard. The
+//! hint is derived from the producer thread's ID, hashed once and cached
+//! for the lifetime of the thread — a thread's ID never changes, so there
+//! is nothing to refresh. The goal is purely that a given producer thread
+//! routes consistently to the same shard, which keeps that producer's
+//! traffic isolated to one injector and minimises cross-shard contention
+//! when many producers run concurrently (the dominant workload).
 //!
-//! Platforms without a direct "what CPU am I on" call fall back to
-//! hashing the thread ID. That loses geographical accuracy but
-//! preserves the goal: a given producer thread consistently routes
-//! to the same shard, which is what gets you cache locality for
-//! long-lived producers.
+//! This previously queried the running CPU (`sched_getcpu` on Linux,
+//! `GetCurrentProcessorNumber` on Windows) for geographic locality, but
+//! that bought little over thread-ID stickiness — workers steal across
+//! shards regardless — while costing a syscall/vDSO call and a platform
+//! dependency (`libc`/`winapi`). Hashing the thread ID is stable,
+//! allocation-free, identical on every target, and works under miri
+//! (which does not support `sched_getcpu`).
 
 use std::cell::Cell;
 
-/// Refresh cadence. Picked empirically: small enough that producer
-/// migrations don't strand a sender on a stale shard for long, large
-/// enough that the per-call overhead is amortised into the noise.
-const REFRESH_EVERY: u32 = 64;
-
 thread_local! {
-	/// `(cached_cpu, age)`. `age == REFRESH_EVERY` (or above) signals
-	/// "refresh on next call". Initialised so the very first call
-	/// always queries — that way we don't pay the cost of a query on
-	/// threads that never reach `current_cpu`.
-	static CACHED: Cell<(usize, u32)> = const { Cell::new((0, REFRESH_EVERY)) };
+	/// Cached shard hint for this thread, computed lazily on first use.
+	/// `None` until the first call; a thread's ID is immutable, so the
+	/// value never needs refreshing once set. Initialised lazily so
+	/// threads that never produce work pay nothing.
+	static SHARD_HINT: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// Return a stable hint for this thread's current CPU. The value is
-/// refreshed every [`REFRESH_EVERY`] calls; in between, callers see
-/// the cached result.
+/// Return a stable shard hint for the calling thread. Derived once from
+/// the thread ID and cached for the thread's lifetime.
 #[inline]
-pub(crate) fn current_cpu() -> usize {
-	CACHED.with(|c| {
-		let (cpu, age) = c.get();
-		if age >= REFRESH_EVERY {
-			let fresh = query_cpu();
-			c.set((fresh, 0));
-			fresh
-		} else {
-			c.set((cpu, age + 1));
-			cpu
+pub(crate) fn current_shard_hint() -> usize {
+	SHARD_HINT.with(|c| match c.get() {
+		Some(h) => h,
+		None => {
+			let h = hash_thread_id();
+			c.set(Some(h));
+			h
 		}
 	})
 }
 
-#[cfg(target_os = "linux")]
+/// Hash the current thread's `ThreadId` into a `usize`. Stable per
+/// thread, so a given producer always routes to the same shard.
 #[inline]
-fn query_cpu() -> usize {
-	// vDSO on modern Linux; ~5 ns.
-	let cpu = unsafe { libc::sched_getcpu() };
-	if cpu < 0 {
-		0
-	} else {
-		cpu as usize
-	}
-}
-
-#[cfg(target_os = "windows")]
-#[inline]
-fn query_cpu() -> usize {
-	use winapi::um::processthreadsapi::GetCurrentProcessorNumber;
-	unsafe { GetCurrentProcessorNumber() as usize }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-#[inline]
-fn query_cpu() -> usize {
-	// Fallback: hash the thread ID. Stable per producer thread, so we
-	// still get producer→shard affinity (just not CPU-locality based).
+fn hash_thread_id() -> usize {
 	use std::collections::hash_map::DefaultHasher;
 	use std::hash::{Hash, Hasher};
 	let mut h = DefaultHasher::new();

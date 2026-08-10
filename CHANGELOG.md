@@ -23,6 +23,27 @@
   `'static` data should move to the safe `spawn`. See `tests/unsound.rs`
   for a demonstration of the hazard.
 
+### Removed
+
+- **CPU-core affinity pinning has been removed entirely.** The
+  `affinity` module and its `libc`/`winapi` platform FFI are gone,
+  along with per-worker core pinning. Pinning was off by default, a
+  no-op on Apple Silicon, useless-to-harmful under containers/VMs, and
+  unproven on the workloads this pool targets; removing it drops all
+  first-party platform `unsafe` and both platform dependencies.
+  `Builder::thread_per_core(true)` still spawns one worker per core (a
+  thread count) but no longer pins — placement is left to the OS
+  scheduler. *(Breaking: `affinitypool::affinity` is no longer a public
+  module.)*
+
+### Changed
+
+- **Shard routing no longer queries the CPU.** Producers now pick a
+  shard from a cached hash of the thread ID instead of `sched_getcpu()`
+  / `GetCurrentProcessorNumber()`. No syscall on the push path, no
+  platform dependency, and it works under miri; per-producer shard
+  stickiness is unchanged.
+
 ### Behavioural notes
 
 - **Worker self-spawn fast path.** When a closure running on a

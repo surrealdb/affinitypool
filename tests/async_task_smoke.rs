@@ -154,9 +154,14 @@ fn cancel_await_resolves_after_runnable_stops() {
 	);
 	runnable.schedule();
 
-	// Give the worker a moment to start running.
-	thread::sleep(Duration::from_millis(10));
-	assert!(started.load(Ordering::Acquire), "worker did not start");
+	// Wait for the worker to actually start running the closure. A fixed
+	// `sleep` here is racy under miri's cooperative scheduler (the worker
+	// thread may not have been scheduled yet within a wall-clock window),
+	// so spin-yield until the closure flips `started` — the worker is
+	// guaranteed to run the scheduled runnable, so this always terminates.
+	while !started.load(Ordering::Acquire) {
+		thread::yield_now();
+	}
 
 	// Now cancel. cancel().await should block until the worker has
 	// finished its closure.
