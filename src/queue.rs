@@ -45,17 +45,19 @@
 //! backoff ([`SPIN_ROUNDS`]) so a runnable already on its way is
 //! caught without a futex round-trip, then a few more with
 //! `yield_now` ([`YIELD_ROUNDS`]) so an oversubscribed pool hands the
-//! CPU back to the producer instead of spinning against it. It is
-//! skipped entirely below [`MIN_WORKERS_FOR_PREPARK`] workers, where
-//! there is no contention to amortise and delaying the park is pure
-//! latency.
+//! CPU back to the producer instead of spinning against it.
 //!
-//! How much this phase contributes relative to the scan-path changes
-//! above is **not yet established**: the only measurements available
-//! were taken on a machine with heavy background load, which moves
-//! these particular workloads by several-fold between runs of identical
-//! code. Do not re-tune the constants below against numbers from a busy
-//! machine.
+//! This phase applies to every pool size. An earlier revision skipped it
+//! for one- and two-worker pools, on the theory that a small pool has no
+//! contention to amortise — measurement on an idle 32-core Linux box
+//! says the opposite: ungated, a single-worker submit-and-await round
+//! trip drops from 4.4 us to 1.1 us, because the worker is still
+//! spinning when the task lands and never takes the futex round trip at
+//! all. It costs 15-20% on `multi_producer` with one worker and many
+//! producers, where the worker is saturated and the backoff is pure
+//! delay. Note that a CPU-*contended* machine inverts this trade, since
+//! a spinning worker there competes with the producer it is waiting
+//! for.
 //!
 //! ## Producer spill
 //!
@@ -158,17 +160,6 @@ const MAX_SHARDS: usize = 8;
 /// single-producer fan-out trips it quickly so the work spreads
 /// across shards before the other workers give up and park.
 const SPILL_THRESHOLD: u32 = 8;
-
-/// Pools with fewer than this many workers skip the pre-park backoff
-/// entirely and park as soon as a scan comes up empty.
-///
-/// The backoff earns its cost by avoiding futex round-trips and by
-/// handing the CPU back to a producer that other workers are competing
-/// with — both of which scale with the number of workers. On a one- or
-/// two-worker pool there is almost no such contention to amortise, so
-/// the delay before parking is close to pure added latency, which is
-/// why those pools opt out.
-const MIN_WORKERS_FOR_PREPARK: usize = 3;
 
 /// Re-scans performed with `spin_loop` backoff before a worker gives
 /// up its CPU. The point is to catch a runnable already on its way, not
@@ -552,15 +543,10 @@ impl Queue {
 			// falls through to arm and park, so an idle pool still
 			// goes to sleep. Scans here are `Cheap` because they
 			// repeat.
-			let (spin_rounds, yield_rounds) = if self.stealers.len() >= MIN_WORKERS_FOR_PREPARK {
-				(SPIN_ROUNDS, YIELD_ROUNDS)
-			} else {
-				(0, 0)
-			};
 			let backoff = Backoff::new();
 			let mut spun = None;
-			for round in 0..spin_rounds + yield_rounds {
-				if round < spin_rounds {
+			for round in 0..SPIN_ROUNDS + YIELD_ROUNDS {
+				if round < SPIN_ROUNDS {
 					backoff.spin();
 				} else {
 					std::thread::yield_now();

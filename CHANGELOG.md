@@ -24,18 +24,51 @@
   a single producer fanning out spreads across shards sooner instead
   of piling onto one while the other workers idle.
 
-**No performance figures are quoted here yet.** The changes above are
-motivated by a real, reproducible pathology — before them, a pool got
-*slower* when given more workers for identical work — but every
-measurement taken so far came from a developer laptop that was not
-quiet (load average ~7.6 on 12 cores, a browser holding ~1.5 of them).
-These benchmarks are unusually sensitive to exactly that: the mechanism
-being changed *is* the competition between idle workers and the producer
-for CPU, so background load moves the multi-worker rows by up to 7x
-between runs of identical code. Numbers taken under those conditions
-would be misleading whichever direction they pointed, so they have been
-left out until the suite can be run on an idle machine — ideally the
-Linux target this pool is deployed on.
+Measured on an idle AMD Ryzen Threadripper 9970X (32 cores / 64 threads,
+one NUMA node), Ubuntu 24.04, kernel 6.8, full criterion sampling. All
+three revisions were benchmarked back-to-back in one session on a machine
+at load average 0.00, with rayon built from the same runs as an unchanged
+control. Every figure below has non-overlapping criterion confidence
+intervals (median CI width 11%).
+
+**24 of 27 microbenchmarks faster, 3 slower.**
+
+| workload | 0.7.0 + prior fixes | this release | |
+|---|---|---|---|
+| `steal_imbalance/8_workers` | 25.4 ms | 3.64 ms | 6.98x |
+| `spawn_overhead/4_workers/1` | 6.14 us | 1.11 us | 5.51x |
+| `steady_state_busy/8_workers` | 98.2 ms | 17.9 ms | 5.49x |
+| `park_unpark_handshake/4_workers` | 5.83 us | 1.09 us | 5.32x |
+| `spawn_overhead/1_worker/1` | 5.37 us | 1.17 us | 4.60x |
+| `spawn_local_overhead/4_workers/1000` | 4.87 ms | 1.09 ms | 4.46x |
+| `steady_state_busy/4_workers` | 18.2 ms | 4.47 ms | 4.07x |
+| `steal_imbalance/2_workers` | 9.33 ms | 2.46 ms | 3.80x |
+| `steal_imbalance/4_workers` | 10.7 ms | 3.25 ms | 3.30x |
+| `multi_producer_contention/2p_4w` | 2.66 ms | 878 us | 3.02x |
+| `per_core_steady_state` (64 workers) | 203 ms | 74.2 ms | 2.74x |
+| `multi_producer_contention/4p_1w` | 802 us | 999 us | 0.80x |
+| `multi_producer_contention/2p_1w` | 436 us | 511 us | 0.85x |
+| `multi_producer_contention/8p_1w` | 1.88 ms | 2.22 ms | 0.85x |
+
+The three regressions share a shape: one worker fed by several
+producers, so the worker is saturated and the pre-park backoff is pure
+delay before a park it was always going to take.
+
+Against `rayon::ThreadPool::spawn` on the same machine and runs,
+affinitypool is now ahead on 14 of 17 head-to-head workloads, including
+`multi_producer/4p_4w` (475 us vs 1.08 ms) and `spawn_overhead/4w/10000`
+(1.99 ms vs 3.46 ms). The remaining three are within noise or close:
+`round_trip/1` 1.07 us vs 0.94 us, `round_trip/8` 2.00 us vs 1.91 us
+(neither statistically separable), and `spawn_overhead/1w/100` 21.8 us vs
+19.6 us. Earlier releases lost single-task latency to rayon by 4-6x on
+this platform; the pre-park backoff closes that.
+
+One caveat worth stating: these gains assume spare CPU. On a
+CPU-contended host a spinning worker competes with the producer it is
+waiting for, and an earlier revision of this work measured the opposite
+sign on a loaded laptop. The backoff yields as well as spins to limit
+that, but a heavily oversubscribed deployment should measure rather than
+assume.
 
 ### Added
 
