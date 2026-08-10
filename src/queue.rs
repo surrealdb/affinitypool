@@ -62,11 +62,35 @@
 //! ## Lock-ordering and the parked-handshake
 //!
 //! Producers push to a shard's injector, then check the `parked`
-//! atomic. If any worker may be parked, the producer briefly takes
-//! the `park` mutex to call `notify_one`. Workers, when parking,
-//! acquire `park` first, bump `parked` *before* a final re-scan of
-//! all shards and stealers, then `cv.wait` (which atomically
-//! releases `park`).
+//! counter. If any worker may be parked, the producer calls
+//! [`Queue::wake_one`] to hand the wake to one specific worker.
+//! Workers, when parking, acquire *their own* parker's mutex, bump
+//! `parked` *before* a final re-scan of all shards and stealers, then
+//! set `blocked` and `cv.wait` (which atomically releases that mutex).
+//!
+//! Two properties of that arrangement are load-bearing, and both are
+//! easy to break by "optimising" them:
+//!
+//! 1. **The gate is a counter, not a set of per-worker bits.**
+//!    `parked > 0` holds for the whole of every worker's armed
+//!    interval, because only its owner decrements it. That is what
+//!    licenses the step "producer read 0, therefore the arming
+//!    worker's increment is later in the modification order" in the
+//!    proof below. A bitmask whose bits other threads may clear has no
+//!    such monotonicity: a third worker's clear can sit between an
+//!    arming worker's set and the producer's load, so the producer can
+//!    legitimately read "nobody parked" while a worker is on its way
+//!    into `cv.wait`. That failure needs no weak-memory exotica — it
+//!    happens under sequential consistency — so no amount of
+//!    strengthening the orderings repairs it.
+//! 2. **A wake must be *claimed*, not merely sent.** `notify_one` on a
+//!    condvar with no waiter is silently dropped, so a producer that
+//!    notifies a worker which has already left `cv.wait` has woken
+//!    nobody. If it treats that as the wake it owed, a runnable can sit
+//!    in the queue while other workers sleep — for as long as the
+//!    unrelated task the "woken" worker went off to run. Hence
+//!    `wake_one` tests `blocked` under the target's own mutex and only
+//!    counts a candidate whose flag was still set.
 //!
 //! Unlike the previous mutex-shard design, the cross-thread
 //! happens-before edge no longer flows through a shard mutex.
@@ -185,6 +209,9 @@ thread_local! {
 struct WorkerHandle {
 	queue: NonNull<Queue>,
 	deque: NonNull<Worker<Runnable>>,
+	/// Owning worker's index, so a self-spawn can bias its peer wake
+	/// toward a neighbour rather than always toward worker 0.
+	idx: usize,
 }
 
 // `WorkerHandle` holds raw pointers and is only ever read on the
@@ -204,10 +231,12 @@ pub(crate) struct Queue {
 	stealers: Box<[StealerSlot]>,
 	/// `num_shards - 1`. `num_shards` is always a power of two.
 	mask: usize,
-	/// Held briefly by producers to notify, and by workers across
-	/// the arm + re-scan + wait sequence.
-	park: Mutex<()>,
-	notify: Condvar,
+	/// One parking slot per worker, indexed by worker index. A worker
+	/// only ever blocks on its own slot, so producers waking different
+	/// workers never contend, and a producer can pick *which* worker to
+	/// wake instead of handing an arbitrary waiter to a shared condvar.
+	/// See [`WorkerParker`] and [`Queue::wake_one`].
+	parkers: Box<[CachePadded<WorkerParker>]>,
 	/// Approximate count of workers currently parked or about to
 	/// park. Read by producers (Acquire) and incremented by
 	/// workers (Release); a SeqCst fence on each side between the
@@ -223,6 +252,36 @@ pub(crate) struct Queue {
 	/// to assert the fast path engaged on a given workload.
 	#[cfg(test)]
 	pub(crate) foreign_pushes: AtomicUsize,
+}
+
+/// One worker's parking slot: the condvar it sleeps on plus the flag
+/// that says whether it is actually asleep on it.
+///
+/// `blocked` lives *inside* the mutex rather than beside it as an
+/// atomic, and that is load-bearing. A waker must be able to tell
+/// "this worker is in `cv.wait` right now" from "this worker looked
+/// parked a moment ago but has since woken", because a `notify_one`
+/// delivered to a condvar with no waiter is silently dropped. If the
+/// waker counted such a no-op as the wake it owed, a runnable could
+/// sit in the queue while other workers slept. Reading and clearing
+/// the flag under the same mutex the worker holds across its
+/// arm/re-scan/wait sequence makes the check exact: see
+/// [`Queue::wake_one`].
+struct WorkerParker {
+	/// `true` only while the owning worker is inside `cv.wait`. Set by
+	/// the worker before waiting; cleared by whoever wakes it (or by
+	/// the worker itself on a spurious wake).
+	blocked: Mutex<bool>,
+	cv: Condvar,
+}
+
+impl WorkerParker {
+	fn new() -> Self {
+		Self {
+			blocked: Mutex::new(false),
+			cv: Condvar::new(),
+		}
+	}
 }
 
 /// Per-worker state owned exclusively by one worker OS thread. The
@@ -303,8 +362,10 @@ impl Queue {
 			injectors: injectors.into_boxed_slice(),
 			stealers: stealers.into_boxed_slice(),
 			mask: num_shards - 1,
-			park: Mutex::new(()),
-			notify: Condvar::new(),
+			parkers: (0..num_workers)
+				.map(|_| CachePadded::new(WorkerParker::new()))
+				.collect::<Vec<_>>()
+				.into_boxed_slice(),
 			parked: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
 			#[cfg(test)]
@@ -324,6 +385,13 @@ impl Queue {
 		let deque = Worker::new_fifo();
 		let stealer = deque.stealer();
 		self.stealers[idx].store(Some(Arc::new(stealer)));
+		// A respawned worker inherits slot `idx`, including its parker.
+		// A worker only ever panics while running a job — never inside
+		// `cv.wait` — so `blocked` should already be false; reset it
+		// anyway so a stale `true` from any unforeseen path cannot make
+		// a waker "claim" a worker that does not exist and count that
+		// as the wake it owed.
+		*self.parkers[idx].blocked.lock() = false;
 		WorkerContext {
 			idx,
 			deque,
@@ -354,6 +422,7 @@ impl Queue {
 			w.set(Some(WorkerHandle {
 				queue: NonNull::from(self),
 				deque: NonNull::from(&ctx.deque),
+				idx: ctx.idx,
 			}))
 		});
 		WorkerScope {
@@ -422,8 +491,9 @@ impl Queue {
 			// `Threadpool::spawn_local`.
 			fence(Ordering::SeqCst);
 			if self.parked.load(Ordering::Acquire) > 0 {
-				let _g = self.park.lock();
-				self.notify.notify_one();
+				// Bias toward our neighbour: it is the peer most
+				// likely to reach our deque first when it scans.
+				self.wake_one(handle.idx.wrapping_add(1));
 			}
 			return;
 		}
@@ -438,11 +508,11 @@ impl Queue {
 		// 1-worker pool). The fence + park-check below still
 		// run; producer↔worker synchronisation is independent of
 		// shard count.
-		if self.mask == 0 {
-			self.injectors[0].push(runnable);
+		let target = if self.mask == 0 {
+			0
 		} else {
 			let preferred = cpu::current_shard_hint() & self.mask;
-			let target = SPILL.with(|s| {
+			SPILL.with(|s| {
 				let (last, count) = s.get();
 				let new_count = if last == preferred {
 					count.saturating_add(1)
@@ -459,26 +529,21 @@ impl Queue {
 					// the otherwise-pinned single producer evenly.
 					(preferred + (new_count - SPILL_THRESHOLD) as usize) & self.mask
 				}
-			});
-			self.injectors[target].push(runnable);
-		}
+			})
+		};
+		self.injectors[target].push(runnable);
 		// SeqCst fence pairs with the worker's SeqCst fence
 		// between `parked.fetch_add` and its re-scan; the pair
 		// forms the Dekker invariant that prevents a lost wakeup
 		// even when the queue itself is lock-free. See the
 		// module-level proof.
 		fence(Ordering::SeqCst);
-		// Fast path: if no worker may be parked, skip the park
-		// mutex.
+		// Fast path: if no worker may be parked, touch no locks at
+		// all. Otherwise hand the wake to the worker whose preferred
+		// shard is the one we just pushed to, so its very first steal
+		// attempt hits our injector.
 		if self.parked.load(Ordering::Acquire) > 0 {
-			// Acquire `park` briefly so the notify is guaranteed
-			// to land on a worker that has either already entered
-			// `cv.wait` (worker has released `park` atomically
-			// with parking) or hasn't yet armed (in which case
-			// the worker's re-scan will pick up our push before
-			// parking).
-			let _g = self.park.lock();
-			self.notify.notify_one();
+			self.wake_one(target);
 		}
 	}
 
@@ -537,11 +602,21 @@ impl Queue {
 				return Some(r);
 			}
 
-			// Phase 2: arm parking. Acquire `park`, then bump
-			// `parked` BEFORE the re-scan so any concurrent
-			// producer load of `parked` sees us as armed and
-			// will notify if we end up waiting.
-			let mut park = self.park.lock();
+			// Phase 2: arm parking. Take *our own* parker's lock,
+			// then bump the shared `parked` counter BEFORE the
+			// re-scan so any concurrent producer load of `parked`
+			// sees us as armed and will go looking for someone to
+			// wake if we end up waiting.
+			//
+			// The gate stays a counter rather than, say, a bitmask
+			// of parked workers: `parked > 0` holds for the whole of
+			// every worker's armed interval, which is exactly what
+			// lets "producer read 0" imply "the arming worker's
+			// increment comes later in the modification order" in the
+			// proof below. A per-worker bit that another worker may
+			// clear has no such monotonicity, and the proof does not
+			// transfer to it.
+			let mut blocked = self.parkers[ctx.idx].blocked.lock();
 			self.parked.fetch_add(1, Ordering::Release);
 			// SeqCst fence pairs with the producer's SeqCst
 			// fence between `injector.push` and `parked.load`.
@@ -564,9 +639,18 @@ impl Queue {
 				return None;
 			}
 
-			self.notify.wait(&mut park);
+			// Publish "actually asleep" before waiting, under the
+			// same lock a waker must take to observe it. A waker that
+			// finds this `false` knows the notify would be dropped
+			// and looks for another worker instead.
+			*blocked = true;
+			self.parkers[ctx.idx].cv.wait(&mut blocked);
+			// Either a waker claimed us (it already set this false) or
+			// this was a spurious wake; clear it either way so we are
+			// never advertised as sleeping while awake.
+			*blocked = false;
 			self.parked.fetch_sub(1, Ordering::Release);
-			// `park` dropped here. Retry from Phase 1.
+			// Our parker lock is dropped here. Retry from Phase 1.
 		}
 	}
 
@@ -677,14 +761,98 @@ impl Queue {
 		self.injectors[idx].steal_batch_and_pop(&ctx.deque)
 	}
 
+	/// Wake one sleeping worker, preferring the one whose preferred
+	/// shard is `hint` so the woken worker's first steal is local.
+	/// Returns whether a worker was actually woken.
+	///
+	/// Walks candidates from `hint` and *claims* each one under its own
+	/// mutex: a candidate counts only if `blocked` was still `true`
+	/// when we held the lock. A candidate that has already left
+	/// `cv.wait` is skipped rather than counted, because notifying its
+	/// condvar would be a no-op — treating that as the wake we owed
+	/// would leave a runnable queued while other workers slept.
+	///
+	/// The `lock()` is deliberately blocking, not `try_lock`. A worker
+	/// holds its mutex across arm + re-scan + `cv.wait`, so blocking
+	/// means we resolve against a settled state: either the worker has
+	/// reached `cv.wait` (we claim and notify it) or it left the armed
+	/// region (it found work, and will re-scan again later). A
+	/// `try_lock` that failed would leave us unable to distinguish
+	/// "about to sleep" from "already gone", which is exactly the case
+	/// a lost wakeup hides in.
+	///
+	/// Returning `false` after a full walk is safe: every candidate was
+	/// outside `cv.wait` while we held its mutex, so no worker is
+	/// asleep, so there is nobody to lose a wakeup.
+	fn wake_one(&self, hint: usize) -> bool {
+		let n = self.parkers.len();
+		let start = hint % n;
+		// Pass 1, non-blocking: claim a worker that is simply asleep,
+		// without ever waiting behind one that is mid-scan. This is the
+		// common case and keeps the producer off the critical path.
+		let mut contended = false;
+		for k in 0..n {
+			let parker = &self.parkers[(start + k) % n];
+			match parker.blocked.try_lock() {
+				Some(mut blocked) => {
+					if *blocked {
+						// Claim it: clear before notifying so a
+						// concurrent producer walking the same
+						// candidates skips this worker and goes on to
+						// wake a different one.
+						*blocked = false;
+						parker.cv.notify_one();
+						return true;
+					}
+				}
+				None => contended = true,
+			}
+		}
+		if !contended {
+			// Every worker was awake and none was contended, so there
+			// is nobody asleep to lose a wakeup.
+			return false;
+		}
+		// Pass 2, blocking, over the slots we could not inspect. A
+		// worker holding its own lock is inside arm + re-scan + wait,
+		// and its re-scan may legitimately miss our push — that is
+		// precisely the case the `parked` gate just told us to wake
+		// someone for, so we cannot treat "busy" as "it will find it".
+		// Blocking resolves against a settled state: either it reaches
+		// `cv.wait` and we claim it, or it leaves the armed region
+		// having found work.
+		for k in 0..n {
+			let parker = &self.parkers[(start + k) % n];
+			let mut blocked = parker.blocked.lock();
+			if *blocked {
+				*blocked = false;
+				parker.cv.notify_one();
+				return true;
+			}
+		}
+		false
+	}
+
 	/// Signal shutdown and wake every worker. Workers see the
 	/// shutdown flag and exit once their re-scan finds everything
 	/// empty.
 	pub(crate) fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
-		// Acquire `park` briefly so the broadcast can't lose a
-		// wakeup to a worker mid-arm.
-		let _g = self.park.lock();
-		self.notify.notify_all();
+		// Every worker sleeps on its own condvar, so shutdown has to
+		// visit all of them rather than issue one broadcast. Taking
+		// each worker's lock is what stops the wakeup being lost to a
+		// worker that is mid-arm: the lock is only free once that
+		// worker has either reached `cv.wait` (so the notify lands) or
+		// left the armed region (so it will re-check `shutdown` on its
+		// next pass and exit).
+		//
+		// Unlike `wake_one` this does not stop at the first claim and
+		// ignores whether the claim succeeded — every worker must be
+		// woken, not just one.
+		for parker in &*self.parkers {
+			let mut blocked = parker.blocked.lock();
+			*blocked = false;
+			parker.cv.notify_one();
+		}
 	}
 }
