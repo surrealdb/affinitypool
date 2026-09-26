@@ -202,27 +202,27 @@ Head-to-head against the most common alternatives for running blocking work in a
 * [`rayon::ThreadPool::spawn`](https://docs.rs/rayon) — Rayon's work-stealing pool. Tasks are wrapped in a `tokio::sync::oneshot` so the producer can await; that handshake is part of what's measured.
 * [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool) — the crate this library was originally forked from. Same `oneshot` wrap as Rayon.
 
-Three workloads run against each pool: `spawn_overhead` (submit N closures, await each), `round_trip` (submit-and-await one closure at a time), and `multi_producer` (P concurrent producers each pushing 1k tasks). Numbers are criterion midpoint estimates from `--quick` runs on a quiet Linux bench machine. **Bold** = affinitypool is the fastest in the row.
+Three workloads run against each pool: `spawn_overhead` (submit N closures, await each), `round_trip` (submit-and-await one closure at a time), and `multi_producer` (P concurrent producers each pushing 1k tasks). Numbers are criterion midpoint estimates from `--quick` runs on a quiet Linux bench machine. <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀"> denotes the fastest implementation in each row.
 
 | Benchmark | affinitypool | tokio | blocking† | rayon | threadpool |
 |---|---|---|---|---|---|
-| `spawn_overhead/1w/1` | 1.20 µs | 7.52 µs | 2.31 µs | **974 ns** | 7.68 µs |
-| `spawn_overhead/4w/1` | **1.19 µs** | 2.88 µs | 2.31 µs | 1.27 µs | 8.10 µs |
-| `spawn_overhead/1w/100` | **12.5 µs** | 65.9 µs | 232.7 µs | 44.0 µs | 13.2 µs |
-| `spawn_overhead/4w/100` | **27.4 µs** | 54.9 µs | 232.7 µs | 109.5 µs | 68.6 µs |
-| `spawn_overhead/1w/1000` | **150.0 µs** | 156.9 µs | 1.59 ms | 811.0 µs | 459.5 µs |
-| `spawn_overhead/4w/1000` | **195.2 µs** | 517.9 µs | 1.59 ms | 251.8 µs | 314.0 µs |
-| `spawn_overhead/1w/10000` | **1.46 ms** | 1.81 ms | 27.43 ms | 7.85 ms | 1.55 ms |
-| `spawn_overhead/4w/10000` | 2.20 ms | 6.44 ms | 27.43 ms | 8.76 ms | **2.02 ms** |
-| `round_trip/1w` | 6.71 µs | 7.11 µs | 6.98 µs | **965 ns** | 7.72 µs |
-| `round_trip/4w` | 3.11 µs | 2.88 µs | 6.98 µs | **1.66 µs** | 3.01 µs |
-| `round_trip/8w` | **3.51 µs** | 7.16 µs | 6.98 µs | 5.67 µs | 8.19 µs |
-| `multi_producer/2p_1w` | **210.8 µs** | 310.4 µs | 5.47 ms | 359.9 µs | 276.5 µs |
-| `multi_producer/2p_4w` | **195.9 µs** | 1.35 ms | 5.47 ms | 388.5 µs | 444.3 µs |
-| `multi_producer/4p_1w` | **504.6 µs** | 1.08 ms | 12.97 ms | 685.9 µs | 645.6 µs |
-| `multi_producer/4p_4w` | **276.5 µs** | 1.70 ms | 12.97 ms | 992.9 µs | 1.56 ms |
-| `multi_producer/8p_1w` | 2.06 ms | 4.47 ms | 29.03 ms | 5.44 ms | **1.62 ms** |
-| `multi_producer/8p_4w` | **1.08 ms** | 3.92 ms | 29.03 ms | 2.34 ms | 4.18 ms |
+| `spawn_overhead/1w/1` | 1.20 µs | 7.52 µs | 2.31 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**974 ns** | 7.68 µs |
+| `spawn_overhead/4w/1` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.19 µs** | 2.88 µs | 2.31 µs | 1.27 µs | 8.10 µs |
+| `spawn_overhead/1w/100` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**12.5 µs** | 65.9 µs | 232.7 µs | 44.0 µs | 13.2 µs |
+| `spawn_overhead/4w/100` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**27.4 µs** | 54.9 µs | 232.7 µs | 109.5 µs | 68.6 µs |
+| `spawn_overhead/1w/1000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**150.0 µs** | 156.9 µs | 1.59 ms | 811.0 µs | 459.5 µs |
+| `spawn_overhead/4w/1000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**195.2 µs** | 517.9 µs | 1.59 ms | 251.8 µs | 314.0 µs |
+| `spawn_overhead/1w/10000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.46 ms** | 1.81 ms | 27.43 ms | 7.85 ms | 1.55 ms |
+| `spawn_overhead/4w/10000` | 2.20 ms | 6.44 ms | 27.43 ms | 8.76 ms | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2.02 ms** |
+| `round_trip/1w` | 6.71 µs | 7.11 µs | 6.98 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**965 ns** | 7.72 µs |
+| `round_trip/4w` | 3.11 µs | 2.88 µs | 6.98 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.66 µs** | 3.01 µs |
+| `round_trip/8w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**3.51 µs** | 7.16 µs | 6.98 µs | 5.67 µs | 8.19 µs |
+| `multi_producer/2p_1w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**210.8 µs** | 310.4 µs | 5.47 ms | 359.9 µs | 276.5 µs |
+| `multi_producer/2p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**195.9 µs** | 1.35 ms | 5.47 ms | 388.5 µs | 444.3 µs |
+| `multi_producer/4p_1w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**504.6 µs** | 1.08 ms | 12.97 ms | 685.9 µs | 645.6 µs |
+| `multi_producer/4p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**276.5 µs** | 1.70 ms | 12.97 ms | 992.9 µs | 1.56 ms |
+| `multi_producer/8p_1w` | 2.06 ms | 4.47 ms | 29.03 ms | 5.44 ms | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.62 ms** |
+| `multi_producer/8p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.08 ms** | 3.92 ms | 29.03 ms | 2.34 ms | 4.18 ms |
 
 † `blocking` uses a single auto-scaled global pool; its column doesn't vary with the worker count.
 
