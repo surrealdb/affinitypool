@@ -15,11 +15,35 @@ use crate::data::Data;
 use crate::global::THREADPOOL;
 use crate::queue::Queue;
 use crate::sentry::Sentry;
-use async_task::{Builder as TaskBuilder, Runnable};
+use async_task::{Builder as TaskBuilder, Runnable, Task};
 use parking_lot::Mutex;
+use std::any::Any;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+
+/// A handle to a task running on a worker thread.
+///
+/// Awaiting this future resolves to the closure's return value or panics
+/// if the closure panicked. Dropping the handle cancels the task.
+pub struct JoinHandle<R> {
+	task: Task<Result<R, Box<dyn Any + Send + 'static>>>,
+}
+
+impl<R> Future for JoinHandle<R> {
+	type Output = R;
+
+	#[inline]
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		match Pin::new(&mut self.task).poll(cx) {
+			Poll::Ready(Ok(value)) => Poll::Ready(value),
+			Poll::Ready(Err(payload)) => std::panic::resume_unwind(payload),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+}
 
 /// Maximum number of worker threads allowed in a thread pool.
 pub const MAX_THREADS: usize = 512;
@@ -158,13 +182,10 @@ impl Threadpool {
 		// start processing it before the caller awaits.
 		runnable.schedule();
 		// Returning the future to the caller — dropping it cancels.
-		// The outer async block re-raises any captured panic, so the
-		// future's output type stays `R` (not `Result<R, _>`).
-		async move {
-			match task.await {
-				Ok(value) => value,
-				Err(payload) => std::panic::resume_unwind(payload),
-			}
+		// `JoinHandle` wraps the inner task and re-raises any captured panic,
+		// avoiding the overhead of an anonymous `async move` state machine.
+		JoinHandle {
+			task,
 		}
 	}
 
