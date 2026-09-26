@@ -238,10 +238,6 @@ pub(crate) struct Queue {
 	/// Prevents producer bursts from repeatedly acquiring `park.lock()` when all
 	/// parked workers have already been sent a wake signal.
 	notified: AtomicUsize,
-	/// Count of worker deques that currently have stealable work.
-	/// Allows `Probe::Cheap` scans to skip checking peer stealers when no
-	/// worker deque has any items to steal.
-	has_stealers: AtomicUsize,
 	/// Set on threadpool drop. Workers observing this with every
 	/// shard and stealer empty exit their loop.
 	shutdown: AtomicBool,
@@ -260,8 +256,16 @@ pub(crate) struct Queue {
 pub(crate) struct WorkerContext {
 	idx: usize,
 	deque: Worker<Runnable>,
+	/// xorshift32 state for randomising the *start offset* of the
+	/// cross-shard and peer-steal scans. Without it every idle worker
+	/// walks victims in the same order and they convoy onto the same
+	/// injector, turning an idle pool into a CAS storm on one cache
+	/// line. Seeded from `idx` (never zero — xorshift is absorbing at
+	/// zero) so a respawned worker re-derives the same stream, which
+	/// keeps runs reproducible. `Cell` is sound here because
+	/// `WorkerContext` is owned by, and only ever touched from, its
+	/// own worker thread — same justification as the `!Sync` deque.
 	rng: Cell<u32>,
-	has_stealer: Cell<bool>,
 }
 
 /// How hard a [`Queue::scan`] pass should work to notice a runnable.
@@ -337,7 +341,6 @@ impl Queue {
 			notify: Condvar::new(),
 			parked: AtomicUsize::new(0),
 			notified: AtomicUsize::new(0),
-			has_stealers: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
 			#[cfg(test)]
 			foreign_pushes: AtomicUsize::new(0),
@@ -362,7 +365,6 @@ impl Queue {
 			// Mix the index so adjacent workers get unrelated streams,
 			// and force the low bit so the state is never zero.
 			rng: Cell::new((idx as u32).wrapping_mul(0x9E37_79B9) | 1),
-			has_stealer: Cell::new(false),
 		}
 	}
 
@@ -442,7 +444,6 @@ impl Queue {
 			unsafe {
 				handle.deque.as_ref().push(runnable);
 			}
-			self.has_stealers.fetch_add(1, Ordering::Relaxed);
 			// Same fence + parked check as the foreign path below.
 			// A `Relaxed` peek at `parked` would not do: without the
 			// fence, x86-TSO alone permits this store-then-load pair
@@ -617,29 +618,19 @@ impl Queue {
 		loop {
 			// 1. Own deque — owner-only, lock-free, zero contention.
 			if let Some(r) = ctx.deque.pop() {
-				if ctx.has_stealer.get() && ctx.deque.is_empty() {
-					ctx.has_stealer.set(false);
-					self.has_stealers.fetch_sub(1, Ordering::Relaxed);
-				}
 				return Some(r);
-			} else if ctx.has_stealer.get() {
-				ctx.has_stealer.set(false);
-				self.has_stealers.fetch_sub(1, Ordering::Relaxed);
 			}
 
 			let mut contended = false;
 			let n = self.mask + 1;
 			let my_shard = ctx.idx & self.mask;
 
-			// 2. Preferred injector.
+			// 2. Preferred injector. `steal_batch_and_pop` migrates
+			//    a batch into our deque and returns one runnable;
+			//    subsequent pops in step 1 hit the local deque
+			//    without any cross-shard traffic.
 			match self.steal_injector(my_shard, ctx, probe) {
-				Steal::Success(r) => {
-					if !ctx.deque.is_empty() && !ctx.has_stealer.get() {
-						ctx.has_stealer.set(true);
-						self.has_stealers.fetch_add(1, Ordering::Relaxed);
-					}
-					return Some(r);
-				}
+				Steal::Success(r) => return Some(r),
 				Steal::Retry => contended = true,
 				Steal::Empty => {}
 			}
@@ -658,13 +649,7 @@ impl Queue {
 					};
 					let idx = (my_shard + 1 + rot) & self.mask;
 					match self.steal_injector(idx, ctx, probe) {
-						Steal::Success(r) => {
-							if !ctx.deque.is_empty() && !ctx.has_stealer.get() {
-								ctx.has_stealer.set(true);
-								self.has_stealers.fetch_add(1, Ordering::Relaxed);
-							}
-							return Some(r);
-						}
+						Steal::Success(r) => return Some(r),
 						Steal::Retry => contended = true,
 						Steal::Empty => {}
 					}
@@ -683,9 +668,7 @@ impl Queue {
 			//    probe and one steal attempt, which is the short-lived
 			//    use `arc_swap` asks for.
 			let num_workers = self.stealers.len();
-			if num_workers > 1
-				&& (!matches!(probe, Probe::Cheap) || self.has_stealers.load(Ordering::Relaxed) > 0)
-			{
+			if num_workers > 1 {
 				let span = num_workers - 1;
 				let start = fast_reduce(next_rand(&ctx.rng), span);
 				for k in 0..self.probe_limit(span, probe) {
@@ -709,13 +692,7 @@ impl Queue {
 						continue;
 					}
 					match stealer.steal_batch_and_pop(&ctx.deque) {
-						Steal::Success(r) => {
-							if !ctx.deque.is_empty() && !ctx.has_stealer.get() {
-								ctx.has_stealer.set(true);
-								self.has_stealers.fetch_add(1, Ordering::Relaxed);
-							}
-							return Some(r);
-						}
+						Steal::Success(r) => return Some(r),
 						Steal::Retry => contended = true,
 						Steal::Empty => {}
 					}
