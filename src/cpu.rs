@@ -1,41 +1,60 @@
-//! Thread-local cached shard hint for producer→shard routing.
+//! Thread-local cached shard routing for producer→shard assignment.
 //!
-//! Producers call [`current_shard_hint`] to pick an injector shard. The
-//! hint is derived from the producer thread's ID, hashed once and cached
-//! for the lifetime of the thread — a thread's ID never changes, so there
-//! is nothing to refresh. The goal is purely that a given producer thread
-//! routes consistently to the same shard, which keeps that producer's
-//! traffic isolated to one injector and minimises cross-shard contention
-//! when many producers run concurrently (the dominant workload).
-//!
-//! This previously queried the running CPU (`sched_getcpu` on Linux,
-//! `GetCurrentProcessorNumber` on Windows) for geographic locality, but
-//! that bought little over thread-ID stickiness — workers steal across
-//! shards regardless — while costing a syscall/vDSO call and a platform
-//! dependency (`libc`/`winapi`). Hashing the thread ID is stable,
-//! allocation-free, identical on every target, and works under miri
-//! (which does not support `sched_getcpu`).
+//! Producers call [`route_shard`] to pick an injector shard. The route is
+//! derived from the producer thread's ID, hashed once and cached for the
+//! lifetime of the thread. When consecutive pushes to the same shard exceed
+//! [`SPILL_THRESHOLD`], routing rotates across shards to distribute single-producer
+//! fan-out evenly across workers.
 
 use std::cell::Cell;
 
-thread_local! {
-	/// Cached shard hint for this thread, computed lazily on first use.
-	/// `None` until the first call; a thread's ID is immutable, so the
-	/// value never needs refreshing once set. Initialised lazily so
-	/// threads that never produce work pay nothing.
-	static SHARD_HINT: Cell<Option<usize>> = const { Cell::new(None) };
+/// Consecutive pushes to the same preferred shard before producer-
+/// side spill kicks in. Multi-producer workloads rarely reach it
+/// (their pushes interleave, resetting the counter), while a
+/// single-producer fan-out trips it quickly so the work spreads
+/// across shards before the other workers give up and park.
+pub(crate) const SPILL_THRESHOLD: u32 = 8;
+
+#[derive(Clone, Copy)]
+struct ProducerRoute {
+	shard_hint: usize,
+	last_preferred: usize,
+	consecutive: u32,
 }
 
-/// Return a stable shard hint for the calling thread. Derived once from
-/// the thread ID and cached for the thread's lifetime.
+thread_local! {
+	static ROUTE: Cell<Option<ProducerRoute>> = const { Cell::new(None) };
+}
+
+/// Route a push to an injector shard given the queue's `mask`.
+/// Derives and caches the thread ID hash on first use, tracks consecutive
+/// pushes to the preferred shard, and applies spill rotation in a single
+/// thread-local access.
 #[inline]
-pub(crate) fn current_shard_hint() -> usize {
-	SHARD_HINT.with(|c| match c.get() {
-		Some(h) => h,
-		None => {
-			let h = hash_thread_id();
-			c.set(Some(h));
-			h
+pub(crate) fn route_shard(mask: usize) -> usize {
+	ROUTE.with(|cell| {
+		let mut route = match cell.get() {
+			Some(r) => r,
+			None => ProducerRoute {
+				shard_hint: hash_thread_id(),
+				last_preferred: usize::MAX,
+				consecutive: 0,
+			},
+		};
+		let preferred = route.shard_hint & mask;
+		let new_count = if route.last_preferred == preferred {
+			route.consecutive.saturating_add(1)
+		} else {
+			1
+		};
+		route.last_preferred = preferred;
+		route.consecutive = new_count;
+		cell.set(Some(route));
+
+		if new_count <= SPILL_THRESHOLD {
+			preferred
+		} else {
+			(preferred + (new_count - SPILL_THRESHOLD) as usize) & mask
 		}
 	})
 }

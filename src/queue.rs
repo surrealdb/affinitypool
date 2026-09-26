@@ -152,13 +152,6 @@ type StealerSlot = CachePadded<ArcSwapOption<Stealer<Runnable>>>;
 /// while keeping the worst-case empty scan at 8 cheap loads.
 const MAX_SHARDS: usize = 8;
 
-/// Consecutive pushes to the same preferred shard before producer-
-/// side spill kicks in. Multi-producer workloads rarely reach it
-/// (their pushes interleave, resetting the counter), while a
-/// single-producer fan-out trips it quickly so the work spreads
-/// across shards before the other workers give up and park.
-const SPILL_THRESHOLD: u32 = 8;
-
 /// Victims a *cheap* scan pass inspects before giving up, per step.
 ///
 /// The armed re-scan still visits every injector and every peer — that
@@ -194,12 +187,6 @@ const CHEAP_SCAN_VICTIMS: usize = 8;
 const SPIN_ROUNDS: u32 = 6;
 
 thread_local! {
-	/// `(last_preferred_shard, consecutive_count)`. Reset when the
-	/// preferred shard changes (a different producer thread is
-	/// interleaved). When `count > SPILL_THRESHOLD`, the route rotates
-	/// by `count - SPILL_THRESHOLD` shards.
-	static SPILL: Cell<(usize, u32)> = const { Cell::new((usize::MAX, 0)) };
-
 	/// When this thread is a worker for some `Queue`, holds raw
 	/// pointers to that queue and the worker's local deque. Set
 	/// by [`Queue::enter_worker_scope`] and cleared when the
@@ -466,34 +453,15 @@ impl Queue {
 		// and wake one parked worker if any.
 		#[cfg(test)]
 		self.foreign_pushes.fetch_add(1, Ordering::Relaxed);
-		// Single-shard fast path: skip the shard-hint lookup, SPILL
-		// thread-local, and bitmask arithmetic — they're all
-		// dead work when `mask == 0` (which corresponds to a
-		// 1-worker pool). The fence + park-check below still
-		// run; producer↔worker synchronisation is independent of
+		// Single-shard fast path: skip the shard-hint lookup
+		// and bitmask arithmetic — they're all dead work when `mask == 0`
+		// (which corresponds to a 1-worker pool). The fence + park-check
+		// below still run; producer↔worker synchronisation is independent of
 		// shard count.
 		if self.mask == 0 {
 			self.injectors[0].push(runnable);
 		} else {
-			let preferred = cpu::current_shard_hint() & self.mask;
-			let target = SPILL.with(|s| {
-				let (last, count) = s.get();
-				let new_count = if last == preferred {
-					count.saturating_add(1)
-				} else {
-					1
-				};
-				s.set((preferred, new_count));
-				if new_count <= SPILL_THRESHOLD {
-					preferred
-				} else {
-					// Rotate by (count - threshold) shards once
-					// we've tripped. As `count` grows, subsequent
-					// pushes cycle through all shards, draining
-					// the otherwise-pinned single producer evenly.
-					(preferred + (new_count - SPILL_THRESHOLD) as usize) & self.mask
-				}
-			});
+			let target = cpu::route_shard(self.mask);
 			self.injectors[target].push(runnable);
 		}
 		// SeqCst fence pairs with the worker's SeqCst fence
