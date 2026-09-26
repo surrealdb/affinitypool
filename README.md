@@ -4,6 +4,93 @@ A threadpool for running blocking jobs on a dedicated thread pool. Blocking task
 
 Tasks are delivered through a sharded, lock-free queue. Each producer thread routes consistently to its own shard, so concurrent producers' traffic stays isolated and contention stays low, while idle workers steal across shards to stay busy.
 
+## Benchmarks
+
+Head-to-head against the most common alternatives for running blocking work in async Rust:
+
+* [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html) — Tokio's built-in blocking pool.
+* [`blocking::unblock`](https://docs.rs/blocking) — the auto-scaling pool used by `async-std` and the smol ecosystem.
+* [`rayon::ThreadPool::spawn`](https://docs.rs/rayon) — Rayon's work-stealing pool. Tasks are wrapped in a `tokio::sync::oneshot` so the producer can await; that handshake is part of what's measured.
+* [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool) — the crate this library was originally forked from. Same `oneshot` wrap as Rayon.
+
+Three workloads run against each pool: `spawn_overhead` (submit N closures, await each), `round_trip` (submit-and-await one closure at a time), and `multi_producer` (P concurrent producers each pushing 1k tasks). Numbers are criterion midpoint estimates from `--quick` runs on a quiet Linux bench machine. <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀"> denotes the fastest implementation in each row.
+
+| Benchmark | affinitypool | tokio | blocking† | rayon | threadpool |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `spawn_overhead/1w/1` | 1.20 µs | 7.52 µs | 2.31 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**974 ns** | 7.68 µs |
+| `spawn_overhead/4w/1` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.19 µs** | 2.88 µs | 2.31 µs | 1.27 µs | 8.10 µs |
+| `spawn_overhead/1w/100` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**12.5 µs** | 65.9 µs | 232.7 µs | 44.0 µs | 13.2 µs |
+| `spawn_overhead/4w/100` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**27.4 µs** | 54.9 µs | 232.7 µs | 109.5 µs | 68.6 µs |
+| `spawn_overhead/1w/1000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**150.0 µs** | 156.9 µs | 1.59 ms | 811.0 µs | 459.5 µs |
+| `spawn_overhead/4w/1000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**195.2 µs** | 517.9 µs | 1.59 ms | 251.8 µs | 314.0 µs |
+| `spawn_overhead/1w/10000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.46 ms** | 1.81 ms | 27.43 ms | 7.85 ms | 1.55 ms |
+| `spawn_overhead/4w/10000` | 2.20 ms | 6.44 ms | 27.43 ms | 8.76 ms | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2.02 ms** |
+| `round_trip/1w` | 6.71 µs | 7.11 µs | 6.98 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**965 ns** | 7.72 µs |
+| `round_trip/4w` | 3.11 µs | 2.88 µs | 6.98 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.66 µs** | 3.01 µs |
+| `round_trip/8w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**3.51 µs** | 7.16 µs | 6.98 µs | 5.67 µs | 8.19 µs |
+| `multi_producer/2p_1w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**210.8 µs** | 310.4 µs | 5.47 ms | 359.9 µs | 276.5 µs |
+| `multi_producer/2p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**195.9 µs** | 1.35 ms | 5.47 ms | 388.5 µs | 444.3 µs |
+| `multi_producer/4p_1w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**504.6 µs** | 1.08 ms | 12.97 ms | 685.9 µs | 645.6 µs |
+| `multi_producer/4p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**276.5 µs** | 1.70 ms | 12.97 ms | 992.9 µs | 1.56 ms |
+| `multi_producer/8p_1w` | 2.06 ms | 4.47 ms | 29.03 ms | 5.44 ms | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.62 ms** |
+| `multi_producer/8p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.08 ms** | 3.92 ms | 29.03 ms | 2.34 ms | 4.18 ms |
+
+† `blocking` uses a single auto-scaled global pool; its column doesn't vary with the worker count.
+
+### How affinitypool compares
+
+* **vs `tokio::spawn_blocking`** — affinitypool wins across virtually all workloads, with up to a 6.9× lead on multi-producer contention (`multi_producer/2p_4w`), a 3.6× lead on `multi_producer/8p_4w`, and up to a 5.1× lead on concurrent sustained pipeline bursts.
+* **vs `blocking::unblock`** — affinitypool dominates batched workloads (10–27× faster) and multi-producer contention (27–47× faster). Trade-off: `blocking`'s pool grows unboundedly and is shared globally with any other crate using it.
+* **vs `rayon::ThreadPool::spawn`** — affinitypool wins on almost all batched and multi-producer workloads (up to 5.4× faster on `spawn_overhead/1w/10000`, 3.6× faster on `multi_producer/4p_4w`). Rayon leads on single-task round-trip latency (`round_trip/1w` and `4w`). Rayon is built for work-stealing CPU parallelism, not async producer / worker handoff.
+* **vs `threadpool::ThreadPool::execute`** — the original. affinitypool matches or beats threadpool on single-worker workloads, and wins heavily on multi-producer concurrent workloads (up to 5.6× faster on `multi_producer/4p_4w` and 3.9× faster on `8p_4w`).
+
+The pattern: affinitypool dominates concurrent multi-producer and batched workloads where each producer routes consistently to its own shard via its thread-ID hash. It provides dedicated pool sizing for blocking work with **per-producer shard affinity** — concurrent producers stay isolated on their own shards, which is where it wins.
+
+## Architecture
+
+Tasks are delivered from producers to workers through a sharded MPMC queue. Each producer routes to a shard via a cached hash of its thread ID, so a given producer consistently lands on the same shard (`hash & mask`). Each worker has a preferred shard (`worker_idx & mask`) and falls back to scanning the remaining shards in cyclic order before parking.
+
+```text
+Producers (any async task)
+   +----------------+   +----------------+   +----------------+
+   | producer @ c0  |   | producer @ c1  |   | producer @ cN  |
+   +----------------+   +----------------+   +----------------+
+           |                    |                    |
+           v                    v                    v
+Sharded queue  (num_workers.next_power_of_two().min(8))
+   +----------------+   +----------------+   +----------------+
+   |    Shard 0     |   |    Shard 1     |   |    Shard k     |
+   |   Mutex<       |   |   Mutex<       |   |   Mutex<       |
+   |    VecDeque<   |   |    VecDeque<   |   |    VecDeque<   |
+   |    Runnable>>  |   |    Runnable>>  |   |    Runnable>>  |
+   +----------------+   +----------------+   +----------------+
+           |                    |                    |
+           v                    v                    v
+Worker threads
+   +----------------+   +----------------+   +----------------+
+   |    worker 0    |   |    worker 1    |   |    worker k    |
+   |  pref: shard 0 |   |  pref: shard 1 |   |  pref: shard k |
+   +----------------+   +----------------+   +----------------+
+```
+
+On an empty preferred shard a worker scans the remaining shards in cyclic order, then parks on a shared `Mutex<()> + Condvar` (counted by an `AtomicUsize`). Producers check that counter after pushing; if any worker may be parked, they briefly take the park mutex to `notify_one`.
+
+Each task is a single heap allocation (the [`async-task`](https://crates.io/crates/async-task) layout — fused header + closure + result slot + waker). The park/unpark handshake is lost-wakeup-free; the proof sketch lives in [src/queue.rs](src/queue.rs) and the model in [tests/loom_queue.rs](tests/loom_queue.rs).
+
+Shard count rules of thumb:
+
+| Workers | Shards |
+|---|---|
+| 1 | 1 (no scan cost, no extra mutex) |
+| 2–3 | 2–4 |
+| ≥ 5 | 8 (capped) |
+
+### Behaviour notes
+
+**Worker self-spawn fast path.** When a closure running on a worker thread calls `pool.spawn(...)`, the new task is pushed directly into that worker's own local deque instead of routing through the shared sharded queue, skipping the shard routing. The spawning worker is usually also the consumer — it returns to its pop loop and drains its own deque — so the work stays biased toward that worker, which is what you want for cache locality.
+
+It still issues the same wake handshake a foreign push does, because the spawning worker is *not guaranteed* to reach its pop loop: a worker that polls a `SpawnFuture` and then drops it blocks in the drop, waiting for the very runnable it just queued. That runnable is in the blocked worker's own deque, so only a peer steal can complete it — the spawning worker's deque is a stealer target. Skipping the wake there let the pool hang until the blocked worker gave up, which is forever. On a one-worker pool there is no peer to wake, so that pattern self-deadlocks regardless; see the `Threadpool::spawn_local` docs.
+
 ## Examples
 
 ### Basic Usage
@@ -192,93 +279,6 @@ async fn main() {
     println!("All tasks completed!");
 }
 ```
-
-## Benchmarks
-
-Head-to-head against the most common alternatives for running blocking work in async Rust:
-
-* [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html) — Tokio's built-in blocking pool.
-* [`blocking::unblock`](https://docs.rs/blocking) — the auto-scaling pool used by `async-std` and the smol ecosystem.
-* [`rayon::ThreadPool::spawn`](https://docs.rs/rayon) — Rayon's work-stealing pool. Tasks are wrapped in a `tokio::sync::oneshot` so the producer can await; that handshake is part of what's measured.
-* [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool) — the crate this library was originally forked from. Same `oneshot` wrap as Rayon.
-
-Three workloads run against each pool: `spawn_overhead` (submit N closures, await each), `round_trip` (submit-and-await one closure at a time), and `multi_producer` (P concurrent producers each pushing 1k tasks). Numbers are criterion midpoint estimates from `--quick` runs on a quiet Linux bench machine. <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀"> denotes the fastest implementation in each row.
-
-| Benchmark | affinitypool | tokio | blocking† | rayon | threadpool |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| `spawn_overhead/1w/1` | 1.20 µs | 7.52 µs | 2.31 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**974 ns** | 7.68 µs |
-| `spawn_overhead/4w/1` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.19 µs** | 2.88 µs | 2.31 µs | 1.27 µs | 8.10 µs |
-| `spawn_overhead/1w/100` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**12.5 µs** | 65.9 µs | 232.7 µs | 44.0 µs | 13.2 µs |
-| `spawn_overhead/4w/100` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**27.4 µs** | 54.9 µs | 232.7 µs | 109.5 µs | 68.6 µs |
-| `spawn_overhead/1w/1000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**150.0 µs** | 156.9 µs | 1.59 ms | 811.0 µs | 459.5 µs |
-| `spawn_overhead/4w/1000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**195.2 µs** | 517.9 µs | 1.59 ms | 251.8 µs | 314.0 µs |
-| `spawn_overhead/1w/10000` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.46 ms** | 1.81 ms | 27.43 ms | 7.85 ms | 1.55 ms |
-| `spawn_overhead/4w/10000` | 2.20 ms | 6.44 ms | 27.43 ms | 8.76 ms | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2.02 ms** |
-| `round_trip/1w` | 6.71 µs | 7.11 µs | 6.98 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**965 ns** | 7.72 µs |
-| `round_trip/4w` | 3.11 µs | 2.88 µs | 6.98 µs | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.66 µs** | 3.01 µs |
-| `round_trip/8w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**3.51 µs** | 7.16 µs | 6.98 µs | 5.67 µs | 8.19 µs |
-| `multi_producer/2p_1w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**210.8 µs** | 310.4 µs | 5.47 ms | 359.9 µs | 276.5 µs |
-| `multi_producer/2p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**195.9 µs** | 1.35 ms | 5.47 ms | 388.5 µs | 444.3 µs |
-| `multi_producer/4p_1w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**504.6 µs** | 1.08 ms | 12.97 ms | 685.9 µs | 645.6 µs |
-| `multi_producer/4p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**276.5 µs** | 1.70 ms | 12.97 ms | 992.9 µs | 1.56 ms |
-| `multi_producer/8p_1w` | 2.06 ms | 4.47 ms | 29.03 ms | 5.44 ms | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.62 ms** |
-| `multi_producer/8p_4w` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.08 ms** | 3.92 ms | 29.03 ms | 2.34 ms | 4.18 ms |
-
-† `blocking` uses a single auto-scaled global pool; its column doesn't vary with the worker count.
-
-### How affinitypool compares
-
-* **vs `tokio::spawn_blocking`** — affinitypool wins across virtually all workloads, with up to a 6.9× lead on multi-producer contention (`multi_producer/2p_4w`), a 3.6× lead on `multi_producer/8p_4w`, and up to a 5.1× lead on concurrent sustained pipeline bursts.
-* **vs `blocking::unblock`** — affinitypool dominates batched workloads (10–27× faster) and multi-producer contention (27–47× faster). Trade-off: `blocking`'s pool grows unboundedly and is shared globally with any other crate using it.
-* **vs `rayon::ThreadPool::spawn`** — affinitypool wins on almost all batched and multi-producer workloads (up to 5.4× faster on `spawn_overhead/1w/10000`, 3.6× faster on `multi_producer/4p_4w`). Rayon leads on single-task round-trip latency (`round_trip/1w` and `4w`). Rayon is built for work-stealing CPU parallelism, not async producer / worker handoff.
-* **vs `threadpool::ThreadPool::execute`** — the original. affinitypool matches or beats threadpool on single-worker workloads, and wins heavily on multi-producer concurrent workloads (up to 5.6× faster on `multi_producer/4p_4w` and 3.9× faster on `8p_4w`).
-
-The pattern: affinitypool dominates concurrent multi-producer and batched workloads where each producer routes consistently to its own shard via its thread-ID hash. It provides dedicated pool sizing for blocking work with **per-producer shard affinity** — concurrent producers stay isolated on their own shards, which is where it wins.
-
-## Architecture
-
-Tasks are delivered from producers to workers through a sharded MPMC queue. Each producer routes to a shard via a cached hash of its thread ID, so a given producer consistently lands on the same shard (`hash & mask`). Each worker has a preferred shard (`worker_idx & mask`) and falls back to scanning the remaining shards in cyclic order before parking.
-
-```text
-Producers (any async task)
-   +----------------+   +----------------+   +----------------+
-   | producer @ c0  |   | producer @ c1  |   | producer @ cN  |
-   +----------------+   +----------------+   +----------------+
-           |                    |                    |
-           v                    v                    v
-Sharded queue  (num_workers.next_power_of_two().min(8))
-   +----------------+   +----------------+   +----------------+
-   |    Shard 0     |   |    Shard 1     |   |    Shard k     |
-   |   Mutex<       |   |   Mutex<       |   |   Mutex<       |
-   |    VecDeque<   |   |    VecDeque<   |   |    VecDeque<   |
-   |    Runnable>>  |   |    Runnable>>  |   |    Runnable>>  |
-   +----------------+   +----------------+   +----------------+
-           |                    |                    |
-           v                    v                    v
-Worker threads
-   +----------------+   +----------------+   +----------------+
-   |    worker 0    |   |    worker 1    |   |    worker k    |
-   |  pref: shard 0 |   |  pref: shard 1 |   |  pref: shard k |
-   +----------------+   +----------------+   +----------------+
-```
-
-On an empty preferred shard a worker scans the remaining shards in cyclic order, then parks on a shared `Mutex<()> + Condvar` (counted by an `AtomicUsize`). Producers check that counter after pushing; if any worker may be parked, they briefly take the park mutex to `notify_one`.
-
-Each task is a single heap allocation (the [`async-task`](https://crates.io/crates/async-task) layout — fused header + closure + result slot + waker). The park/unpark handshake is lost-wakeup-free; the proof sketch lives in [src/queue.rs](src/queue.rs) and the model in [tests/loom_queue.rs](tests/loom_queue.rs).
-
-Shard count rules of thumb:
-
-| Workers | Shards |
-|---|---|
-| 1 | 1 (no scan cost, no extra mutex) |
-| 2–3 | 2–4 |
-| ≥ 5 | 8 (capped) |
-
-### Behaviour notes
-
-**Worker self-spawn fast path.** When a closure running on a worker thread calls `pool.spawn(...)`, the new task is pushed directly into that worker's own local deque instead of routing through the shared sharded queue, skipping the shard routing. The spawning worker is usually also the consumer — it returns to its pop loop and drains its own deque — so the work stays biased toward that worker, which is what you want for cache locality.
-
-It still issues the same wake handshake a foreign push does, because the spawning worker is *not guaranteed* to reach its pop loop: a worker that polls a `SpawnFuture` and then drops it blocks in the drop, waiting for the very runnable it just queued. That runnable is in the blocked worker's own deque, so only a peer steal can complete it — the spawning worker's deque is a stealer target. Skipping the wake there let the pool hang until the blocked worker gave up, which is forever. On a one-worker pool there is no peer to wake, so that pattern self-deadlocks regardless; see the `Threadpool::spawn_local` docs.
 
 #### Original
 
