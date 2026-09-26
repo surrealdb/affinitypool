@@ -9,7 +9,7 @@
 //! replaces each shard's `Injector<Runnable>` with an `AtomicUsize`
 //! item counter, and matches the production code's
 //! [`std::sync::atomic::fence`]`(SeqCst)` between queue access and
-//! `parked` access on both sides — the Dekker pattern that closes
+//! `parked` access on both sides: the Dekker pattern that closes
 //! the lost-wakeup race when the queue is lock-free.
 //!
 //! **MIRROR INVARIANT:** any change to `Queue::push`, `Queue::pop_blocking`,
@@ -36,7 +36,7 @@ use loom::thread;
 /// Sharded MPMC queue. Mirrors `crate::queue::Queue`, with each
 /// shard's lock-free `Injector<Runnable>` replaced by an
 /// `AtomicUsize` item counter and the actual `Runnable` payload
-/// elided (items have no identity in the model — only their
+/// elided (items have no identity in the model; only their
 /// presence/absence matters for the handshake proof).
 ///
 /// Push and pop on the shard counters use Release/Acquire (the
@@ -73,7 +73,7 @@ impl Queue {
 	/// and spill counter are replaced by an explicit `shard_hint`
 	/// so the model controls routing deterministically. The
 	/// `fence(SeqCst)` between the push and the `parked.load`
-	/// mirrors the production fence — load-bearing for the
+	/// mirrors the production fence, which is load-bearing for the
 	/// lost-wakeup proof.
 	fn push(&self, shard_hint: usize) {
 		let idx = shard_hint & self.mask;
@@ -91,7 +91,7 @@ impl Queue {
 	/// Try one lock-free scan pass. Mirrors `Queue::scan` in
 	/// `src/queue.rs`: walks shards starting from `worker_idx &
 	/// mask` in cyclic order, returns the first non-empty one.
-	/// Acquire on both load and CAS — Release/Acquire is enough
+	/// Acquire on both load and CAS; Release/Acquire is enough
 	/// for coherence of the shard counter; the cross-thread
 	/// edge for the lost-wakeup proof comes from the `fence(SeqCst)`
 	/// in `pop_blocking`.
@@ -257,7 +257,7 @@ fn one_push_two_workers_exactly_one_wins() {
 ///
 /// Every worker that parks here has work waiting for it, so a wakeup
 /// that goes missing strands a worker with an item still queued and
-/// nothing left to wake it — loom's deadlock detection fires on the
+/// nothing left to wake it; loom's deadlock detection fires on the
 /// blocked thread. The absence of `shutdown()` is the point: a shutdown
 /// would rescue the stranded worker and hide exactly the class of bug
 /// this model exists to catch.
@@ -312,7 +312,7 @@ fn shutdown_wakes_parked_worker() {
 fn shutdown_drains_pending_item() {
 	loom::model(|| {
 		let q = Arc::new(Queue::new(2));
-		// Pre-seed before launching threads — no race on the push
+		// Pre-seed before launching threads: no race on the push
 		// itself, only on shutdown vs the worker's pop.
 		q.push(0);
 		let worker = {

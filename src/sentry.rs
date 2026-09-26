@@ -7,8 +7,8 @@ use std::sync::Weak;
 /// If a worker thread unwinds (panic outside `Runnable::run`, since
 /// `async-task` catches panics inside the future), the sentry's `Drop`
 /// fires and spins up a replacement worker. Panics inside the future
-/// itself never reach the sentry — async-task stores them in the task
-/// header for the awaiter — so under normal operation this path is
+/// itself never reach the sentry (async-task stores them in the task
+/// header for the awaiter), so under normal operation this path is
 /// dead.
 pub(crate) struct Sentry {
 	active: bool,

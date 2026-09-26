@@ -1,12 +1,12 @@
 //! Regression tests for the self-spawn wake-up handshake.
 //!
 //! A worker that pushes into its own deque is normally also the
-//! consumer, but it can block before returning to its pop loop — a
+//! consumer, but it can block before returning to its pop loop: a
 //! polled-then-dropped [`affinitypool::SpawnFuture`] runs
 //! `block_on_cancel` -> `thread::park()`, waiting for the very runnable
 //! it just queued. At that point only a peer steal can make progress,
-//! so the self-spawn path has to wake a parked peer. It previously did
-//! not, and the pool hung.
+//! so the self-spawn path must wake a parked peer to prevent the pool
+//! from hanging.
 #![cfg(not(loom))]
 
 use affinitypool::Threadpool;

@@ -34,11 +34,8 @@ impl Builder {
 	}
 
 	/// Set the maximum number of worker-threads that will be alive at any given moment by the built
-	/// [`Threadpool`]. If not specified, defaults the number of threads to the number of CPUs.
-	///
-	/// # Panics
-	///
-	/// This method will panic if `num_threads` is 0.
+	/// [`Threadpool`]. If not specified, defaults the number of threads to 2 (or the number of CPUs
+	/// if [`thread_per_core`](Self::thread_per_core) is enabled). The value is clamped to `1..=MAX_THREADS`.
 	///
 	/// # Examples
 	///
@@ -92,8 +89,8 @@ impl Builder {
 	}
 
 	/// Set the stack size (in bytes) for each of the threads spawned by the built [`Threadpool`].
-	/// If not specified, threads spawned by the threadpool will have a stack size [as specified in
-	/// the `std::thread` documentation][thread].
+	/// If not specified, threads spawned by the threadpool will have a default stack size as specified in
+	/// the [`std::thread`] documentation.
 	///
 	/// # Examples
 	///
@@ -120,7 +117,7 @@ impl Builder {
 	/// Spawn one worker thread per CPU core.
 	///
 	/// This sets the worker count to the number of available cores. It
-	/// does **not** pin threads to cores — worker placement is left to
+	/// does **not** pin threads to cores; worker placement is left to
 	/// the OS scheduler.
 	///
 	/// # Examples

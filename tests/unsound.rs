@@ -16,7 +16,7 @@
 //! leaked. If the future is leaked while it still borrows caller data,
 //! the worker goes on to read that data after it has gone out of scope:
 //! a data race and a use-after-free. This is the classic
-//! "leak ⇒ unsoundness" hole — the same one that sank the pre-1.0
+//! "leak ⇒ unsoundness" hole, the same one that sank the pre-1.0
 //! `std::thread::scoped` API.
 //!
 //! This test reproduces exactly that. `PollAndLeak` polls the spawn
@@ -31,7 +31,7 @@
 //! future is a *value*, and safe code may always leak a value, so a
 //! future's destructor can never be a load-bearing safety barrier. The
 //! only construct whose completion safe code cannot skip is a returning
-//! stack frame — which is why the one sound design is a *synchronous*
+//! stack frame; this is why the one sound design is a *synchronous*
 //! scoped API (`std::thread::scope` / `rayon::scope`), where the join
 //! happens as the scope call returns. That shape cannot be expressed
 //! over `.await`: awaiting hands control to an executor that is never
@@ -41,7 +41,7 @@
 //!
 //! Because the hazard cannot be designed out, `spawn_local` is `unsafe`.
 //! The way to ensure safety is to use it correctly: **never leak the
-//! returned future while it borrows non-`'static` data** — always let it
+//! returned future while it borrows non-`'static` data**: always let it
 //! drop, or drive it to completion, before the borrows end. The ordinary
 //! patterns (`pool.spawn_local(..).await`, or just dropping the future)
 //! all uphold this; only a deliberate leak like the one below breaks it.
@@ -52,8 +52,8 @@
 //! exercises undefined behaviour, whose observable result is not
 //! guaranteed (it usually "passes" because the freed stack slot still
 //! reads back as a valid integer). It exists as an executable record of
-//! the hazard, not as a correctness check — see the non-blocking
-//! `unsound` job in `.github/workflows/ci.yml`.
+//! the hazard, not as a correctness check (see the non-blocking
+//! `unsound` job in `.github/workflows/ci.yml`).
 
 use std::{
 	pin::Pin,
@@ -63,7 +63,7 @@ use std::{
 
 /// A future adapter that polls its inner future exactly once and then,
 /// if it is still `Pending`, **leaks** it via [`std::mem::forget`]
-/// instead of dropping it — deliberately skipping the `SpawnFuture`
+/// instead of dropping it, deliberately skipping the `SpawnFuture`
 /// destructor that `spawn_local`'s soundness depends on.
 struct PollAndLeak<T>(Option<Pin<Box<T>>>);
 
@@ -103,7 +103,7 @@ fn trigger_unsoundness() {
 			{
 				let v_ref = &v;
 				println!("MAIN THREAD SPAWNING");
-				// SAFETY: this call is intentionally UNSOUND — it exists to
+				// SAFETY: this call is intentionally UNSOUND; it exists to
 				// demonstrate the hazard. `spawn_local`'s contract (do not
 				// leak the returned future while it borrows `v`) is
 				// deliberately violated below by `PollAndLeak`, which polls

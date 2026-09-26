@@ -1,5 +1,5 @@
 //! Head-to-head: `affinitypool::Threadpool::spawn` vs
-//! [`blocking::unblock`](https://docs.rs/blocking) — the pool that
+//! [`blocking::unblock`](https://docs.rs/blocking): the pool that
 //! powers `async-std::task::spawn_blocking` and is commonly reached
 //! for by smol-ecosystem users.
 //!

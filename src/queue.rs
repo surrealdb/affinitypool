@@ -1,5 +1,5 @@
 //! Sharded MPMC queue used by `Threadpool` to deliver `Runnable`s from
-//! producers to worker threads. Backed by `crossbeam_deque` —
+//! producers to worker threads. Backed by `crossbeam_deque`:
 //! `Injector`s for cross-thread handoff and per-worker `Worker` deques
 //! for the steady-state hot path.
 //!
@@ -9,7 +9,7 @@
 //!
 //! * **Sharded injectors.** Up to [`MAX_SHARDS`] lock-free MPMC
 //!   `Injector<Runnable>`s. Producers pick a shard via a cached hash
-//!   of their thread ID (see [`crate::cpu`]) — a given producer
+//!   of their thread ID (see [`crate::cpu`]); a given producer
 //!   consistently lands on the same shard. The count defaults to
 //!   `num_workers.next_power_of_two().min(MAX_SHARDS)` and can be
 //!   overridden per pool by [`crate::Builder::shards`]; it is always a
@@ -74,7 +74,7 @@
 //! orderings alone aren't enough to close the producer↔worker
 //! race on `parked`. The queue therefore inserts a
 //! [`fence(SeqCst)`] between each side's queue access and its
-//! `parked` access — the textbook Dekker pattern.
+//! `parked` access: the textbook Dekker pattern.
 //!
 //! [`fence(SeqCst)`]: std::sync::atomic::fence
 //!
@@ -86,7 +86,7 @@
 //! its `Injector::steal`. Both `fence(SeqCst)`s appear in a single
 //! SeqCst total order.
 //!
-//! Assume for contradiction that a wakeup is lost — i.e., the
+//! Assume for contradiction that a wakeup is lost: i.e., the
 //! producer's `parked.load` reads 0 (so producer takes the fast
 //! path and skips `notify_one`) AND the worker's `Injector::steal`
 //! finds nothing (so the worker proceeds into `cv.wait`).
@@ -100,14 +100,14 @@
 //!   modification order. By the SeqCst fence rule, the producer's
 //!   fence is then after the worker's fence in SeqCst order.
 //!
-//! These two conclusions contradict — the fences can't both be
+//! These two conclusions contradict; the fences can't both be
 //! before each other in the SeqCst total order. So at least one
 //! of (`parked.load = 0`) or (`Injector::steal = empty`) is false,
 //! and the wakeup is delivered.
 //!
 //! Either way: if the worker's re-scan finds the runnable, the
 //! worker doesn't park. If the producer's notify path runs, it
-//! synchronises through `park.lock()` — which blocks until the
+//! synchronises through `park.lock()`, which blocks until the
 //! worker is already in `cv.wait` (since the worker holds `park`
 //! across arm + re-scan and `cv.wait` atomically releases it).
 //!
@@ -142,8 +142,8 @@ const MAX_SHARDS: usize = 8;
 
 /// Victims a *cheap* scan pass inspects before giving up, per step.
 ///
-/// The armed re-scan still visits every injector and every peer — that
-/// sweep is load-bearing for the lost-wakeup proof — but the unarmed and
+/// The armed re-scan still visits every injector and every peer (that
+/// sweep is load-bearing for the lost-wakeup proof), but the unarmed and
 /// pre-park passes stop here, because their cost is paid on every wake
 /// and it grows with the pool. Unbounded, a single submit-and-await round
 /// trip on a 512-worker pool costs ~69 µs against ~2 µs at 8 workers,
@@ -159,14 +159,14 @@ const MAX_SHARDS: usize = 8;
 /// others requires at least nine workers, all scanning with independent
 /// random rotations; and the sweep a worker performs immediately before
 /// parking is exhaustive regardless. That last one is what the
-/// lost-wakeup proof actually rests on — it is a visibility-ordering
+/// lost-wakeup proof actually rests on: it is a visibility-ordering
 /// requirement, not a coverage one, which is why it must stay unbounded
 /// even though liveness would survive without it.
 const CHEAP_SCAN_VICTIMS: usize = 8;
 
 /// Re-scans performed with `spin_loop` backoff before a worker gives
 /// up its CPU. The point is to catch a runnable already on its way, not
-/// to poll — spinning is the cheapest way to win a submit-and-await
+/// to poll; spinning is the cheapest way to win a submit-and-await
 /// round trip, but it burns a core.
 ///
 /// Six matches `crossbeam_utils::Backoff`'s own spin boundary
@@ -248,11 +248,11 @@ pub(crate) struct WorkerContext {
 	/// cross-shard and peer-steal scans. Without it every idle worker
 	/// walks victims in the same order and they convoy onto the same
 	/// injector, turning an idle pool into a CAS storm on one cache
-	/// line. Seeded from `idx` (never zero — xorshift is absorbing at
+	/// line. Seeded from `idx` (never zero, as xorshift is absorbing at
 	/// zero) so a respawned worker re-derives the same stream, which
 	/// keeps runs reproducible. `Cell` is sound here because
 	/// `WorkerContext` is owned by, and only ever touched from, its
-	/// own worker thread — same justification as the `!Sync` deque.
+	/// own worker thread, with the same justification as the `!Sync` deque.
 	rng: Cell<u32>,
 }
 
@@ -304,8 +304,8 @@ impl Drop for WorkerScope<'_> {
 impl Queue {
 	/// Build a queue for `num_workers` workers. `shard_override`
 	/// replaces the default shard count (see [`MAX_SHARDS`]): it is
-	/// clamped to `1..=num_workers` — shards beyond the worker count
-	/// only add empty-scan cost — and then rounded up to a power of
+	/// clamped to `1..=num_workers` (shards beyond the worker count
+	/// only add empty-scan cost) and then rounded up to a power of
 	/// two, because the routing is a bitmask.
 	pub(crate) fn new(num_workers: usize, shard_override: Option<usize>) -> Self {
 		// Clamp *before* `next_power_of_two`, not after: the override is
@@ -337,7 +337,7 @@ impl Queue {
 
 	/// Construct per-worker state and register the worker's
 	/// `Stealer` in the queue's slot for `idx`. Called once from
-	/// each worker thread's entry point, *and* on respawn — the
+	/// each worker thread's entry point, *and* on respawn: the
 	/// new thread overwrites the slot with a fresh stealer. Any
 	/// stealer reference held momentarily by another worker keeps
 	/// the dropped buffer alive (the buffer is `Arc`-shared
@@ -395,7 +395,7 @@ impl Queue {
 		// worker's local deque, skipping the Injector and the
 		// shard routing.
 		//
-		// The spawning worker is *usually* also the consumer — it
+		// The spawning worker is *usually* also the consumer: it
 		// returns to `pop_blocking` and pops its own deque, which
 		// needs no cross-thread synchronisation. But it is not
 		// guaranteed to get there: a worker that polls a
@@ -411,8 +411,8 @@ impl Queue {
 		//
 		// So the local deque is published with the same fenced
 		// handshake the foreign path uses. The Dekker argument is
-		// unchanged in shape — it only needs the producer's queue
-		// access and the worker's steal to touch the same object —
+		// unchanged in shape (it only needs the producer's queue
+		// access and the worker's steal to touch the same object),
 		// with `Worker::push` and `Stealer::steal_batch_and_pop`
 		// on this deque taking the place of the injector pair.
 		if let Some(handle) = CURRENT_WORKER.with(|w| w.get())
@@ -459,7 +459,7 @@ impl Queue {
 		#[cfg(test)]
 		self.foreign_pushes.fetch_add(1, Ordering::Relaxed);
 		// Single-shard fast path: skip the shard-hint lookup
-		// and bitmask arithmetic — they're all dead work when `mask == 0`
+		// and bitmask arithmetic; they're all dead work when `mask == 0`
 		// (which corresponds to a 1-worker pool). The fence + park-check
 		// below still run; producer↔worker synchronisation is independent of
 		// shard count.
@@ -506,12 +506,8 @@ impl Queue {
 			// Parking costs a futex round-trip on both sides, which
 			// dominates a submit-and-await round trip when the next
 			// runnable is only a moment away. A few cheap re-scans
-			// first let a worker that is about to be handed work skip
-			// the syscall entirely.
-			//
-			// Bounded spin loop before committing to a park.
-			// A few cheap re-scans with exponential backoff allow a worker
-			// to catch an imminent runnable without the futex round-trip.
+			// with backoff allow a worker to catch an imminent
+			// runnable without the syscall entirely.
 			let backoff = Backoff::new();
 			let mut spun = None;
 			for _ in 0..SPIN_ROUNDS {
@@ -585,7 +581,7 @@ impl Queue {
 	///   empty victim then costs a shared load instead of a failed
 	///   CAS, which is what keeps an idle multi-worker pool from
 	///   melting a cache line. Used on the unarmed scans, where a
-	///   missed just-pushed runnable is harmless — the worker either
+	///   missed just-pushed runnable is harmless: the worker either
 	///   loops and scans again or proceeds to arm, and the armed
 	///   re-scan is strict.
 	/// * `Probe::Strict` always attempts the steal. Used for the
@@ -604,7 +600,7 @@ impl Queue {
 		// nothing while at least one victim was contended. `Retry`
 		// implies concurrent activity, so this terminates.
 		loop {
-			// 1. Own deque — owner-only, lock-free, zero contention.
+			// 1. Own deque: owner-only, lock-free, zero contention.
 			if let Some(r) = ctx.deque.pop() {
 				return Some(r);
 			}
@@ -649,7 +645,7 @@ impl Queue {
 			//
 			//    `load()`, not `load_full()`. `load_full` clones the
 			//    `Arc`, and that refcount is a line every idle worker
-			//    would touch on every pass — the same convoy the
+			//    would touch on every pass; this is the same convoy the
 			//    `is_empty` probe above exists to avoid, one level up.
 			//    `load()` hands back a guard instead and leaves the
 			//    refcount alone. The guard is held only across the
@@ -694,7 +690,7 @@ impl Queue {
 	}
 
 	/// How many victims one scan step should walk out of `span`
-	/// available. `Probe::Strict` always walks all of them — the armed
+	/// available. `Probe::Strict` always walks all of them: the armed
 	/// re-scan has to observe every injector for the lost-wakeup proof
 	/// to hold. `Probe::Cheap` caps it at [`CHEAP_SCAN_VICTIMS`], since
 	/// those passes run on every wake and are pure overhead once the

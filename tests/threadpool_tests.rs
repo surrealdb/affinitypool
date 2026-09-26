@@ -195,7 +195,7 @@ async fn test_builder_shard_override() {
 
 /// The shard override is arbitrary caller input, so both ends of the
 /// range must be clamped rather than trusted. Zero must not divide by
-/// zero, and a huge value must not overflow the power-of-two rounding —
+/// zero, and a huge value must not overflow the power-of-two rounding:
 /// `usize::MAX.next_power_of_two()` panics on a debug build, so the
 /// clamp has to happen first.
 #[tokio::test]
@@ -213,8 +213,8 @@ async fn test_builder_extreme_shards_clamped() {
 /// every shard has a dedicated checker. This covers the case the clamp
 /// still permits: 9 workers asking for 9 shards get **16**, because the
 /// count is rounded up to a power of two, so shards 9-15 have no worker
-/// that prefers them and must be reached by the cross-shard walk — which
-/// the unarmed passes bound.
+/// that prefers them and must be reached by the cross-shard walk (which
+/// the unarmed passes bound).
 ///
 /// Nothing else in the suite builds a pool with more shards than workers,
 /// so this is the only cover for that arithmetic. Note it is a smoke test,
@@ -509,7 +509,7 @@ async fn test_spawn_from_worker_routes_to_local_deque() {
 	// fast path, which routes into the producing worker's own
 	// deque). We forget the inner JoinHandle to keep the task
 	// scheduled (Drop would cancel it) and use a channel for
-	// completion signalling because a worker thread is sync —
+	// completion signalling because a worker thread is sync;
 	// it can't `.await`.
 	use std::sync::mpsc;
 
@@ -539,7 +539,7 @@ async fn test_spawn_from_worker_routes_to_local_deque() {
 #[tokio::test]
 async fn test_spawn_into_other_pool_from_worker() {
 	// A closure running on a worker of pool A calling `pool_b.spawn(...)`
-	// must route through pool B's foreign-producer path — the
+	// must route through pool B's foreign-producer path: the
 	// thread-local self-spawn handle was set for pool A, so
 	// pool B's `std::ptr::eq` queue-identity check must miss
 	// and fall back to the Injector + wake. Without that pointer-
@@ -1074,7 +1074,7 @@ async fn test_forget_spawn_local_future_does_not_dangle() {
 	let tracker = DropTracker(drops.clone());
 	// SAFETY: the closure captures `tracker` by move (owned, no borrow of
 	// non-`'static` data). Although this future is deliberately
-	// `mem::forget`-ed below, there are no borrows that could dangle —
+	// `mem::forget`-ed below, there are no borrows that could dangle;
 	// this exercises the leak-safety of the memory path, not a borrow.
 	let mut fut = Box::pin(unsafe {
 		pool.spawn_local(move || {
@@ -1102,7 +1102,7 @@ async fn test_forget_spawn_local_future_does_not_dangle() {
 }
 
 /// Static assertion that the new `spawn` future does not require its
-/// closure return type to be `Send` beyond what we declare — i.e. the
+/// closure return type to be `Send` beyond what we declare; that is, the
 /// `R: Send + 'static` bound on `Threadpool::spawn` is the one being
 /// enforced. This is a compile-time check; if it ever changes, this test
 /// fails to compile.

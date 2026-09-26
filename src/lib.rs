@@ -77,12 +77,12 @@ where
 ///
 /// `func` may borrow non-`'static` data. Soundness relies on the future
 /// returned by this `async fn` being dropped (or driven to completion)
-/// before those borrows expire — its destructor blocks until the worker
+/// before those borrows expire: its destructor blocks until the worker
 /// has stopped touching them. The caller must therefore **not leak that
 /// future** (via [`mem::forget`](std::mem::forget), `Box::leak`, an
 /// `Rc`/`Arc` cycle, or by embedding it in another future that is then
 /// leaked) while it still borrows non-`'static` data. Leaking it lets a
-/// worker read data after it has gone out of scope — a data race and a
+/// worker read data after it has gone out of scope, causing a data race and a
 /// use-after-free.
 ///
 /// This hazard cannot be designed away in async Rust; see
@@ -96,7 +96,7 @@ where
 {
 	if let Some(threadpool) = THREADPOOL.get() {
 		// SAFETY: the no-leak obligation is forwarded to our own caller
-		// via this fn's `# Safety` contract — the future they must not
+		// via this fn's `# Safety` contract. The future they must not
 		// leak is the one this `async fn` returns, which owns the inner
 		// `SpawnFuture` across the `.await`.
 		unsafe { threadpool.spawn_local(func) }.await
@@ -141,7 +141,7 @@ impl Threadpool {
 
 	/// Queue a new command for execution on this pool.
 	///
-	/// The closure is scheduled **immediately** — by the time this
+	/// The closure is scheduled **immediately**; by the time this
 	/// function returns, the task is already on the worker queue and
 	/// may already be running. The returned future resolves to the
 	/// closure's return value. Dropping the future before completion
@@ -150,8 +150,8 @@ impl Threadpool {
 	/// discarded.
 	///
 	/// Returning a future (rather than being an `async fn`) means
-	/// pipelined producers — e.g. `let h1 = pool.spawn(a); let h2 =
-	/// pool.spawn(b)` — start both `a` and `b` on workers
+	/// pipelined producers (e.g. `let h1 = pool.spawn(a); let h2 =
+	/// pool.spawn(b)`) start both `a` and `b` on workers
 	/// concurrently, before any `.await`. This matches the semantics
 	/// of `tokio::task::spawn_blocking`.
 	pub fn spawn<F, R>(&self, func: F) -> impl Future<Output = R> + Send + 'static
@@ -180,7 +180,7 @@ impl Threadpool {
 		// Push the runnable onto the queue right now so a worker can
 		// start processing it before the caller awaits.
 		runnable.schedule();
-		// Returning the future to the caller — dropping it cancels.
+		// Returning the future to the caller; dropping it cancels.
 		// `JoinHandle` wraps the inner task and re-raises any captured panic,
 		// avoiding the overhead of an anonymous `async move` state machine.
 		JoinHandle {
@@ -197,8 +197,8 @@ impl Threadpool {
 	/// runnable to a worker, so the drop returns immediately. Once
 	/// polled, dropping the future cancels the task; if the worker is
 	/// currently running the closure, the dropping thread is parked
-	/// until the worker has finished, so that — *provided the future is
-	/// not leaked* — closure borrows of `'pool` data cannot dangle. See
+	/// until the worker has finished, so that, provided the future is
+	/// not leaked, closure borrows of `'pool` data cannot dangle. See
 	/// [Safety](#safety) for the obligation that "provided" places on
 	/// the caller.
 	///
@@ -209,8 +209,8 @@ impl Threadpool {
 	/// mind:
 	///
 	/// 1. **Async-context footgun.** Dropping a polled `SpawnFuture`
-	///    from inside an async task — for example by holding it in a
-	///    `select!`/`tokio::join!` branch that loses — blocks the
+	///    from inside an async task (for example by holding it in a
+	///    `select!`/`tokio::join!` branch that loses) blocks the
 	///    underlying async runtime's worker thread for the duration
 	///    of the closure. On a multi-thread runtime this just stalls
 	///    one worker; on a current-thread runtime it can deadlock the
@@ -229,23 +229,23 @@ impl Threadpool {
 	///    blocks waiting for that runnable to stop, which only this
 	///    worker (or a peer, of which there are none) could make
 	///    happen. On a pool with two or more workers the queued
-	///    runnable is stolen by a peer — the self-spawn path wakes one
-	///    — and the drop completes.
+	///    runnable is stolen by a peer, as the self-spawn path wakes one,
+	///    and the drop completes.
 	///
 	/// # Safety
 	///
 	/// The returned [`SpawnFuture`] may borrow non-`'static` data through
 	/// `func`. Its `Drop` impl is the *only* thing that guarantees the
-	/// worker has stopped touching those borrows before they expire — it
+	/// worker has stopped touching those borrows before they expire: it
 	/// blocks on cancellation. The caller must therefore ensure that
 	/// destructor actually runs before the borrowed data goes out of
 	/// scope: the future must be dropped (or driven to completion) and
-	/// **must not be leaked** — not via [`mem::forget`](std::mem::forget),
+	/// **must not be leaked** (not via [`mem::forget`](std::mem::forget),
 	/// `Box::leak`, `ManuallyDrop`, an `Rc`/`Arc` cycle, nor by being
-	/// embedded in another future that is itself leaked.
+	/// embedded in another future that is itself leaked).
 	///
 	/// Leaking the future while it still borrows non-`'static` data lets
-	/// a worker read those borrows after they are gone — a data race and
+	/// a worker read those borrows after they are gone, causing a data race and
 	/// a use-after-free. This obligation cannot be enforced statically in
 	/// async Rust (a future is a value that safe code may always leak),
 	/// which is why the function is `unsafe` rather than relying on the
@@ -262,7 +262,7 @@ impl Threadpool {
 	{
 		let queue = self.data.queue.clone();
 		let schedule = move |runnable: Runnable| queue.push(runnable);
-		// Same `catch_unwind` wrapper rationale as `spawn` — keep
+		// Same `catch_unwind` wrapper rationale as `spawn`: keep
 		// panics off the worker thread, surface them on the awaiter.
 		// SAFETY: `async_task::Builder::spawn_unchecked` lifts the
 		// `'static` bound on the future. The erased lifetime is sound
@@ -271,11 +271,11 @@ impl Threadpool {
 		//      the future cannot outlive the pool.
 		//   2. `SpawnFuture::drop` blocks (via `Task::cancel().await`)
 		//      until the runnable has stopped, so the closure's `'pool`
-		//      borrows are not accessed after they expire — *as long as
-		//      that destructor runs*.
+		//      borrows are not accessed after they expire, as long as
+		//      that destructor runs.
 		//   3. A destructor is not guaranteed to run, so (2) cannot be
-		//      discharged here. That remaining obligation — do not leak
-		//      the future while it borrows non-`'static` data — is the
+		//      discharged here. That remaining obligation (do not leak
+		//      the future while it borrows non-`'static` data) is the
 		//      caller's, via this fn's `unsafe` contract (see `# Safety`
 		//      and the `local.rs` module docs).
 		let (runnable, task) = unsafe {
@@ -358,7 +358,7 @@ impl Threadpool {
 			while let Some(runnable) = queue.pop_blocking(&ctx) {
 				runnable.run();
 			}
-			// Clean exit — cancel the sentry so its Drop does not
+			// Clean exit: cancel the sentry so its Drop does not
 			// trigger a respawn.
 			sentry.cancel();
 		});
@@ -368,7 +368,7 @@ impl Threadpool {
 		}
 	}
 
-	/// WASM stub — worker threads are not supported.
+	/// WASM stub: worker threads are not supported.
 	#[cfg(target_family = "wasm")]
 	pub(crate) fn spin_up(_data: Arc<Data>, _index: usize) {
 		// Do nothing in WASM.
@@ -410,8 +410,8 @@ mod tests {
 	/// `mask == 0` fast path and skips shard-hint routing entirely.
 	///
 	/// The inner `JoinHandle` is sent to the test thread via an
-	/// mpsc channel and awaited there, instead of `mem::forget`-ed
-	/// — keeps the test leak-free under miri while still letting
+	/// mpsc channel and awaited there, instead of `mem::forget`-ed.
+	/// This keeps the test leak-free under miri while still letting
 	/// the inner closure run to completion on the worker.
 	#[tokio::test]
 	async fn self_spawn_does_not_increment_foreign_push_counter() {
@@ -454,7 +454,7 @@ mod tests {
 		let foreign_count = pool.data.queue.foreign_pushes.load(Ordering::Relaxed);
 		assert_eq!(
 			foreign_count, 1,
-			"expected exactly one foreign push (the outer); got {foreign_count} — self-spawn fast path didn't engage"
+			"expected exactly one foreign push (the outer); got {foreign_count}; self-spawn fast path didn't engage"
 		);
 	}
 }

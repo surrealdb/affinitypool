@@ -4,28 +4,28 @@
 //! per-task compute) by isolating the components that the performance work
 //! actually targets:
 //!
-//! * **`spawn_overhead`** — empty closure, single worker. Dominated by
+//! * **`spawn_overhead`**: empty closure, single worker. Dominated by
 //!   `async-task` allocation and the spawn/poll state machine.
-//! * **`steady_state_busy`** — keep all workers busy with many tasks queued,
+//! * **`steady_state_busy`**: keep all workers busy with many tasks queued,
 //!   so the parking machinery is never exercised. Isolates the shard push
 //!   cost and the `parked.load(Acquire)` short-circuit on the producer hot
 //!   path.
-//! * **`park_unpark_handshake`** — submit a single task, await, then go
+//! * **`park_unpark_handshake`**: submit a single task, await, then go
 //!   idle. Forces a park/unpark cycle on each iteration. Stresses the
 //!   arm-then-rescan handshake that protects against lost wakeups (see
 //!   `src/queue.rs` and `tests/loom_queue.rs`).
-//! * **`multi_producer_contention`** — many concurrent async producers fed
+//! * **`multi_producer_contention`**: many concurrent async producers fed
 //!   into one pool. Stresses cross-shard contention and the `parked` atomic
 //!   gate from the producer side.
-//! * **`spawn_local_overhead`** — empty closure via `spawn_local`. The
+//! * **`spawn_local_overhead`**: empty closure via `spawn_local`. The
 //!   `spawn_local` path schedules lazily on first poll and runs the cancel
 //!   path on drop, so it has different completion costs than `spawn` and is
 //!   not covered by the existing benches.
-//! * **`steal_imbalance`** — push every task from a single producer onto
+//! * **`steal_imbalance`**: push every task from a single producer onto
 //!   one shard with N workers idle, so peer workers have to scan empty
 //!   shards before finding the work. Stresses the worker's shard-scan path
 //!   plus the wake-fanout that distributes the queued work across the
-//!   parked workers. (Name preserved for criterion history continuity —
+//!   parked workers. (Name preserved for criterion history continuity;
 //!   the current implementation is shard-scanning, not work-stealing.)
 
 use affinitypool::{Builder, Threadpool};
@@ -143,7 +143,7 @@ fn bench_park_unpark_handshake(c: &mut Criterion) {
 	// the cheapest probe of the *pre-park* path, whose cost per pass is
 	// linear in the worker count (a worker scans every peer's deque
 	// before it parks). Without a case up here, that scaling would be
-	// entirely untested — the rest of the suite stops at 8.
+	// untested, as the rest of the suite stops at 8.
 	for &workers in &[1usize, 4, 8, 64, 256, 512] {
 		group.bench_with_input(BenchmarkId::new("workers", workers), &workers, |b, &workers| {
 			b.iter_custom(|iters| {
@@ -196,7 +196,7 @@ fn bench_multi_producer_contention(c: &mut Criterion) {
 							// pool per iteration spawned `workers` threads each
 							// time and left them cold, so each timed region
 							// included their start-up and first park. That made
-							// this the noisiest group in the suite — identical
+							// That made this the noisiest group in the suite; identical
 							// code drifted up to 1.4x between runs, which is
 							// wider than most of the effects being measured.
 							let pool = Arc::new(Threadpool::new(workers));

@@ -9,11 +9,11 @@
 //!
 //! Workloads:
 //!
-//! * **`spawn_overhead`** — submit `count` empty closures and await
+//! * **`spawn_overhead`**: submit `count` empty closures and await
 //!   each. Dominated by per-spawn allocator + handshake cost.
-//! * **`round_trip`** — submit one task, await it, repeat. Measures
+//! * **`round_trip`**: submit one task, await it, repeat. Measures
 //!   producer↔worker latency including the wakeup path.
-//! * **`multi_producer`** — `P` concurrent async producers each
+//! * **`multi_producer`**: `P` concurrent async producers each
 //!   feeding `count / P` tasks into one pool. Stresses contention
 //!   on whatever queue the pool uses internally.
 

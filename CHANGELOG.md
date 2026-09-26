@@ -8,11 +8,11 @@
   pool used to burn itself on the steal path: every worker walked
   victims in the same order, hammered a contended
   `steal_batch_and_pop` CAS, and spun in place on `Steal::Retry`.
-  Three changes — a per-worker random start offset for the
+  Three changes (a per-worker random start offset for the
   cross-shard and peer-steal walks, an `is_empty()` probe before each
   steal on the unarmed scans (a shared load instead of a failed CAS),
   and moving on to the next victim on `Retry` instead of spinning on
-  the contended one — turn that storm back into useful work. Adding
+  the contended one) turn that storm back into useful work. Adding
   workers no longer makes the pool slower.
 - **Bounded spin before parking.** A worker now re-scans a few times
   with `spin_loop` backoff and then a few more with `yield_now`
@@ -23,7 +23,7 @@
 - **The pre-park scan no longer walks the whole pool.** A worker's
   unarmed scans now inspect at most `CHEAP_SCAN_VICTIMS` injectors and
   peers per pass, and read each peer's stealer slot with
-  `ArcSwapOption::load` rather than `load_full` — the latter clones the
+  `ArcSwapOption::load` rather than `load_full`; the latter clones the
   `Arc`, and that refcount is a cache line every idle worker was
   touching on every pass. The scan a worker performs immediately before
   it parks is still exhaustive, because that sweep is what the
@@ -31,7 +31,7 @@
   side run twice (both stable to 2%): a submit-and-await round trip
   costs 1.77x less at 64 workers, 1.58x at 256 and 1.43x at 512, and is
   unchanged at or below 8 workers. Pools of that size were previously
-  untested — the suite stopped at 8 workers, so
+  untested, as the suite stopped at 8 workers, so
   `park_unpark_handshake` now runs up to `MAX_THREADS` to keep this
   honest. Note the remaining growth with pool size (~50x from 8 to 512
   workers) is that final exhaustive sweep and cannot be bounded without
@@ -51,7 +51,7 @@ describe sampling variance *within* one run; they say nothing about
 run-to-run reproducibility, and the two are far apart for anything
 involving several workers racing to steal. The effects below are 3-7x, an
 order of magnitude larger than that drift, so their direction and rough
-size are solid — their third significant figure is not.
+size are solid; their third significant figure is not.
 
 **24 of 27 microbenchmarks faster; no regression survived re-measurement.**
 
@@ -119,7 +119,7 @@ assume.
   responsibility via an `# Safety` contract: **do not leak the returned
   future while it borrows non-`'static` data.** This is the classic
   leak-based unsoundness (the pre-1.0 `std::thread::scoped` hole); there
-  is no sound, fully safe `spawn_local` in async Rust — the only
+  is no sound, fully safe `spawn_local` in async Rust; the only
   leak-proof design is a synchronous scoped API, which has no
   `.await`-able equivalent. Migration: wrap existing calls in `unsafe`;
   the common `pool.spawn_local(..).await` (or dropping the future
@@ -136,7 +136,7 @@ assume.
   unproven on the workloads this pool targets; removing it drops all
   first-party platform `unsafe` and both platform dependencies.
   `Builder::thread_per_core(true)` still spawns one worker per core (a
-  thread count) but no longer pins — placement is left to the OS
+  thread count) but no longer pins; placement is left to the OS
   scheduler. *(Breaking: `affinitypool::affinity` is no longer a public
   module.)*
 
@@ -158,10 +158,10 @@ assume.
   `SpawnFuture` and then drops it runs `block_on_cancel` ->
   `thread::park()`, blocking until the runnable it just queued has
   stopped. That runnable is in the blocked worker's own deque, so only
-  a peer steal can complete it — and with every peer parked and no
+  a peer steal can complete it, and with every peer parked and no
   wake issued, nothing ever woke them. The pool hung indefinitely.
   The self-spawn path now performs the same fenced wake handshake as a
-  foreign push (`fence(SeqCst)` then the `parked` check — a `Relaxed`
+  foreign push (`fence(SeqCst)` then the `parked` check; a `Relaxed`
   peek would be unsound, since x86-TSO alone lets the store-then-load
   pair be observed out of order). A one-worker pool has no peer to
   wake and still self-deadlocks on that pattern; that is inherent and
@@ -178,11 +178,11 @@ assume.
   see the fix above for why that is required rather than merely
   desirable.
 
-## 0.6.0 — 2026-05-24 — async-task rewrite + sharded queue
+## 0.6.0 - 2026-05-24 - async-task rewrite + sharded queue
 
 A major internal rewrite that closes the 8-15× performance gap versus
 `tokio::task::spawn_blocking` and ends up beating it on most
-heavy-contention workloads while preserving CPU affinity — the
+heavy-contention workloads while preserving CPU affinity, the
 feature this library exists for. Public trait methods
 (`Threadpool::new`, `spawn`, `spawn_local`, `Builder`, `affinity::*`,
 global `spawn`/`spawn_local`, `Error`, `MAX_THREADS`) are unchanged;
@@ -227,7 +227,7 @@ on 8 workers** (`concurrent_pipeline`).
 * **CPU-affinity routing.** Producers pick a shard via a thread-local
   cache of `sched_getcpu()` (Linux) / `GetCurrentProcessorNumber()`
   (Windows), refreshed every 64 pushes. Other platforms hash the
-  thread ID — less geographical, but stable per producer thread,
+  thread ID: less geographical, but stable per producer thread,
   which is what gets you cache-locality for long-lived producers.
 * **Shard scanning, not work-stealing.** Each worker has a preferred
   shard (`worker_idx & mask`); on empty, scans remaining shards in
@@ -239,7 +239,7 @@ on 8 workers** (`concurrent_pipeline`).
   may be parked, the producer briefly acquires the `park` mutex to
   call `notify_one`. Workers, when parking, hold the `park` mutex
   across `parked.fetch_add` and a final re-scan of all shards
-  before `cv.wait` — so any push whose `parked.load` sees the
+  before `cv.wait`, so any push whose `parked.load` sees the
   worker armed must serialise through `park.lock`, and the worker's
   `cv.wait` atomically releases that lock with starting to wait.
   See `src/queue.rs` for the full proof sketch and
@@ -253,7 +253,7 @@ on 8 workers** (`concurrent_pipeline`).
   called, not on the first poll of the returned future. Callers that
   used `pool.spawn(closure).await` are unaffected. Callers that built
   many futures and awaited them later will see the closures start
-  running in parallel right away — typically a performance win and
+  running in parallel right away; typically a performance win and
   the behavior most users expect.
 
 - Dropping the future returned by `Threadpool::spawn` before it
@@ -265,7 +265,7 @@ on 8 workers** (`concurrent_pipeline`).
 
 - The concrete future type returned by `Threadpool::spawn_local`
   changed from `SpawnFuture<'pool, F, R>` to `SpawnFuture<'pool, R>`
-  (the closure type parameter was dropped — the closure now lives
+  (the closure type parameter was dropped, as the closure now lives
   inside an `async_task::Task<R>`). Callers that named the type in
   a `where` clause, stored it in a struct, or returned it from a
   function will need to drop the `F` parameter. Callers that only
@@ -276,7 +276,7 @@ on 8 workers** (`concurrent_pipeline`).
   runnable is pushed onto the queue on first poll of the returned
   `SpawnFuture`, not at the call site. Constructing and dropping a
   `SpawnFuture` without ever polling it is a no-op and never touches
-  a worker — required so a 1-worker pool cannot deadlock when the
+  a worker; required so a 1-worker pool cannot deadlock when the
   only worker does `let _ = pool.spawn_local(...)`. Only `spawn`
   (which has no `'pool` borrow and no drop-blocking contract) was
   switched to eager scheduling.
@@ -290,7 +290,7 @@ on 8 workers** (`concurrent_pipeline`).
   removed `AtomicWaker` and `Job<F, R>` protocols). Replaced by
   `tests/loom_queue.rs`, which models the new arm-then-rescan park
   handshake in `src/queue.rs`.
-- New module: `src/cpu.rs` — thread-local cached `current_cpu()`
+- New module: `src/cpu.rs`: thread-local cached `current_cpu()`
   lookup for shard routing.
 - Dependencies: added `async-task`; removed `arc-swap`, `crossbeam`.
 - CI: miri (scoped to `--lib` and `tests/async_task_smoke`) and

@@ -1,8 +1,4 @@
-//! Smoke tests for `async-task` semantics that the rewrite depends on.
-//!
-//! These confirm — before any production code touches async-task — that
-//! the assumptions in `/home/bench/.claude/plans/ok-make-this-into-toasty-simon.md`
-//! hold. If any of these fail, the rewrite plan needs revisiting before PR #2.
+//! Smoke tests for `async-task` semantics that the pool relies on.
 //!
 //! Specifically we check:
 //! 1. `Runnable` is `Send`; it can be moved to a worker thread for `.run()`.
@@ -124,7 +120,7 @@ fn cancel_before_run_drops_future() {
 
 	// Drop the task (the join handle). This marks the task closed.
 	drop(task);
-	// Now run the runnable — but because the task is closed,
+	// Now run the runnable: because the task is closed,
 	// async-task should drop the future without polling it.
 	runnable.run();
 	// The future's drop guard should have fired exactly once.
@@ -157,7 +153,7 @@ fn cancel_await_resolves_after_runnable_stops() {
 	// Wait for the worker to actually start running the closure. A fixed
 	// `sleep` here is racy under miri's cooperative scheduler (the worker
 	// thread may not have been scheduled yet within a wall-clock window),
-	// so spin-yield until the closure flips `started` — the worker is
+	// so spin-yield until the closure flips `started`: the worker is
 	// guaranteed to run the scheduled runnable, so this always terminates.
 	while !started.load(Ordering::Acquire) {
 		thread::yield_now();
@@ -169,7 +165,7 @@ fn cancel_await_resolves_after_runnable_stops() {
 	// The task either completed normally (Some) or was cancelled
 	// before its return (None). Because the closure is synchronous
 	// (one poll), it almost certainly completed before cancellation
-	// took effect — but the contract is that cancel().await resolves
+	// took effect; but the contract is that cancel().await resolves
 	// only after the runnable stops, which is what we care about.
 	// We just confirm it returned.
 	let _ = result;

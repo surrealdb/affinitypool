@@ -1,5 +1,5 @@
 //! Head-to-head: `affinitypool::Threadpool::spawn` vs
-//! [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool) —
+//! [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool):
 //! the crate this library was originally forked from.
 //!
 //! `threadpool` is sync-only: `execute(closure) -> ()` is fire and

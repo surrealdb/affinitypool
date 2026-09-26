@@ -92,7 +92,7 @@ jobs:
   # The 0.6.0 rewrite shrank the unsafe surface (task allocation and
   # waker synchronisation moved into `async-task`, which carries its
   # own miri + loom coverage upstream), but it introduced a new
-  # first-party concurrency protocol — the arm-then-rescan park
+  # first-party concurrency protocol: the arm-then-rescan park
   # handshake in `src/queue.rs`. The remaining first-party `unsafe`
   # is `Builder::spawn_unchecked` in `Threadpool::spawn_local`, whose
   # soundness relies on `SpawnFuture::drop` blocking until the

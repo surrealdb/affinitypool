@@ -8,10 +8,10 @@ Tasks are delivered through a sharded, lock-free queue. Each producer thread rou
 
 Head-to-head against the most common alternatives for running blocking work in async Rust:
 
-* [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html) — Tokio's built-in blocking pool.
-* [`blocking::unblock`](https://docs.rs/blocking) — the auto-scaling pool used by `async-std` and the smol ecosystem.
-* [`rayon::ThreadPool::spawn`](https://docs.rs/rayon) — Rayon's work-stealing pool. Tasks are wrapped in a `tokio::sync::oneshot` so the producer can await; that handshake is part of what's measured.
-* [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool) — the crate this library was originally forked from. Same `oneshot` wrap as Rayon.
+* [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html) - Tokio's built-in blocking pool.
+* [`blocking::unblock`](https://docs.rs/blocking) - the auto-scaling pool used by `async-std` and the smol ecosystem.
+* [`rayon::ThreadPool::spawn`](https://docs.rs/rayon) - Rayon's work-stealing pool. Tasks are wrapped in a `tokio::sync::oneshot` so the producer can await; that handshake is part of what's measured.
+* [`threadpool::ThreadPool::execute`](https://docs.rs/threadpool) - the crate this library was originally forked from. Same `oneshot` wrap as Rayon.
 
 Three workloads run against each pool: `spawn_overhead` (submit N closures, await each), `round_trip` (submit-and-await one closure at a time), and `multi_producer` (P concurrent producers each pushing 1k tasks). Numbers are criterion midpoint estimates from `--quick` runs on a quiet Linux bench machine. <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀"> denotes the fastest implementation in each row.
 
@@ -39,12 +39,12 @@ Three workloads run against each pool: `spawn_overhead` (submit N closures, awai
 
 ### How affinitypool compares
 
-* **vs `tokio::spawn_blocking`** — affinitypool wins across virtually all workloads, with up to a 6.9× lead on multi-producer contention (`multi_producer/2p_4w`), a 3.6× lead on `multi_producer/8p_4w`, and up to a 5.1× lead on concurrent sustained pipeline bursts.
-* **vs `blocking::unblock`** — affinitypool dominates batched workloads (10–27× faster) and multi-producer contention (27–47× faster). Trade-off: `blocking`'s pool grows unboundedly and is shared globally with any other crate using it.
-* **vs `rayon::ThreadPool::spawn`** — affinitypool wins on almost all batched and multi-producer workloads (up to 5.4× faster on `spawn_overhead/1w/10000`, 3.6× faster on `multi_producer/4p_4w`). Rayon leads on single-task round-trip latency (`round_trip/1w` and `4w`). Rayon is built for work-stealing CPU parallelism, not async producer / worker handoff.
-* **vs `threadpool::ThreadPool::execute`** — the original. affinitypool matches or beats threadpool on single-worker workloads, and wins heavily on multi-producer concurrent workloads (up to 5.6× faster on `multi_producer/4p_4w` and 3.9× faster on `8p_4w`).
+* **vs `tokio::spawn_blocking`** - affinitypool wins across virtually all workloads, with up to a 6.9× lead on multi-producer contention (`multi_producer/2p_4w`), a 3.6× lead on `multi_producer/8p_4w`, and up to a 5.1× lead on concurrent sustained pipeline bursts.
+* **vs `blocking::unblock`** - affinitypool dominates batched workloads (10–27× faster) and multi-producer contention (27–47× faster). Trade-off: `blocking`'s pool grows unboundedly and is shared globally with any other crate using it.
+* **vs `rayon::ThreadPool::spawn`** - affinitypool wins on almost all batched and multi-producer workloads (up to 5.4× faster on `spawn_overhead/1w/10000`, 3.6× faster on `multi_producer/4p_4w`). Rayon leads on single-task round-trip latency (`round_trip/1w` and `4w`). Rayon is built for work-stealing CPU parallelism, not async producer / worker handoff.
+* **vs `threadpool::ThreadPool::execute`** - the original. affinitypool matches or beats threadpool on single-worker workloads, and wins heavily on multi-producer concurrent workloads (up to 5.6× faster on `multi_producer/4p_4w` and 3.9× faster on `8p_4w`).
 
-The pattern: affinitypool dominates concurrent multi-producer and batched workloads where each producer routes consistently to its own shard via its thread-ID hash. It provides dedicated pool sizing for blocking work with **per-producer shard affinity** — concurrent producers stay isolated on their own shards, which is where it wins.
+The pattern: affinitypool dominates concurrent multi-producer and batched workloads where each producer routes consistently to its own shard via its thread-ID hash. It provides dedicated pool sizing for blocking work with **per-producer shard affinity** - concurrent producers stay isolated on their own shards, which is where it wins.
 
 ## Architecture
 
@@ -75,7 +75,7 @@ Worker threads
 
 On an empty preferred shard a worker scans the remaining shards in cyclic order, then parks on a shared `Mutex<()> + Condvar` (counted by an `AtomicUsize`). Producers check that counter after pushing; if any worker may be parked, they briefly take the park mutex to `notify_one`.
 
-Each task is a single heap allocation (the [`async-task`](https://crates.io/crates/async-task) layout — fused header + closure + result slot + waker). The park/unpark handshake is lost-wakeup-free; the proof sketch lives in [src/queue.rs](src/queue.rs) and the model in [tests/loom_queue.rs](tests/loom_queue.rs).
+Each task is a single heap allocation (the [`async-task`](https://crates.io/crates/async-task) layout: fused header + closure + result slot + waker). The park/unpark handshake is lost-wakeup-free; the proof sketch lives in [src/queue.rs](src/queue.rs) and the model in [tests/loom_queue.rs](tests/loom_queue.rs).
 
 Shard count rules of thumb:
 
@@ -87,9 +87,9 @@ Shard count rules of thumb:
 
 ### Behaviour notes
 
-**Worker self-spawn fast path.** When a closure running on a worker thread calls `pool.spawn(...)`, the new task is pushed directly into that worker's own local deque instead of routing through the shared sharded queue, skipping the shard routing. The spawning worker is usually also the consumer — it returns to its pop loop and drains its own deque — so the work stays biased toward that worker, which is what you want for cache locality.
+**Worker self-spawn fast path.** When a closure running on a worker thread calls `pool.spawn(...)`, the new task is pushed directly into that worker's own local deque instead of routing through the shared sharded queue, skipping the shard routing. The spawning worker is usually also the consumer - it returns to its pop loop and drains its own deque - so the work stays biased toward that worker, which is what you want for cache locality.
 
-It still issues the same wake handshake a foreign push does, because the spawning worker is *not guaranteed* to reach its pop loop: a worker that polls a `SpawnFuture` and then drops it blocks in the drop, waiting for the very runnable it just queued. That runnable is in the blocked worker's own deque, so only a peer steal can complete it — the spawning worker's deque is a stealer target. Skipping the wake there let the pool hang until the blocked worker gave up, which is forever. On a one-worker pool there is no peer to wake, so that pattern self-deadlocks regardless; see the `Threadpool::spawn_local` docs.
+It still issues the same wake handshake a foreign push does, because the spawning worker is *not guaranteed* to reach its pop loop: a worker that polls a `SpawnFuture` and then drops it blocks in the drop, waiting for the very runnable it just queued. That runnable is in the blocked worker's own deque, so only a peer steal can complete it; the spawning worker's deque is a stealer target. Skipping the wake there let the pool hang until the blocked worker gave up, which is forever. On a one-worker pool there is no peer to wake, so that pattern self-deadlocks regardless; see the `Threadpool::spawn_local` docs.
 
 ## Examples
 
@@ -214,7 +214,7 @@ async fn process_data() {
 
 Use `spawn_local` when you need to borrow data without the `'static` lifetime requirement.
 
-`spawn_local` is **`unsafe`**: the closure may borrow non-`'static` data, and that borrow stays sound only as long as the returned future is *not leaked* (`mem::forget`, `Box::leak`, an `Rc`/`Arc` cycle, …) before the borrow ends. Awaiting it — or simply letting it drop — upholds the contract; leaking it while it borrows local data is a use-after-free. This cannot be enforced statically in async Rust, which is why the API is `unsafe` rather than safe; if your closure only captures `'static` data, prefer the safe `spawn`.
+`spawn_local` is **`unsafe`**: the closure may borrow non-`'static` data, and that borrow stays sound only as long as the returned future is *not leaked* (`mem::forget`, `Box::leak`, an `Rc`/`Arc` cycle, …) before the borrow ends. Awaiting it, or simply letting it drop, upholds the contract; leaking it while it borrows local data is a use-after-free. This cannot be enforced statically in async Rust, which is why the API is `unsafe` rather than safe; if your closure only captures `'static` data, prefer the safe `spawn`.
 
 ```rust
 use affinitypool::Threadpool;

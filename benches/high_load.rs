@@ -1,14 +1,14 @@
 //! High-load benchmarks targeting workloads the `vs_tokio.rs` suite
 //! doesn't exercise:
 //!
-//! * **`burst_drain`** — push a large burst (100k / 1M tasks) in one
+//! * **`burst_drain`**: push a large burst (100k / 1M tasks) in one
 //!   go and measure time to drain. Stresses peak queue depth,
 //!   allocator pressure, and the worst-case mutex contention window.
-//! * **`sustained_throughput`** — repeat 100k-task spawn/await
+//! * **`sustained_throughput`**: repeat 100k-task spawn/await
 //!   batches for criterion's measurement window. Tests whether peak
 //!   burst rates hold under continuous load (no slow leaks, no
 //!   degradation, no allocator pathologies).
-//! * **`realistic_cost`** — sweep the per-task CPU cost from ~50 ns
+//! * **`realistic_cost`**: sweep the per-task CPU cost from ~50 ns
 //!   (empty closure) through ~100 µs (10⁵ arithmetic ops). Shows how
 //!   pool overhead amortises as tasks get larger and where contention
 //!   stops mattering.
@@ -39,7 +39,7 @@ fn tokio_runtime(blocking_threads: usize) -> tokio::runtime::Runtime {
 /// Deterministic CPU work. `iters` controls cost.
 ///
 /// The inner loop uses `black_box` on every operand so the optimiser
-/// can't vectorise or unroll the body — without this, even
+/// can't vectorise or unroll the body: without this, even
 /// `100_000`-iteration variants were finishing in microseconds,
 /// indicating the loop was being collapsed at compile time.
 ///

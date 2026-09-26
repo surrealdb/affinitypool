@@ -29,7 +29,7 @@
 //! value, leaking a value is always safe, so a destructor can never be
 //! a sound safety barrier in async code. The only leak-proof design is
 //! a *synchronous* scoped API (`std::thread::scope` / `rayon::scope`),
-//! where the join happens as the scope call returns — a barrier safe
+//! where the join happens as the scope call returns, a barrier safe
 //! code cannot skip. There is no `.await`-able equivalent.
 //!
 //! Because the hazard is intrinsic, [`Threadpool::spawn_local`] and the
@@ -53,27 +53,27 @@ use crate::Threadpool;
 
 /// The inner task type. The closure is wrapped in `catch_unwind` on
 /// the worker side (see `Threadpool::spawn_local`), so the future's
-/// output is a `Result` — `Ok(R)` if the closure returned normally,
+/// output is a `Result`: `Ok(R)` if the closure returned normally,
 /// `Err(payload)` if it panicked.
 type Inner<R> = Task<Result<R, Box<dyn Any + Send + 'static>>>;
 
 /// A future returned by [`Threadpool::spawn_local`].
 ///
 /// Resolves to the closure's return value. The runnable is scheduled
-/// lazily on first poll — constructing a `SpawnFuture` and dropping it
+/// lazily on first poll. Constructing a `SpawnFuture` and dropping it
 /// without polling never touches a worker. Dropping after polling
 /// cancels the task; if the worker is currently running the closure,
 /// the dropping thread is parked until the worker has finished. See
 /// module docs.
 ///
 /// Must **not** be leaked (e.g. via `mem::forget`) while it borrows
-/// non-`'static` data — that is the safety obligation of
+/// non-`'static` data; that is the safety obligation of
 /// [`Threadpool::spawn_local`], the `unsafe` fn that produces it.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SpawnFuture<'pool, R> {
 	runnable: Option<Runnable>,
 	task: Option<Inner<R>>,
-	/// Phantom borrow of the pool — ties the future's lifetime to the
+	/// Phantom borrow of the pool; ties the future's lifetime to the
 	/// [`Threadpool`] reference it was created from, ensuring the pool
 	/// outlives any in-flight tasks.
 	_pool: PhantomData<&'pool Threadpool>,
@@ -127,7 +127,7 @@ impl<R> Drop for SpawnFuture<'_, R> {
 }
 
 /// Parker-based `block_on` for `task.cancel()`. Only used on the drop
-/// path, so this is not a hot path — the contract is correctness, not
+/// path, so this is not a hot path; the contract is correctness, not
 /// throughput.
 fn block_on_cancel<R>(task: Inner<R>) {
 	struct ParkWaker(thread::Thread);
