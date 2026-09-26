@@ -169,11 +169,10 @@ impl Threadpool {
 		// closure is reified into a `Result::Err(payload)` on the
 		// worker side instead of propagating up through
 		// `Runnable::run` and unwinding the worker thread. The
-		// awaiter then `resume_unwind`s the payload, matching the
-		// previous behaviour where panics surfaced on the `.await`
-		// side, not the worker side. Without this wrapper, a
-		// panicking closure would tear down the worker and force the
-		// sentry to respawn a thread on every panic.
+		// awaiter then `resume_unwind`s the payload, so panics surface
+		// on the `.await` side rather than unwinding the worker thread.
+		// Without this wrapper, a panicking closure would tear down the
+		// worker and force the sentry to respawn a thread on every panic.
 		let (runnable, task) = TaskBuilder::new().spawn(
 			move |()| async move { std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) },
 			schedule,

@@ -43,19 +43,9 @@
 //!
 //! Before parking, a worker re-scans a few times with `spin_loop`
 //! backoff ([`SPIN_ROUNDS`]) so a runnable already on its way is
-//! caught without a futex round-trip.
-//!
-//! This phase applies to every pool size. An earlier revision skipped it
-//! for one- and two-worker pools, on the theory that a small pool has no
-//! contention to amortise — measurement on an idle 32-core Linux box
-//! says the opposite: ungated, a single-worker submit-and-await round
-//! trip drops from 4.4 us to 1.1 us, because the worker is still
-//! spinning when the task lands and never takes the futex round trip at
-//! all. It costs 15-20% on `multi_producer` with one worker and many
-//! producers, where the worker is saturated and the backoff is pure
-//! delay. Note that a CPU-*contended* machine inverts this trade, since
-//! a spinning worker there competes with the producer it is waiting
-//! for.
+//! caught without a futex round-trip. This phase applies uniformly to all
+//! pool sizes to catch imminent runnables during sequential submit-and-await
+//! workloads while bounding CPU consumption before sleeping.
 //!
 //! ## Producer spill
 //!
@@ -79,9 +69,7 @@
 //! all shards and stealers, then `cv.wait` (which atomically
 //! releases `park`).
 //!
-//! Unlike the previous mutex-shard design, the cross-thread
-//! happens-before edge no longer flows through a shard mutex.
-//! [`crossbeam_deque::Injector`] is lock-free; pushes and steals
+//! Because [`crossbeam_deque::Injector`] is lock-free, pushes and steals
 //! synchronise through the injector's internal atomics, but those
 //! orderings alone aren't enough to close the producer↔worker
 //! race on `parked`. The queue therefore inserts a

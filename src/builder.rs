@@ -121,8 +121,7 @@ impl Builder {
 	///
 	/// This sets the worker count to the number of available cores. It
 	/// does **not** pin threads to cores — worker placement is left to
-	/// the OS scheduler. (Earlier versions also pinned each worker via
-	/// platform affinity APIs; that was removed — see the changelog.)
+	/// the OS scheduler.
 	///
 	/// # Examples
 	///

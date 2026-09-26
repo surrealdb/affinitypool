@@ -9,7 +9,6 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 description = "A Rust library for running blocking jobs on a dedicated thread pool with per-producer shard affinity"
 repository = "https://github.com/surrealdb/affinitypool"
-homepage = "https://github.com/surrealdb/affinitypool"
 documentation = "https://docs.rs/affinitypool/"
 keywords = ["pool", "parallelism", "threading", "thread", "threadpool"]
 categories = ["asynchronous", "concurrency", "os"]

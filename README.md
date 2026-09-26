@@ -282,4 +282,4 @@ It still issues the same wake handshake a foreign push does, because the spawnin
 
 #### Original
 
-This code is heavily inspired by [threadpool](https://crates.io/crates/threadpool), licensed under the Apache License 2.0 and MIT licenses. Earlier versions also included CPU-core-pinning code forked from [core-affinity](https://crates.io/crates/core_affinity); that code has since been removed.
+This code is inspired by [threadpool](https://crates.io/crates/threadpool), licensed under the Apache License 2.0 and MIT licenses.
