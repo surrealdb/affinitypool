@@ -43,9 +43,7 @@
 //!
 //! Before parking, a worker re-scans a few times with `spin_loop`
 //! backoff ([`SPIN_ROUNDS`]) so a runnable already on its way is
-//! caught without a futex round-trip, then a few more with
-//! `yield_now` ([`YIELD_ROUNDS`]) so an oversubscribed pool hands the
-//! CPU back to the producer instead of spinning against it.
+//! caught without a futex round-trip.
 //!
 //! This phase applies to every pool size. An earlier revision skipped it
 //! for one- and two-worker pools, on the theory that a small pool has no
@@ -154,13 +152,6 @@ type StealerSlot = CachePadded<ArcSwapOption<Stealer<Runnable>>>;
 /// while keeping the worst-case empty scan at 8 cheap loads.
 const MAX_SHARDS: usize = 8;
 
-/// Consecutive pushes to the same preferred shard before producer-
-/// side spill kicks in. Multi-producer workloads rarely reach it
-/// (their pushes interleave, resetting the counter), while a
-/// single-producer fan-out trips it quickly so the work spreads
-/// across shards before the other workers give up and park.
-const SPILL_THRESHOLD: u32 = 8;
-
 /// Victims a *cheap* scan pass inspects before giving up, per step.
 ///
 /// The armed re-scan still visits every injector and every peer — that
@@ -190,29 +181,12 @@ const CHEAP_SCAN_VICTIMS: usize = 8;
 /// to poll — spinning is the cheapest way to win a submit-and-await
 /// round trip, but it burns a core.
 ///
-/// Six matches `crossbeam_utils::Backoff`'s own spin/yield boundary
-/// (`SPIN_LIMIT`), i.e. exactly the point at which that crate stops
-/// spinning and starts yielding, so the two halves of this phase line up
-/// with the backoff primitive driving them. That is a principled anchor
-/// rather than a measured optimum — see the caveat in the module docs
-/// about tuning these against a busy machine.
+/// Six matches `crossbeam_utils::Backoff`'s own spin boundary
+/// (`SPIN_LIMIT`), keeping the backoff phase bounded before committing
+/// to park.
 const SPIN_ROUNDS: u32 = 6;
 
-/// Re-scans performed with `yield_now` between them, after
-/// [`SPIN_ROUNDS`] and before parking. These exist for the
-/// *oversubscribed* case: when workers outnumber free cores, an idle
-/// worker that only spins starves the very producer it is waiting
-/// for, so handing the CPU back beats both spinning and an immediate
-/// park. Kept small too — each yield is a syscall.
-const YIELD_ROUNDS: u32 = 4;
-
 thread_local! {
-	/// `(last_preferred_shard, consecutive_count)`. Reset when the
-	/// preferred shard changes (a different producer thread is
-	/// interleaved). When `count > SPILL_THRESHOLD`, the route rotates
-	/// by `count - SPILL_THRESHOLD` shards.
-	static SPILL: Cell<(usize, u32)> = const { Cell::new((usize::MAX, 0)) };
-
 	/// When this thread is a worker for some `Queue`, holds raw
 	/// pointers to that queue and the worker's local deque. Set
 	/// by [`Queue::enter_worker_scope`] and cleared when the
@@ -258,6 +232,12 @@ pub(crate) struct Queue {
 	/// queue access and the parked access closes the lost-wakeup
 	/// race. See module docs for the Dekker-fence proof.
 	parked: AtomicUsize,
+	/// Number of unconsumed wake notifications currently in flight.
+	/// Incremented under `park` lock by producers when `notify_one` is called;
+	/// decremented under `park` lock by workers upon waking or finding work in strict scan.
+	/// Prevents producer bursts from repeatedly acquiring `park.lock()` when all
+	/// parked workers have already been sent a wake signal.
+	notified: AtomicUsize,
 	/// Set on threadpool drop. Workers observing this with every
 	/// shard and stealer empty exit their loop.
 	shutdown: AtomicBool,
@@ -310,6 +290,13 @@ fn next_rand(rng: &Cell<u32>) -> u32 {
 	x
 }
 
+/// Fast unbiased mapping of a 32-bit random integer to `0..span` using
+/// Lemire's multiplication-and-shift method, avoiding hardware integer division.
+#[inline]
+fn fast_reduce(rand: u32, span: usize) -> usize {
+	((rand as u64).wrapping_mul(span as u64) >> 32) as usize
+}
+
 /// RAII guard returned by [`Queue::enter_worker_scope`]. While
 /// alive, the calling thread's [`CURRENT_WORKER`] holds a handle
 /// to the queue + the worker's local deque so [`Queue::push`]
@@ -353,6 +340,7 @@ impl Queue {
 			park: Mutex::new(()),
 			notify: Condvar::new(),
 			parked: AtomicUsize::new(0),
+			notified: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
 			#[cfg(test)]
 			foreign_pushes: AtomicUsize::new(0),
@@ -468,9 +456,12 @@ impl Queue {
 			// deadlocks; that is inherent, and documented on
 			// `Threadpool::spawn_local`.
 			fence(Ordering::SeqCst);
-			if self.parked.load(Ordering::Acquire) > 0 {
+			if self.parked.load(Ordering::Acquire) > self.notified.load(Ordering::Acquire) {
 				let _g = self.park.lock();
-				self.notify.notify_one();
+				if self.parked.load(Ordering::Relaxed) > self.notified.load(Ordering::Relaxed) {
+					self.notified.fetch_add(1, Ordering::Relaxed);
+					self.notify.notify_one();
+				}
 			}
 			return;
 		}
@@ -479,34 +470,15 @@ impl Queue {
 		// and wake one parked worker if any.
 		#[cfg(test)]
 		self.foreign_pushes.fetch_add(1, Ordering::Relaxed);
-		// Single-shard fast path: skip the shard-hint lookup, SPILL
-		// thread-local, and bitmask arithmetic — they're all
-		// dead work when `mask == 0` (which corresponds to a
-		// 1-worker pool). The fence + park-check below still
-		// run; producer↔worker synchronisation is independent of
+		// Single-shard fast path: skip the shard-hint lookup
+		// and bitmask arithmetic — they're all dead work when `mask == 0`
+		// (which corresponds to a 1-worker pool). The fence + park-check
+		// below still run; producer↔worker synchronisation is independent of
 		// shard count.
 		if self.mask == 0 {
 			self.injectors[0].push(runnable);
 		} else {
-			let preferred = cpu::current_shard_hint() & self.mask;
-			let target = SPILL.with(|s| {
-				let (last, count) = s.get();
-				let new_count = if last == preferred {
-					count.saturating_add(1)
-				} else {
-					1
-				};
-				s.set((preferred, new_count));
-				if new_count <= SPILL_THRESHOLD {
-					preferred
-				} else {
-					// Rotate by (count - threshold) shards once
-					// we've tripped. As `count` grows, subsequent
-					// pushes cycle through all shards, draining
-					// the otherwise-pinned single producer evenly.
-					(preferred + (new_count - SPILL_THRESHOLD) as usize) & self.mask
-				}
-			});
+			let target = cpu::route_shard(self.mask);
 			self.injectors[target].push(runnable);
 		}
 		// SeqCst fence pairs with the worker's SeqCst fence
@@ -515,17 +487,14 @@ impl Queue {
 		// even when the queue itself is lock-free. See the
 		// module-level proof.
 		fence(Ordering::SeqCst);
-		// Fast path: if no worker may be parked, skip the park
-		// mutex.
-		if self.parked.load(Ordering::Acquire) > 0 {
-			// Acquire `park` briefly so the notify is guaranteed
-			// to land on a worker that has either already entered
-			// `cv.wait` (worker has released `park` atomically
-			// with parking) or hasn't yet armed (in which case
-			// the worker's re-scan will pick up our push before
-			// parking).
+		// Fast path: if all parked workers have already been sent a wake notification,
+		// skip the park mutex.
+		if self.parked.load(Ordering::Acquire) > self.notified.load(Ordering::Acquire) {
 			let _g = self.park.lock();
-			self.notify.notify_one();
+			if self.parked.load(Ordering::Relaxed) > self.notified.load(Ordering::Relaxed) {
+				self.notified.fetch_add(1, Ordering::Relaxed);
+				self.notify.notify_one();
+			}
 		}
 	}
 
@@ -552,29 +521,13 @@ impl Queue {
 			// first let a worker that is about to be handed work skip
 			// the syscall entirely.
 			//
-			// Two sub-phases, because the right thing to do with an
-			// idle worker depends on whether the machine has a spare
-			// core for it:
-			//
-			// * [`SPIN_ROUNDS`] of `spin_loop` — cheapest way to catch
-			//   an imminent runnable when a core is free.
-			// * [`YIELD_ROUNDS`] of `yield_now` — when workers
-			//   outnumber cores, a spinning worker starves the
-			//   producer it is waiting for, so give the CPU back
-			//   before parking.
-			//
-			// Both are bounded and a worker that still finds nothing
-			// falls through to arm and park, so an idle pool still
-			// goes to sleep. Scans here are `Cheap` because they
-			// repeat.
+			// Bounded spin loop before committing to a park.
+			// A few cheap re-scans with exponential backoff allow a worker
+			// to catch an imminent runnable without the futex round-trip.
 			let backoff = Backoff::new();
 			let mut spun = None;
-			for round in 0..SPIN_ROUNDS + YIELD_ROUNDS {
-				if round < SPIN_ROUNDS {
-					backoff.spin();
-				} else {
-					std::thread::yield_now();
-				}
+			for _ in 0..SPIN_ROUNDS {
+				backoff.spin();
 				if let Some(r) = self.scan(ctx, Probe::Cheap) {
 					spun = Some(r);
 					break;
@@ -605,16 +558,25 @@ impl Queue {
 			// substitute `is_empty`'s weaker read for that access and
 			// invalidate the lost-wakeup argument in the module docs.
 			if let Some(r) = self.scan(ctx, Probe::Strict) {
+				if self.notified.load(Ordering::Relaxed) > 0 {
+					self.notified.fetch_sub(1, Ordering::Relaxed);
+				}
 				self.parked.fetch_sub(1, Ordering::Release);
 				return Some(r);
 			}
 
 			if self.shutdown.load(Ordering::Acquire) {
+				if self.notified.load(Ordering::Relaxed) > 0 {
+					self.notified.fetch_sub(1, Ordering::Relaxed);
+				}
 				self.parked.fetch_sub(1, Ordering::Release);
 				return None;
 			}
 
 			self.notify.wait(&mut park);
+			if self.notified.load(Ordering::Relaxed) > 0 {
+				self.notified.fetch_sub(1, Ordering::Relaxed);
+			}
 			self.parked.fetch_sub(1, Ordering::Release);
 			// `park` dropped here. Retry from Phase 1.
 		}
@@ -677,9 +639,15 @@ impl Queue {
 			//    a random rotation.
 			if n > 1 {
 				let span = n - 1;
-				let start = next_rand(&ctx.rng) as usize % span;
+				let start = fast_reduce(next_rand(&ctx.rng), span);
 				for k in 0..self.probe_limit(span, probe) {
-					let idx = (my_shard + 1 + (start + k) % span) & self.mask;
+					let offset = start + k;
+					let rot = if offset >= span {
+						offset - span
+					} else {
+						offset
+					};
+					let idx = (my_shard + 1 + rot) & self.mask;
 					match self.steal_injector(idx, ctx, probe) {
 						Steal::Success(r) => return Some(r),
 						Steal::Retry => contended = true,
@@ -702,9 +670,20 @@ impl Queue {
 			let num_workers = self.stealers.len();
 			if num_workers > 1 {
 				let span = num_workers - 1;
-				let start = next_rand(&ctx.rng) as usize % span;
+				let start = fast_reduce(next_rand(&ctx.rng), span);
 				for k in 0..self.probe_limit(span, probe) {
-					let victim = (ctx.idx + 1 + (start + k) % span) % num_workers;
+					let offset = start + k;
+					let rot = if offset >= span {
+						offset - span
+					} else {
+						offset
+					};
+					let victim = ctx.idx + 1 + rot;
+					let victim = if victim >= num_workers {
+						victim - num_workers
+					} else {
+						victim
+					};
 					let slot = self.stealers[victim].load();
 					let Some(stealer) = slot.as_ref() else {
 						continue;
