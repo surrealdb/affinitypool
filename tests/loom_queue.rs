@@ -50,6 +50,7 @@ struct Queue {
 	park: Mutex<()>,
 	notify: Condvar,
 	parked: AtomicUsize,
+	notified: AtomicUsize,
 	shutdown: AtomicBool,
 }
 
@@ -63,6 +64,7 @@ impl Queue {
 			park: Mutex::new(()),
 			notify: Condvar::new(),
 			parked: AtomicUsize::new(0),
+			notified: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
 		}
 	}
@@ -77,9 +79,12 @@ impl Queue {
 		let idx = shard_hint & self.mask;
 		self.shards[idx].fetch_add(1, Ordering::Release);
 		fence(Ordering::SeqCst);
-		if self.parked.load(Ordering::Acquire) > 0 {
+		if self.parked.load(Ordering::Acquire) > self.notified.load(Ordering::Acquire) {
 			let _g = self.park.lock().unwrap();
-			self.notify.notify_one();
+			if self.parked.load(Ordering::Relaxed) > self.notified.load(Ordering::Relaxed) {
+				self.notified.fetch_add(1, Ordering::Relaxed);
+				self.notify.notify_one();
+			}
 		}
 	}
 
@@ -131,16 +136,25 @@ impl Queue {
 			fence(Ordering::SeqCst);
 
 			if let Some(r) = self.try_pop(worker_idx) {
+				if self.notified.load(Ordering::Relaxed) > 0 {
+					self.notified.fetch_sub(1, Ordering::Relaxed);
+				}
 				self.parked.fetch_sub(1, Ordering::Release);
 				return Some(r);
 			}
 
 			if self.shutdown.load(Ordering::Acquire) {
+				if self.notified.load(Ordering::Relaxed) > 0 {
+					self.notified.fetch_sub(1, Ordering::Relaxed);
+				}
 				self.parked.fetch_sub(1, Ordering::Release);
 				return None;
 			}
 
 			park = self.notify.wait(park).unwrap();
+			if self.notified.load(Ordering::Relaxed) > 0 {
+				self.notified.fetch_sub(1, Ordering::Relaxed);
+			}
 			self.parked.fetch_sub(1, Ordering::Release);
 			drop(park);
 		}

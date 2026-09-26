@@ -232,6 +232,12 @@ pub(crate) struct Queue {
 	/// queue access and the parked access closes the lost-wakeup
 	/// race. See module docs for the Dekker-fence proof.
 	parked: AtomicUsize,
+	/// Number of unconsumed wake notifications currently in flight.
+	/// Incremented under `park` lock by producers when `notify_one` is called;
+	/// decremented under `park` lock by workers upon waking or finding work in strict scan.
+	/// Prevents producer bursts from repeatedly acquiring `park.lock()` when all
+	/// parked workers have already been sent a wake signal.
+	notified: AtomicUsize,
 	/// Set on threadpool drop. Workers observing this with every
 	/// shard and stealer empty exit their loop.
 	shutdown: AtomicBool,
@@ -327,6 +333,7 @@ impl Queue {
 			park: Mutex::new(()),
 			notify: Condvar::new(),
 			parked: AtomicUsize::new(0),
+			notified: AtomicUsize::new(0),
 			shutdown: AtomicBool::new(false),
 			#[cfg(test)]
 			foreign_pushes: AtomicUsize::new(0),
@@ -442,9 +449,12 @@ impl Queue {
 			// deadlocks; that is inherent, and documented on
 			// `Threadpool::spawn_local`.
 			fence(Ordering::SeqCst);
-			if self.parked.load(Ordering::Acquire) > 0 {
+			if self.parked.load(Ordering::Acquire) > self.notified.load(Ordering::Acquire) {
 				let _g = self.park.lock();
-				self.notify.notify_one();
+				if self.parked.load(Ordering::Relaxed) > self.notified.load(Ordering::Relaxed) {
+					self.notified.fetch_add(1, Ordering::Relaxed);
+					self.notify.notify_one();
+				}
 			}
 			return;
 		}
@@ -470,17 +480,14 @@ impl Queue {
 		// even when the queue itself is lock-free. See the
 		// module-level proof.
 		fence(Ordering::SeqCst);
-		// Fast path: if no worker may be parked, skip the park
-		// mutex.
-		if self.parked.load(Ordering::Acquire) > 0 {
-			// Acquire `park` briefly so the notify is guaranteed
-			// to land on a worker that has either already entered
-			// `cv.wait` (worker has released `park` atomically
-			// with parking) or hasn't yet armed (in which case
-			// the worker's re-scan will pick up our push before
-			// parking).
+		// Fast path: if all parked workers have already been sent a wake notification,
+		// skip the park mutex.
+		if self.parked.load(Ordering::Acquire) > self.notified.load(Ordering::Acquire) {
 			let _g = self.park.lock();
-			self.notify.notify_one();
+			if self.parked.load(Ordering::Relaxed) > self.notified.load(Ordering::Relaxed) {
+				self.notified.fetch_add(1, Ordering::Relaxed);
+				self.notify.notify_one();
+			}
 		}
 	}
 
@@ -544,16 +551,25 @@ impl Queue {
 			// substitute `is_empty`'s weaker read for that access and
 			// invalidate the lost-wakeup argument in the module docs.
 			if let Some(r) = self.scan(ctx, Probe::Strict) {
+				if self.notified.load(Ordering::Relaxed) > 0 {
+					self.notified.fetch_sub(1, Ordering::Relaxed);
+				}
 				self.parked.fetch_sub(1, Ordering::Release);
 				return Some(r);
 			}
 
 			if self.shutdown.load(Ordering::Acquire) {
+				if self.notified.load(Ordering::Relaxed) > 0 {
+					self.notified.fetch_sub(1, Ordering::Relaxed);
+				}
 				self.parked.fetch_sub(1, Ordering::Release);
 				return None;
 			}
 
 			self.notify.wait(&mut park);
+			if self.notified.load(Ordering::Relaxed) > 0 {
+				self.notified.fetch_sub(1, Ordering::Relaxed);
+			}
 			self.parked.fetch_sub(1, Ordering::Release);
 			// `park` dropped here. Retry from Phase 1.
 		}
