@@ -290,6 +290,13 @@ fn next_rand(rng: &Cell<u32>) -> u32 {
 	x
 }
 
+/// Fast unbiased mapping of a 32-bit random integer to `0..span` using
+/// Lemire's multiplication-and-shift method, avoiding hardware integer division.
+#[inline]
+fn fast_reduce(rand: u32, span: usize) -> usize {
+	((rand as u64).wrapping_mul(span as u64) >> 32) as usize
+}
+
 /// RAII guard returned by [`Queue::enter_worker_scope`]. While
 /// alive, the calling thread's [`CURRENT_WORKER`] holds a handle
 /// to the queue + the worker's local deque so [`Queue::push`]
@@ -632,9 +639,15 @@ impl Queue {
 			//    a random rotation.
 			if n > 1 {
 				let span = n - 1;
-				let start = next_rand(&ctx.rng) as usize % span;
+				let start = fast_reduce(next_rand(&ctx.rng), span);
 				for k in 0..self.probe_limit(span, probe) {
-					let idx = (my_shard + 1 + (start + k) % span) & self.mask;
+					let offset = start + k;
+					let rot = if offset >= span {
+						offset - span
+					} else {
+						offset
+					};
+					let idx = (my_shard + 1 + rot) & self.mask;
 					match self.steal_injector(idx, ctx, probe) {
 						Steal::Success(r) => return Some(r),
 						Steal::Retry => contended = true,
@@ -657,9 +670,20 @@ impl Queue {
 			let num_workers = self.stealers.len();
 			if num_workers > 1 {
 				let span = num_workers - 1;
-				let start = next_rand(&ctx.rng) as usize % span;
+				let start = fast_reduce(next_rand(&ctx.rng), span);
 				for k in 0..self.probe_limit(span, probe) {
-					let victim = (ctx.idx + 1 + (start + k) % span) % num_workers;
+					let offset = start + k;
+					let rot = if offset >= span {
+						offset - span
+					} else {
+						offset
+					};
+					let victim = ctx.idx + 1 + rot;
+					let victim = if victim >= num_workers {
+						victim - num_workers
+					} else {
+						victim
+					};
 					let slot = self.stealers[victim].load();
 					let Some(stealer) = slot.as_ref() else {
 						continue;
