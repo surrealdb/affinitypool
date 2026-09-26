@@ -19,24 +19,24 @@ resolver = "2"
 default = []
 
 [dependencies]
-arc-swap = "1.7"
-async-task = "4"
-crossbeam-deque = "0.8"
-crossbeam-utils = "0.8"
+arc-swap = "1.9.2"
+async-task = "4.7.1"
+crossbeam-deque = "0.8.8"
+crossbeam-utils = "0.8.23"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
-thiserror = "2.0.18"
+thiserror = "2.0.21"
 
 [target.'cfg(not(loom))'.dev-dependencies]
-blocking = "1.6.2"
-criterion = { version = "0.8", features = ["html_reports"] }
+blocking = "1.7.0"
+criterion = { version = "0.8.2", features = ["html_reports"] }
 rayon = "1.12.0"
 threadpool = "1.8.1"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync"] }
-trybuild = "1.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+trybuild = "1.0.121"
 
 [target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
+loom = "0.7.2"
 
 [[bench]]
 name = "threadpool"
