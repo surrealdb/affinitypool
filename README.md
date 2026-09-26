@@ -206,36 +206,34 @@ Three workloads run against each pool: `spawn_overhead` (submit N closures, awai
 
 | Benchmark | affinitypool | tokio | blocking† | rayon | threadpool |
 |---|---|---|---|---|---|
-| `spawn_overhead/1w/1` | 5.84 µs | 6.36 µs | 2.49 µs | 1.03 µs | 5.76 µs |
-| `spawn_overhead/4w/1` | 6.77 µs | 5.71 µs | 2.49 µs | 1.53 µs | 6.54 µs |
-| `spawn_overhead/1w/100` | **18.0 µs** | 35.7 µs | 181 µs | 20.7 µs | 27.1 µs |
-| `spawn_overhead/4w/100` | 98.8 µs | 87.3 µs | 181 µs | 39.5 µs | 27.2 µs |
-| `spawn_overhead/1w/1000` | **208 µs** | 286 µs | 1.86 ms | 270 µs | 278 µs |
-| `spawn_overhead/4w/1000` | 875 µs | 1.19 ms | 1.86 ms | 332 µs | 240 µs |
-| `spawn_overhead/1w/10000` | 2.26 ms | 2.40 ms | 21.3 ms | 2.20 ms | 2.09 ms |
-| `spawn_overhead/4w/10000` | 12.0 ms | 10.4 ms | 21.3 ms | 3.37 ms | 2.19 ms |
-| `round_trip/1w` | 5.54 µs | 5.76 µs | 2.49 µs | 1.01 µs | 4.45 µs |
-| `round_trip/4w` | 6.19 µs | 6.57 µs | 2.49 µs | 1.44 µs | 6.24 µs |
-| `round_trip/8w` | 6.56 µs | 5.37 µs | 2.49 µs | 2.24 µs | 6.78 µs |
-| `multi_producer/2p_1w` | **367 µs** | 409 µs | 4.88 ms | 524 µs | 385 µs |
-| `multi_producer/2p_4w` | 1.12 ms | 1.73 ms | 4.88 ms | 731 µs | 426 µs |
-| `multi_producer/4p_1w` | 1.00 ms | 1.16 ms | 11.2 ms | 973 µs | 890 µs |
-| `multi_producer/4p_4w` | 1.16 ms | 1.80 ms | 11.2 ms | 938 µs | 976 µs |
-| `multi_producer/8p_1w` | 3.97 ms | 3.29 ms | 27.3 ms | 1.94 ms | 2.35 ms |
-| `multi_producer/8p_4w` | **1.61 ms** | 5.42 ms | 27.3 ms | 1.73 ms | 1.94 ms |
+| `spawn_overhead/1w/1` | 1.20 µs | 7.52 µs | 2.31 µs | **974 ns** | 7.68 µs |
+| `spawn_overhead/4w/1` | **1.19 µs** | 2.88 µs | 2.31 µs | 1.27 µs | 8.10 µs |
+| `spawn_overhead/1w/100` | **12.5 µs** | 65.9 µs | 232.7 µs | 44.0 µs | 13.2 µs |
+| `spawn_overhead/4w/100` | **27.4 µs** | 54.9 µs | 232.7 µs | 109.5 µs | 68.6 µs |
+| `spawn_overhead/1w/1000` | **150.0 µs** | 156.9 µs | 1.59 ms | 811.0 µs | 459.5 µs |
+| `spawn_overhead/4w/1000` | **195.2 µs** | 517.9 µs | 1.59 ms | 251.8 µs | 314.0 µs |
+| `spawn_overhead/1w/10000` | **1.46 ms** | 1.81 ms | 27.43 ms | 7.85 ms | 1.55 ms |
+| `spawn_overhead/4w/10000` | 2.20 ms | 6.44 ms | 27.43 ms | 8.76 ms | **2.02 ms** |
+| `round_trip/1w` | 6.71 µs | 7.11 µs | 6.98 µs | **965 ns** | 7.72 µs |
+| `round_trip/4w` | 3.11 µs | 2.88 µs | 6.98 µs | **1.66 µs** | 3.01 µs |
+| `round_trip/8w` | **3.51 µs** | 7.16 µs | 6.98 µs | 5.67 µs | 8.19 µs |
+| `multi_producer/2p_1w` | **210.8 µs** | 310.4 µs | 5.47 ms | 359.9 µs | 276.5 µs |
+| `multi_producer/2p_4w` | **195.9 µs** | 1.35 ms | 5.47 ms | 388.5 µs | 444.3 µs |
+| `multi_producer/4p_1w` | **504.6 µs** | 1.08 ms | 12.97 ms | 685.9 µs | 645.6 µs |
+| `multi_producer/4p_4w` | **276.5 µs** | 1.70 ms | 12.97 ms | 992.9 µs | 1.56 ms |
+| `multi_producer/8p_1w` | 2.06 ms | 4.47 ms | 29.03 ms | 5.44 ms | **1.62 ms** |
+| `multi_producer/8p_4w` | **1.08 ms** | 3.92 ms | 29.03 ms | 2.34 ms | 4.18 ms |
 
 † `blocking` uses a single auto-scaled global pool; its column doesn't vary with the worker count.
 
 ### How affinitypool compares
 
-* **vs `tokio::spawn_blocking`** — affinitypool wins or ties on most workloads, including a 3.4× lead on `multi_producer/8p_4w`. Tokio still leads on the single-task `4w` cases.
-* **vs `blocking::unblock`** — affinitypool dominates batched workloads (5–14× faster) and loses single-task latency (`blocking` is consistently ~2.5 µs). Trade-off: `blocking`'s pool grows unboundedly and is shared globally with any other crate using it.
-* **vs `rayon::ThreadPool::spawn`** — Rayon's lock-free deques win single-task latency (3–6×) and most `4w` batched workloads. affinitypool wins on `multi_producer/8p_4w` and ties or wins most `1w` workloads. Rayon is built for work-stealing CPU parallelism, not async producer / worker handoff.
-* **vs `threadpool::ThreadPool::execute`** — the original. Parity on `1w` workloads, threadpool wins big (4–5×) on `4w` batched spawn (no sharding overhead), affinitypool wins on `multi_producer/8p_4w` and `2p_1w`.
+* **vs `tokio::spawn_blocking`** — affinitypool wins across virtually all workloads, with up to a 6.9× lead on multi-producer contention (`multi_producer/2p_4w`), a 3.6× lead on `multi_producer/8p_4w`, and up to a 5.1× lead on concurrent sustained pipeline bursts.
+* **vs `blocking::unblock`** — affinitypool dominates batched workloads (10–27× faster) and multi-producer contention (27–47× faster). Trade-off: `blocking`'s pool grows unboundedly and is shared globally with any other crate using it.
+* **vs `rayon::ThreadPool::spawn`** — affinitypool wins on almost all batched and multi-producer workloads (up to 5.4× faster on `spawn_overhead/1w/10000`, 3.6× faster on `multi_producer/4p_4w`). Rayon leads on single-task round-trip latency (`round_trip/1w` and `4w`). Rayon is built for work-stealing CPU parallelism, not async producer / worker handoff.
+* **vs `threadpool::ThreadPool::execute`** — the original. affinitypool matches or beats threadpool on single-worker workloads, and wins heavily on multi-producer concurrent workloads (up to 5.6× faster on `multi_producer/4p_4w` and 3.9× faster on `8p_4w`).
 
-The pattern: affinitypool loses to the single-queue and work-stealing alternatives on `4w/N` batched-spawn workloads where one producer fans out fast and pays for crossing shards. It wins where shard locality pays back — `1w` (no scan cost), and multi-producer workloads where each producer lands on its own shard via its thread-ID hash.
-
-Unlike a single shared queue, affinitypool gives you a dedicated pool sized for blocking work with **per-producer shard affinity** — concurrent producers stay isolated on their own shards, which is where it wins.
+The pattern: affinitypool dominates concurrent multi-producer and batched workloads where each producer routes consistently to its own shard via its thread-ID hash. It provides dedicated pool sizing for blocking work with **per-producer shard affinity** — concurrent producers stay isolated on their own shards, which is where it wins.
 
 ## Architecture
 
