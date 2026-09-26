@@ -43,9 +43,7 @@
 //!
 //! Before parking, a worker re-scans a few times with `spin_loop`
 //! backoff ([`SPIN_ROUNDS`]) so a runnable already on its way is
-//! caught without a futex round-trip, then a few more with
-//! `yield_now` ([`YIELD_ROUNDS`]) so an oversubscribed pool hands the
-//! CPU back to the producer instead of spinning against it.
+//! caught without a futex round-trip.
 //!
 //! This phase applies to every pool size. An earlier revision skipped it
 //! for one- and two-worker pools, on the theory that a small pool has no
@@ -190,21 +188,10 @@ const CHEAP_SCAN_VICTIMS: usize = 8;
 /// to poll — spinning is the cheapest way to win a submit-and-await
 /// round trip, but it burns a core.
 ///
-/// Six matches `crossbeam_utils::Backoff`'s own spin/yield boundary
-/// (`SPIN_LIMIT`), i.e. exactly the point at which that crate stops
-/// spinning and starts yielding, so the two halves of this phase line up
-/// with the backoff primitive driving them. That is a principled anchor
-/// rather than a measured optimum — see the caveat in the module docs
-/// about tuning these against a busy machine.
+/// Six matches `crossbeam_utils::Backoff`'s own spin boundary
+/// (`SPIN_LIMIT`), keeping the backoff phase bounded before committing
+/// to park.
 const SPIN_ROUNDS: u32 = 6;
-
-/// Re-scans performed with `yield_now` between them, after
-/// [`SPIN_ROUNDS`] and before parking. These exist for the
-/// *oversubscribed* case: when workers outnumber free cores, an idle
-/// worker that only spins starves the very producer it is waiting
-/// for, so handing the CPU back beats both spinning and an immediate
-/// park. Kept small too — each yield is a syscall.
-const YIELD_ROUNDS: u32 = 4;
 
 thread_local! {
 	/// `(last_preferred_shard, consecutive_count)`. Reset when the
@@ -552,29 +539,13 @@ impl Queue {
 			// first let a worker that is about to be handed work skip
 			// the syscall entirely.
 			//
-			// Two sub-phases, because the right thing to do with an
-			// idle worker depends on whether the machine has a spare
-			// core for it:
-			//
-			// * [`SPIN_ROUNDS`] of `spin_loop` — cheapest way to catch
-			//   an imminent runnable when a core is free.
-			// * [`YIELD_ROUNDS`] of `yield_now` — when workers
-			//   outnumber cores, a spinning worker starves the
-			//   producer it is waiting for, so give the CPU back
-			//   before parking.
-			//
-			// Both are bounded and a worker that still finds nothing
-			// falls through to arm and park, so an idle pool still
-			// goes to sleep. Scans here are `Cheap` because they
-			// repeat.
+			// Bounded spin loop before committing to a park.
+			// A few cheap re-scans with exponential backoff allow a worker
+			// to catch an imminent runnable without the futex round-trip.
 			let backoff = Backoff::new();
 			let mut spun = None;
-			for round in 0..SPIN_ROUNDS + YIELD_ROUNDS {
-				if round < SPIN_ROUNDS {
-					backoff.spin();
-				} else {
-					std::thread::yield_now();
-				}
+			for _ in 0..SPIN_ROUNDS {
+				backoff.spin();
 				if let Some(r) = self.scan(ctx, Probe::Cheap) {
 					spun = Some(r);
 					break;
