@@ -43,7 +43,6 @@ use async_task::{Runnable, Task};
 use std::any::Any;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::mem;
 use std::panic;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -57,26 +56,6 @@ use crate::Threadpool;
 /// output is a `Result` — `Ok(R)` if the closure returned normally,
 /// `Err(payload)` if it panicked.
 type Inner<R> = Task<Result<R, Box<dyn Any + Send + 'static>>>;
-
-/// State machine for the spawn-local future. We defer
-/// [`Runnable::schedule`] to first poll so a 1-worker pool cannot
-/// deadlock when a caller does `drop(pool.spawn_local(…))` from inside
-/// the only worker thread.
-enum State<R> {
-	/// Constructed but not yet polled. Holds the unscheduled
-	/// [`Runnable`] alongside the [`Task`] so first poll can push the
-	/// runnable into the queue, and so an early drop can release the
-	/// runnable without ever touching a worker.
-	Pending {
-		runnable: Runnable,
-		task: Inner<R>,
-	},
-	/// First poll has already pushed the runnable onto the queue. Only
-	/// the awaiter handle remains.
-	Scheduled(Inner<R>),
-	/// Resolved or dropped — no further work.
-	Done,
-}
 
 /// A future returned by [`Threadpool::spawn_local`].
 ///
@@ -92,7 +71,8 @@ enum State<R> {
 /// [`Threadpool::spawn_local`], the `unsafe` fn that produces it.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SpawnFuture<'pool, R> {
-	state: State<R>,
+	runnable: Option<Runnable>,
+	task: Option<Inner<R>>,
 	/// Phantom borrow of the pool — ties the future's lifetime to the
 	/// [`Threadpool`] reference it was created from, ensuring the pool
 	/// outlives any in-flight tasks.
@@ -103,10 +83,8 @@ impl<'pool, R> SpawnFuture<'pool, R> {
 	#[inline]
 	pub(crate) fn new(runnable: Runnable, task: Inner<R>) -> Self {
 		Self {
-			state: State::Pending {
-				runnable,
-				task,
-			},
+			runnable: Some(runnable),
+			task: Some(task),
 			_pool: PhantomData,
 		}
 	}
@@ -116,70 +94,34 @@ impl<R> Future for SpawnFuture<'_, R> {
 	type Output = R;
 
 	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		// Structural pinning: we never move out of `self.state` except
-		// to replace it whole, and the Task inside is moved only when
-		// it has just been constructed by `mem::replace` (i.e. is no
-		// longer pinned through this Self).
 		let this = unsafe { self.as_mut().get_unchecked_mut() };
-		// Schedule on first poll. Transitions `Pending → Scheduled`
-		// and then falls through to poll the Task immediately so a
-		// caller awaiting the future doesn't need a second poll just
-		// to register the waker.
-		if matches!(this.state, State::Pending { .. }) {
-			match mem::replace(&mut this.state, State::Done) {
-				State::Pending {
-					runnable,
-					task,
-				} => {
-					runnable.schedule();
-					this.state = State::Scheduled(task);
-				}
-				_ => unreachable!(),
-			}
+		if let Some(runnable) = this.runnable.take() {
+			runnable.schedule();
 		}
-		match &mut this.state {
-			State::Scheduled(task) => match Pin::new(task).poll(cx) {
+		if let Some(task) = this.task.as_mut() {
+			match Pin::new(task).poll(cx) {
 				Poll::Ready(result) => {
-					this.state = State::Done;
+					this.task = None;
 					match result {
 						Ok(value) => Poll::Ready(value),
 						Err(payload) => panic::resume_unwind(payload),
 					}
 				}
 				Poll::Pending => Poll::Pending,
-			},
-			State::Done => panic!("SpawnFuture polled after completion"),
-			State::Pending {
-				..
-			} => unreachable!("Pending handled above"),
+			}
+		} else {
+			panic!("SpawnFuture polled after completion");
 		}
 	}
 }
 
 impl<R> Drop for SpawnFuture<'_, R> {
 	fn drop(&mut self) {
-		match mem::replace(&mut self.state, State::Done) {
-			State::Pending {
-				runnable,
-				task,
-			} => {
-				// Never scheduled — dropping the runnable cancels the
-				// task synchronously without touching a worker, so no
-				// `block_on_cancel` is needed and a 1-worker pool
-				// cannot deadlock here.
-				drop(runnable);
-				drop(task);
-			}
-			State::Scheduled(task) => {
-				// `Task::cancel()` returns a future that resolves once
-				// the runnable has finished (either by running to
-				// completion or by being dropped without running).
-				// Block the current thread on that — the closure may
-				// borrow `'pool` data that goes out of scope as soon
-				// as this returns.
-				block_on_cancel(task);
-			}
-			State::Done => {}
+		if let Some(runnable) = self.runnable.take() {
+			drop(runnable);
+			drop(self.task.take());
+		} else if let Some(task) = self.task.take() {
+			block_on_cancel(task);
 		}
 	}
 }
