@@ -23,7 +23,7 @@ async-task = "4.7.1"
 crossbeam-deque = "0.8.8"
 crossbeam-utils = "0.8.23"
 num_cpus = "1.17.0"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 thiserror = "2.0.21"
 
 [target.'cfg(not(loom))'.dev-dependencies]
